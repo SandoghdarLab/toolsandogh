@@ -20,10 +20,7 @@ This repository collects data analysis scripts of the Sandoghdar Division of the
 
 | Script | Description | Usage |
 |--------|-------------|-------|
-| ```deconvolution.py``` | Richardson-Lucy deconvolution for 3D stacks | ```python deconvolution.py -i input.tif -o output.tif -psf psf.tif -n 10``` |
-| ```background_subtraction.py``` | Rolling ball background subtraction | ```python background_subtraction.py -i input.tif -o output.tif -r 50``` |
-| ```channel_alignment.py``` | Align multi-channel images using phase correlation | ```python channel_alignment.py -i input.tif -o aligned.tif -r 1``` |
-| ```z_projection.py``` | Maximum/mean/median Z-projections | ```python z_projection.py -i stack.tif -o projection.tif -m max``` |
+| ```iscat-analysis.py``` | iSCAT Analysis | ```./iscat_analysis.py -i input.tif -o output.tif``` |
 
 ## Guidelines for New Scripts
 

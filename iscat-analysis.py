@@ -42,7 +42,6 @@ class Analysis:
         rvt (npt.NDArray[np.float32]): Radial variance transform of dra
         bits (npt.NDArray[np.bool_]): One bit per dra_window_size frames
         worklist (list[slice]): A list of dra slices that have yet to be computed
-        _current_frame (int): The video frame that is viewed right now
     """
 
     args: argparse.Namespace
@@ -53,7 +52,6 @@ class Analysis:
     dra: npt.NDArray[np.float32]
     rvt: npt.NDArray[np.float32]
     worklist: list[slice]
-    _current_frame: int
 
     def __init__(self, args: argparse.Namespace, video: npt.NDArray[np.float32]):
         assert video.ndim == 3
@@ -67,26 +65,18 @@ class Analysis:
         dra_shape = (nframes - 2 * args.dra_window_size + 1, nrows, ncols)
         self.dra = np.zeros(dra_shape, dtype=np.float32)
         self.rvt = np.zeros(dra_shape, dtype=np.float32)
-        # initialize the worklist and current_frame
+        # initialize the worklist
         self.worklist = []
-        self._current_frame = 0
         self.reset(clear_buffers=False)
 
-    @property
-    def current_frame(self):
-        return self._current_frame
-
-    @current_frame.setter
-    def current_frame(self, value):
-        if self._current_frame != value:
-            self._current_frame = value
-            self.sort_worklist()
-
-    def sort_worklist(self):
+    def sort_worklist(self, current_frame=0):
         # Reorder the worklist
         def slice_distance(s: slice) -> int:
-            start = 0 if s.start is None else s.start
-            return abs(start - self.current_frame)
+            if s.start <= current_frame < s.stop:
+                return 0
+            else:
+                return min(abs(s.start - current_frame),
+                           abs(s.stop - 1 - current_frame))
 
         self.worklist = sorted(self.worklist, key=slice_distance, reverse=True)
 
@@ -203,11 +193,15 @@ def iscat_gui(analysis: Analysis):
         figure_kwargs={"size": (analysis.args.gui_width, analysis.args.gui_height),
                        "controller_ids": None})
 
+    def index_changed(index):
+        frame = index["t"]
+        analysis.sort_worklist(frame)
+        analysis.advance()
+
+    iw.add_event_handler(index_changed, event="current_index")
+
     def animation():
         analysis.advance()
-        frame = iw.current_index["t"]
-        if analysis.current_frame != frame:
-            analysis.current_frame = frame
 
     iw.figure.add_animations(animation)
     iw.show()

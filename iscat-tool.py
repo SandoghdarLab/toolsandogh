@@ -1,0 +1,364 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.11"
+# dependencies = [
+#     "imgui[sdl2]",
+#     "fastplotlib[imgui] @ git+https://github.com/fastplotlib/fastplotlib.git@a057faa#egg=fastplotlib[imgui]",
+#     "imageio[ffmpeg]",
+#     "numpy",
+#     "scipy",
+#     "scikit-image",
+#     "trackpy",
+#     "imgrvt",
+#     "tqdm",
+# ]
+# ///
+
+import argparse
+import os
+import fastplotlib as fpl
+import imgrvt as rvt
+import imageio.v3 as iio
+import numpy as np
+import numpy.typing as npt
+import tqdm
+
+
+###############################################################################
+###
+###  Analysis
+
+
+class Analysis:
+    """All the data associated with one iSCAT Analysis run.
+
+    Attributes:
+        args (argparse.Namespace): The parsed command line arguments
+        video (npt.NDArray[np.float32]): The original video
+        fft (npt.NDArray[np.complex64]): FFT of the original video
+        fft_log_abs (npt.NDArray[np.float32]): log(abs(fft + 1))
+        corrected (npt.NDArray[np.float32]): The inverse FFT of fft_part
+        dra (npt.NDArray[np.float32]): Differential rolling average of corrected
+        rvt (npt.NDArray[np.float32]): Radial variance transform of dra
+        bits (npt.NDArray[np.bool_]): One bit per dra_window_size frames
+        worklist (list[slice]): A list of dra slices that have yet to be computed
+        _current_frame (int): The video frame that is viewed right now
+    """
+
+    args: argparse.Namespace
+    video: npt.NDArray[np.float32]
+    fft: npt.NDArray[np.complex64]
+    fft_log_abs: npt.NDArray[np.float32]
+    corrected: npt.NDArray[np.float32]
+    dra: npt.NDArray[np.float32]
+    rvt: npt.NDArray[np.float32]
+    worklist: list[slice]
+    _current_frame: int
+
+    def __init__(self, args: argparse.Namespace, video: npt.NDArray[np.float32]):
+        assert video.ndim == 3
+        self.args = args
+        # initialize all buffers
+        self.video = video.astype(np.float32)
+        self.fft = np.zeros(video.shape, dtype=np.complex64)
+        self.fft_log_abs = np.zeros(video.shape, dtype=np.float32)
+        self.corrected = np.zeros(video.shape, dtype=np.float32)
+        (nframes, nrows, ncols) = video.shape
+        dra_shape = (nframes - 2 * args.dra_window_size + 1, nrows, ncols)
+        self.dra = np.zeros(dra_shape, dtype=np.float32)
+        self.rvt = np.zeros(dra_shape, dtype=np.float32)
+        # initialize the worklist and current_frame
+        self.worklist = []
+        self._current_frame = 0
+        self.reset(clear_buffers=False)
+
+    @property
+    def current_frame(self):
+        return self._current_frame
+
+    @current_frame.setter
+    def current_frame(self, value):
+        if self._current_frame != value:
+            self._current_frame = value
+            self.sort_worklist()
+
+    def sort_worklist(self):
+        # Reorder the worklist
+        def slice_distance(s: slice) -> int:
+            start = 0 if s.start is None else s.start
+            return abs(start - self.current_frame)
+
+        self.worklist = sorted(self.worklist, key=slice_distance, reverse=True)
+
+    def reset(self, clear_buffers=True):
+        """Clear all buffers and reinitialize the worklist."""
+        # Clear all buffers
+        if clear_buffers:
+            self.fft[...] = 0
+            self.fft_log_abs[...] = 0
+            self.corrected[...] = 0
+            self.dra[...] = 0
+            self.rvt[...] = 0
+        # Reinitialize the worklist
+        self.worklist.clear()
+        window_size = self.args.dra_window_size
+        nframes = self.video.shape[0] - 2 * window_size + 1
+        for start in range(0, nframes, window_size):
+            if (nframes - start) < 2 * window_size:
+                end = nframes
+            else:
+                end = start + window_size
+            self.worklist.append(slice(start, end, 1))
+        self.sort_worklist()
+
+    def advance(self):
+        """(Re)compute parts of the Analysis run.  Prefer those close to the current_frame."""
+        if len(self.worklist) == 0:
+            return
+        window_size = self.args.dra_window_size
+        dra_frames = self.worklist.pop()
+        print(f"Computing {dra_frames}.")
+        frames = slice(dra_frames.start, dra_frames.stop + 2 * window_size - 1)
+        (nframes, nrows, ncols) = self.video[frames].shape
+
+        # Determine the FFT mask
+        row, col = np.mgrid[:nrows, :ncols]
+        distance = np.sqrt((row - nrows / 2) ** 2 + (col - ncols / 2) ** 2)
+        dmax = np.max(distance)
+        inner = (self.args.fft_inner_radius * dmax) <= distance
+        outer = distance <= (self.args.fft_outer_radius * dmax)
+        ring = np.logical_and(inner, outer)
+        cross = np.zeros((nrows, ncols), dtype=np.bool_)
+        row_offset = self.args.fft_row_noise_threshold / 2
+        row_start = round(nrows * (0.5 - row_offset))
+        row_end = round(nrows * (0.5 + row_offset)) + 1
+        cross[row_start:row_end, :] = True
+        col_offset = self.args.fft_column_noise_threshold / 2
+        col_start = round(ncols * (0.5 - col_offset))
+        col_end = round(ncols * (0.5 + col_offset)) + 1
+        cross[:, col_start:col_end] = True
+        mask = np.broadcast_to(np.logical_and(ring, ~cross), (nframes, nrows, ncols))
+
+        # Compute the FFT
+        raw_fft = np.fft.fft2(self.video[frames], axes=(1, 2))
+        shifted_fft = np.fft.fftshift(raw_fft, axes=(1, 2))
+        filtered_fft = np.where(mask, shifted_fft, 0.0)
+        ifft = np.fft.ifft2(np.fft.fftshift(filtered_fft, axes=(1,2)), axes=(1,2))
+        corrected = np.real(ifft)
+        self.fft[frames] = filtered_fft
+        self.fft_log_abs[frames] = np.log(np.abs(filtered_fft + 1))
+        self.corrected[frames] = corrected
+
+        # Compute the rolling average
+        padded = np.pad(corrected, ((1, 0), (0, 0), (0, 0)),)
+        cumsum = np.cumsum(padded, axis=0)
+        ravg = cumsum[window_size:] - cumsum[0:-window_size]
+
+        # Compute the differential rolling average
+        left = ravg[0:-window_size]
+        right = ravg[window_size:]
+        self.dra[dra_frames] = (left - right)
+
+        # Compute the RVT
+        for frame in range(dra_frames.start, dra_frames.stop):
+            self.rvt[frame] = rvt.rvt(self.dra[frame],
+                                      rmin=self.args.rvt_min_radius,
+                                      rmax=self.args.rvt_max_radius,
+                                      upsample=self.args.rvt_upsample,
+                                      kind="normalized")
+
+
+    def finish(self):
+        """Complete the Analysis run."""
+        print("Performing iSCAT Analysis with the following parameters:")
+        self.print_args()
+        if len(self.worklist) > 0:
+            for _ in tqdm.tqdm(range(len(self.worklist)), unit="chunks"):
+                self.advance()
+        assert len(self.worklist) == 0
+
+    def print_args(self):
+        print(f"{os.path.basename(__file__)}", end="")
+        for key, value in vars(self.args).items():
+            print(f" --{key}={value}", end="")
+        print("")
+
+
+###############################################################################
+###
+### The iSCAT GUI
+
+
+class SideBar(fpl.ui.EdgeWindow):
+    def __init__(self, figure, size, location, title):
+        super().__init__(figure=figure, size=size, location=location, title=title)
+
+
+def iscat_gui(analysis: Analysis):
+    s = slice(0, analysis.rvt.shape[0])
+    iw = fpl.ImageWidget(
+        data=[analysis.video[s], analysis.fft_log_abs[s], analysis.corrected[s], analysis.dra, analysis.rvt, analysis.rvt],
+        names=["original", "fft", "corrected", "dra", "rvt", "rvt"],
+        cmap="viridis",
+        figure_kwargs={"size": (analysis.args.gui_width, analysis.args.gui_height),
+                       "controller_ids": None})
+
+    def animation():
+        analysis.advance()
+        frame = iw.current_index["t"]
+        if analysis.current_frame != frame:
+            analysis.current_frame = frame
+
+    iw.figure.add_animations(animation)
+    iw.show()
+
+
+###############################################################################
+###
+###  Parameter Handling
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Analyze iSCAT recordings.")
+
+    parser.add_argument("-i", "--input-file", type=str, required=True,
+                        help="Input file path")
+
+    parser.add_argument("-o", "--output-file", type=str, required=True,
+                        help="Output file path")
+
+    parser.add_argument("--dtype", type=str, default="",
+                        help="The dtype of the RAW file to load, or an empty string.")
+
+    parser.add_argument("--rows", type=int, default=-1,
+                        help="The number of rows of the raw video to load.")
+
+    parser.add_argument("--columns", type=int, default=-1,
+                        help="The number of columns of the raw video to load.")
+
+    parser.add_argument("--frames", type=int, default=-1,
+                        help="The number of frames of the input video to load.")
+
+    parser.add_argument("--normalize", action=argparse.BooleanOptionalAction, default=False,
+                        help="Whether to rescale the input video to the [0, 1] interval.")
+
+    parser.add_argument("--gui", action=argparse.BooleanOptionalAction, default=True,
+                        help="Whether to open a GUI to preview the parameters (default: True).")
+
+    parser.add_argument("--gui-width", type=int, default=1024,
+                        help="The width of the GUI window in Pixels.")
+
+    parser.add_argument("--gui-height", type=int, default=768,
+                        help="The height of the GUI window in Pixels.")
+
+    parser.add_argument("--fft-inner-radius", type=float, default=0.0,
+                        help="The inner circle to cut out in FFT space to filter high-frequencies.")
+
+    parser.add_argument("--fft-outer-radius", type=float, default=1.0,
+                        help="The outer circle to cut out in FFT space to filter low-frequencies.")
+
+    parser.add_argument("--fft-row-noise-threshold", type=float, default=0.00,
+                        help="The percentage of row noise frequencies to cut out in FFT space.")
+
+    parser.add_argument("--fft-column-noise-threshold", type=float, default=0.00,
+                        help="The percentage of column noise frequencies to cut out in FFT space.")
+
+    parser.add_argument("--dra-window-size", type=int, default=20,
+                        help="The number of frames to compute the differential rolling average over.")
+
+    parser.add_argument("--rvt-min-radius", type=int, default=1,
+                        help="The minimum radius (in pixels) to consider for radial variance transform.")
+
+    parser.add_argument("--rvt-max-radius", type=int, default=20,
+                        help="The maximum radius (in pixels) to consider for radial variance transform.")
+
+    parser.add_argument("--rvt-upsample", type=int, default=1,
+                        help="The degree of upsampling during radial variance transform.")
+
+    args = parser.parse_args()
+
+    # Validate that input file exists
+    if not os.path.isfile(args.input_file):
+        parser.error(f"Input file '{args.input_file}' does not exist.")
+
+    # Validate that output file doesn't exist
+    if os.path.exists(args.output_file):
+        parser.error(f"Output file '{args.output_file}' already exists.")
+
+    # Validate the video parameters
+    if args.dtype:
+        dtype = np.dtype(args.dtype)
+        if not args.rows > 0:
+            parser.error(f"The --rows argument must be given when reading raw files.")
+        if not args.columns > 0:
+            parser.error(f"The --columns argument must be given when reading raw files.")
+    else:
+        if args.rows != -1:
+            parser.error(f"The --rows argument must only be given when reading raw files.")
+        if args.columns != -1:
+            parser.error(f"The --columns argument must only be given when reading raw files.")
+
+    # Validate the GUI parameters
+    if args.gui_width < 1:
+        parser.error(f"Videos must have at least one row, got {args.gui_width}.")
+    if args.gui_height < 1:
+        parser.error(f"Videos must have at least one row, got {args.gui_height}.")
+
+    # Validate the FFT parameters
+    if not 0 <= args.fft_inner_radius <= 1:
+        parser.error(f"The --fft-inner-radius must be between 0 and 1, got {args.fft_inner_radius}")
+    if not 0 <= args.fft_outer_radius <= 1:
+        parser.error(f"The --fft-outer-radius must be between 0 and 1, got {args.fft_outer_radius}")
+    if not 0 <= args.fft_row_noise_threshold <= 1:
+        parser.error(f"The --fft-row-noise-threshold must be between 0 and 1, got {args.fft_row_noise_threshold}")
+    if not 0 <= args.fft_column_noise_threshold <= 1:
+        parser.error(f"The --fft-column-noise-threshold must be between 0 and 1, got {args.fft_column_noise_threshold}")
+
+    # Validate the DRA parameters
+    if args.dra_window_size < 1:
+        parser.error(f"The --dra-window-size must be at least one, got {args.dra_window_size}")
+
+    # Validate the RVT parameters
+    if args.rvt_min_radius < 0:
+        parser.error(f"The --rvt-min-radius must be non-negative, got {args.rvt_min_radius}")
+    if not args.rvt_min_radius < args.rvt_max_radius:
+        parser.error(f"The --rvt-max-radius must be larger than {args.rvt_min_radius}, got {args.rvt_max_radius}")
+    if not args.rvt_upsample > 0:
+        parser.error(f"The --rvt-upsample must be non-negative, got {args.rvt_upsample}")
+
+    if args.dtype:
+        dtype = np.dtype(args.dtype)
+        # Derive the number of frames when it is not set.
+        if args.frames == -1:
+            bytes_per_frame = dtype.itemsize * args.rows * args.columns
+            args.frames = os.path.getsize(args.input_file) // bytes_per_frame
+
+        # Load the raw video
+        shape = (args.frames, args.rows, args.columns)
+        count = shape[0] * shape[1] * shape[2]
+        pixels = np.fromfile(args.input_file, dtype=dtype, count=count)
+        video = np.reshape(pixels, shape)
+    else:
+        # Read video using imageio
+        data = iio.imread(args.input_file)
+        if not 0 < data.ndim <= 3:
+            raise ValueError(f"Unexpected input video shape: {data.shape}")
+        video = np.reshape(data, ( (1,) * (3 - data.ndim) + data.shape))
+    # Normalize the video if desired.
+    if args.normalize:
+        minimum = np.min(video)
+        maximum = np.max(video)
+        video = (video - minimum) / (maximum - minimum)
+    # Start the iSCAT analysis
+    analysis = Analysis(args, video)
+    # Unless we have --no-gui, open a GUI for tuning the args
+    if args.gui:
+        analysis.advance()
+        iscat_gui(analysis)
+        fpl.loop.run()
+    # Finish the analysis and save the results.
+    analysis.finish()
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,18 @@
+[project]
+name = "toolsandogh"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+license = {text = "GPL-3.0-or-later"}
+requires-python = ">=3.12"
+dependencies = [
+    "imgui[sdl2]",
+    "fastplotlib[imgui] @ git+https://github.com/fastplotlib/fastplotlib.git@a057faa#egg=fastplotlib[imgui]",
+    "imageio[ffmpeg]",
+    "numpy",
+    "scipy",
+    "scikit-image",
+    "trackpy",
+    "imgrvt",
+    "tqdm",
+]

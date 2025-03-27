@@ -22,7 +22,9 @@ import imageio.v3 as iio
 import numpy as np
 import numpy.typing as npt
 import tqdm
-
+import math
+from fastplotlib.ui import EdgeWindow
+from imgui_bundle import imgui
 
 ###############################################################################
 ###
@@ -61,10 +63,8 @@ class Analysis:
         self.fft = np.zeros(video.shape, dtype=np.complex64)
         self.fft_log_abs = np.zeros(video.shape, dtype=np.float32)
         self.corrected = np.zeros(video.shape, dtype=np.float32)
-        (nframes, nrows, ncols) = video.shape
-        dra_shape = (nframes - 2 * args.dra_window_size + 1, nrows, ncols)
-        self.dra = np.zeros(dra_shape, dtype=np.float32)
-        self.rvt = np.zeros(dra_shape, dtype=np.float32)
+        self.dra = np.zeros(video.shape, dtype=np.float32)
+        self.rvt = np.zeros(video.shape, dtype=np.float32)
         # initialize the worklist
         self.worklist = []
         self.reset(clear_buffers=False)
@@ -93,11 +93,13 @@ class Analysis:
         self.worklist.clear()
         window_size = self.args.dra_window_size
         nframes = self.video.shape[0] - 2 * window_size + 1
-        for start in range(0, nframes, window_size):
-            if (nframes - start) < 2 * window_size:
+        nchunks = (nframes // window_size)
+        chunk_size = math.ceil(nframes / nchunks)
+        for start in range(0, nframes - chunk_size, chunk_size):
+            if (nframes - start) < (2 * chunk_size):
                 end = nframes
             else:
-                end = start + window_size
+                end = start + chunk_size
             self.worklist.append(slice(start, end, 1))
         self.sort_worklist()
 
@@ -107,7 +109,8 @@ class Analysis:
             return
         window_size = self.args.dra_window_size
         dra_frames = self.worklist.pop()
-        print(f"Computing {dra_frames}.")
+        print(f"Computing DRA/RVT frames from {dra_frames.start} to {dra_frames.stop - 1}.")
+        # print(f"Computing {dra_frames}.")
         frames = slice(dra_frames.start, dra_frames.stop + 2 * window_size - 1)
         (nframes, nrows, ncols) = self.video[frames].shape
 
@@ -119,13 +122,13 @@ class Analysis:
         outer = distance <= (self.args.fft_outer_radius * dmax)
         ring = np.logical_and(inner, outer)
         cross = np.zeros((nrows, ncols), dtype=np.bool_)
-        row_offset = self.args.fft_row_noise_threshold / 2
+        row_offset = self.args.fft_column_noise_threshold / 2
         row_start = round(nrows * (0.5 - row_offset))
-        row_end = round(nrows * (0.5 + row_offset)) + 1
+        row_end = round(nrows * (0.5 + row_offset))
         cross[row_start:row_end, :] = True
-        col_offset = self.args.fft_column_noise_threshold / 2
+        col_offset = self.args.fft_row_noise_threshold / 2
         col_start = round(ncols * (0.5 - col_offset))
-        col_end = round(ncols * (0.5 + col_offset)) + 1
+        col_end = round(ncols * (0.5 + col_offset))
         cross[:, col_start:col_end] = True
         mask = np.broadcast_to(np.logical_and(ring, ~cross), (nframes, nrows, ncols))
 
@@ -179,19 +182,65 @@ class Analysis:
 ### The iSCAT GUI
 
 
-class SideBar(fpl.ui.EdgeWindow):
-    def __init__(self, figure, size, location, title):
-        super().__init__(figure=figure, size=size, location=location, title=title)
+class SideBar(EdgeWindow):
+    analysis: Analysis
 
+    def __init__(self, figure, size, location, title, analysis):
+        super().__init__(figure=figure, size=size, location=location, title=title)
+        self.analysis = analysis
+
+    def update(self):
+        args = self.analysis.args
+        changes = False
+        # FFT
+        _, fft_i_r = imgui.slider_float("fft-inner-radius", v=args.fft_inner_radius, v_min=0.0, v_max=0.25)
+        _, fft_o_r = imgui.slider_float("fft-outer-radius", v=args.fft_outer_radius, v_min=0.0, v_max=1.0)
+        _, fft_rnt = imgui.slider_float("fft-row-noise-threshold", v=args.fft_row_noise_threshold, v_min=0.0, v_max=0.125)
+        _, fft_cnt = imgui.slider_float("fft-column-noise-threshold", v=args.fft_column_noise_threshold, v_min=0.0, v_max=0.125)
+        _, dra_w_s = imgui.slider_int("dra-window-size", v=args.dra_window_size, v_min=0, v_max=min(500, args.frames // 3))
+        _, rvt_mnr = imgui.slider_int("rvt-min-radius", v=args.rvt_min_radius, v_min=0, v_max=20)
+        _, rvt_mxr = imgui.slider_int("rvt-max-radius", v=args.rvt_max_radius, v_min=0, v_max=50)
+        _, rvt_ups = imgui.slider_int("rvt-upsample", v=args.rvt_upsample, v_min=0, v_max=4)
+        if fft_i_r != args.fft_inner_radius:
+            args.fft_inner_radius = fft_i_r
+            changes = True
+        if fft_o_r != args.fft_outer_radius:
+            args.fft_outer_radius = fft_o_r
+            changes = True
+        if fft_rnt != args.fft_row_noise_threshold:
+            args.fft_row_noise_threshold = fft_rnt
+            changes = True
+        if fft_cnt != args.fft_column_noise_threshold:
+            args.fft_column_noise_threshold = fft_cnt
+            changes = True
+        if dra_w_s != args.dra_window_size:
+            args.dra_window_size = dra_w_s
+            changes = True
+        if rvt_mnr != args.rvt_min_radius:
+            args.rvt_min_radius = rvt_mnr
+            changes = True
+        if rvt_mxr != args.rvt_max_radius:
+            args.rvt_max_radius = rvt_mxr
+            changes = True
+        if rvt_ups != args.rvt_upsample:
+            args.rvt_upsample = rvt_ups
+            changes = True
+        if changes:
+            self.analysis.reset()
 
 def iscat_gui(analysis: Analysis):
-    s = slice(0, analysis.rvt.shape[0])
-    iw = fpl.ImageWidget(
-        data=[analysis.video[s], analysis.fft_log_abs[s], analysis.corrected[s], analysis.dra, analysis.rvt, analysis.rvt],
+    iw = fpl.widgets.image_widget._widget.ImageWidget(
+        data=[analysis.video, analysis.fft_log_abs, analysis.corrected, analysis.dra, analysis.rvt, analysis.rvt],
         names=["original", "fft", "corrected", "dra", "rvt", "rvt"],
-        cmap="viridis",
+        cmap="plasma",
         figure_kwargs={"size": (analysis.args.gui_width, analysis.args.gui_height),
                        "controller_ids": None})
+    # Hide the axes
+    for subplot in iw.figure:
+        subplot.axes.visible = False
+
+    sidebar = SideBar(iw.figure, 0.2*analysis.args.gui_width, "right", "Parameters", analysis)
+    iw.figure.add_gui(sidebar)
 
     def index_changed(index):
         frame = index["t"]
@@ -202,6 +251,8 @@ def iscat_gui(analysis: Analysis):
 
     def animation():
         analysis.advance()
+        # Update the ImageWidget
+        iw.current_index = iw.current_index
 
     iw.figure.add_animations(animation)
     iw.show()
@@ -239,7 +290,7 @@ def main():
     parser.add_argument("--gui", action=argparse.BooleanOptionalAction, default=True,
                         help="Whether to open a GUI to preview the parameters (default: True).")
 
-    parser.add_argument("--gui-width", type=int, default=1024,
+    parser.add_argument("--gui-width", type=int, default=1280,
                         help="The width of the GUI window in Pixels.")
 
     parser.add_argument("--gui-height", type=int, default=768,
@@ -347,6 +398,8 @@ def main():
     analysis = Analysis(args, video)
     # Unless we have --no-gui, open a GUI for tuning the args
     if args.gui:
+        # Compute the first batch of items before creating the GUI, so that we
+        # have sane bounds for each histogram.
         analysis.advance()
         iscat_gui(analysis)
         fpl.loop.run()

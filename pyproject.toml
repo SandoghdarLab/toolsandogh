@@ -6,7 +6,7 @@ readme = "README.md"
 license = {text = "GPL-3.0-or-later"}
 requires-python = ">=3.12"
 dependencies = [
-    "imgui[sdl2]",
+    "imgui[glfw,sdl2]",
     "fastplotlib[imgui] @ git+https://github.com/fastplotlib/fastplotlib.git@a057faa#egg=fastplotlib[imgui]",
     "imageio[ffmpeg]",
     "numpy",

@@ -26,6 +26,8 @@ import math
 from fastplotlib.ui import EdgeWindow
 from imgui_bundle import imgui
 
+COLORMAPS = ["gray", "viridis", "plasma", "inferno", "magma", "cividis", "gnuplot2"]
+
 ###############################################################################
 ###
 ###  Analysis
@@ -192,15 +194,34 @@ class SideBar(EdgeWindow):
     def update(self):
         args = self.analysis.args
         changes = False
-        # FFT
+        # Widgets
+        imgui.text("GUI Parameters")
+        if imgui.begin_combo("##colormap_combo", args.colormap):
+            for cmap in COLORMAPS:
+                is_selected = cmap == args.colormap
+                if imgui.selectable(cmap, is_selected)[0]:
+                    args.colormap = cmap
+            imgui.end_combo()
+        imgui.separator()
+
+        imgui.text("FFT Parameters")
         _, fft_i_r = imgui.slider_float("fft-inner-radius", v=args.fft_inner_radius, v_min=0.0, v_max=0.25)
         _, fft_o_r = imgui.slider_float("fft-outer-radius", v=args.fft_outer_radius, v_min=0.0, v_max=1.0)
         _, fft_rnt = imgui.slider_float("fft-row-noise-threshold", v=args.fft_row_noise_threshold, v_min=0.0, v_max=0.125)
         _, fft_cnt = imgui.slider_float("fft-column-noise-threshold", v=args.fft_column_noise_threshold, v_min=0.0, v_max=0.125)
+        imgui.separator()
+
+        imgui.text("DRA Parameters")
         _, dra_w_s = imgui.slider_int("dra-window-size", v=args.dra_window_size, v_min=0, v_max=min(500, args.frames // 3))
+        imgui.separator()
+
+        imgui.text("RVT Parameters")
         _, rvt_mnr = imgui.slider_int("rvt-min-radius", v=args.rvt_min_radius, v_min=0, v_max=20)
         _, rvt_mxr = imgui.slider_int("rvt-max-radius", v=args.rvt_max_radius, v_min=0, v_max=50)
         _, rvt_ups = imgui.slider_int("rvt-upsample", v=args.rvt_upsample, v_min=0, v_max=4)
+        imgui.separator()
+
+        # Changes
         if fft_i_r != args.fft_inner_radius:
             args.fft_inner_radius = fft_i_r
             changes = True
@@ -251,6 +272,7 @@ def iscat_gui(analysis: Analysis):
 
     def animation():
         analysis.advance()
+        iw.cmap = analysis.args.colormap
         # Update the ImageWidget
         iw.current_index = iw.current_index
 
@@ -295,6 +317,9 @@ def main():
 
     parser.add_argument("--gui-height", type=int, default=768,
                         help="The height of the GUI window in Pixels.")
+
+    parser.add_argument("--colormap", type=str, default=COLORMAPS[0],
+                        help="The colormap used for visualization in the GUI.")
 
     parser.add_argument("--fft-inner-radius", type=float, default=0.0,
                         help="The inner circle to cut out in FFT space to filter high-frequencies.")

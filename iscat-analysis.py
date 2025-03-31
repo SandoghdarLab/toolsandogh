@@ -202,6 +202,7 @@ class SideBar(EdgeWindow):
                 if imgui.selectable(cmap, is_selected)[0]:
                     args.colormap = cmap
             imgui.end_combo()
+        _, gui_sync = imgui.checkbox("Apply Settings Immediately", args.gui_sync)
         imgui.separator()
 
         imgui.text("FFT Parameters")
@@ -222,6 +223,9 @@ class SideBar(EdgeWindow):
         imgui.separator()
 
         # Changes
+        if gui_sync != args.gui_sync:
+            args.gui_sync = gui_sync
+            changes = True
         if fft_i_r != args.fft_inner_radius:
             args.fft_inner_radius = fft_i_r
             changes = True
@@ -246,7 +250,7 @@ class SideBar(EdgeWindow):
         if rvt_ups != args.rvt_upsample:
             args.rvt_upsample = rvt_ups
             changes = True
-        if changes:
+        if changes and args.gui_sync:
             self.analysis.reset()
 
 def iscat_gui(analysis: Analysis):
@@ -317,6 +321,9 @@ def main():
 
     parser.add_argument("--gui-height", type=int, default=768,
                         help="The height of the GUI window in Pixels.")
+
+    parser.add_argument("--gui-sync", action=argparse.BooleanOptionalAction, default=True,
+                        help="Whether to keep the GUI in sync with the chosen parameters (default: True).")
 
     parser.add_argument("--colormap", type=str, default=COLORMAPS[0],
                         help="The colormap used for visualization in the GUI.")

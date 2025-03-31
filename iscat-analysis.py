@@ -23,6 +23,8 @@ import numpy as np
 import numpy.typing as npt
 import tqdm
 import math
+import trackpy
+import pandas
 from fastplotlib.ui import EdgeWindow
 from imgui_bundle import imgui
 
@@ -55,6 +57,7 @@ class Analysis:
     corrected: npt.NDArray[np.float32]
     dra: npt.NDArray[np.float32]
     rvt: npt.NDArray[np.float32]
+    locs: list[pandas.DataFrame]
     worklist: list[slice]
 
     def __init__(self, args: argparse.Namespace, video: npt.NDArray[np.float32]):
@@ -67,6 +70,7 @@ class Analysis:
         self.corrected = np.zeros(video.shape, dtype=np.float32)
         self.dra = np.zeros(video.shape, dtype=np.float32)
         self.rvt = np.zeros(video.shape, dtype=np.float32)
+        self.locs = [pandas.DataFrame()] * video.shape[0]
         # initialize the worklist
         self.worklist = []
         self.reset(clear_buffers=False)
@@ -91,6 +95,8 @@ class Analysis:
             self.corrected[...] = 0
             self.dra[...] = 0
             self.rvt[...] = 0
+            for index in range(len(self.locs)):
+                self.locs[index] = pandas.DataFrame()
         # Reinitialize the worklist
         self.worklist.clear()
         window_size = self.args.dra_window_size
@@ -111,8 +117,7 @@ class Analysis:
             return
         window_size = self.args.dra_window_size
         dra_frames = self.worklist.pop()
-        print(f"Computing DRA/RVT frames from {dra_frames.start} to {dra_frames.stop - 1}.")
-        # print(f"Computing {dra_frames}.")
+        # print(f"Computing DRA/RVT frames from {dra_frames.start} to {dra_frames.stop - 1}.")
         frames = slice(dra_frames.start, dra_frames.stop + 2 * window_size - 1)
         (nframes, nrows, ncols) = self.video[frames].shape
 
@@ -162,6 +167,15 @@ class Analysis:
                                       upsample=self.args.rvt_upsample,
                                       kind="normalized")
 
+        # Track Particles
+        for frame in range(dra_frames.start, dra_frames.stop):
+            self.locs[frame] = trackpy.locate(self.rvt[frame],
+                                              diameter=2*self.args.tracking_radius+1,
+                                              minmass=self.args.tracking_min_mass,
+                                              percentile=self.args.tracking_percentile,
+                                              preprocess=False,
+                                              characterize=False)
+
 
     def finish(self):
         """Complete the Analysis run."""
@@ -186,14 +200,17 @@ class Analysis:
 
 class SideBar(EdgeWindow):
     analysis: Analysis
+    rvt_changes: bool
+    loc_changes: bool
 
     def __init__(self, figure, size, location, title, analysis):
         super().__init__(figure=figure, size=size, location=location, title=title)
+        self.rvt_changes = False
+        self.loc_changes = True
         self.analysis = analysis
 
     def update(self):
         args = self.analysis.args
-        changes = False
         # Widgets
         imgui.text("GUI Parameters")
         if imgui.begin_combo("##colormap_combo", args.colormap):
@@ -222,36 +239,54 @@ class SideBar(EdgeWindow):
         _, rvt_ups = imgui.slider_int("rvt-upsample", v=args.rvt_upsample, v_min=0, v_max=4)
         imgui.separator()
 
+        imgui.text("Tracking Parameters")
+        _, tracking_radius = imgui.slider_int("tracking-radius", v=args.tracking_radius, v_min=0, v_max=20)
+        _, tracking_min_mass = imgui.slider_float("tracking-min-mass", v=args.tracking_min_mass, v_min=0.0, v_max=400.0)
+        _, tracking_percentile = imgui.slider_float("tracking-percentile", v=args.tracking_percentile, v_min=0.0, v_max=100.0)
+        imgui.separator()
+
         # Changes
         if gui_sync != args.gui_sync:
             args.gui_sync = gui_sync
-            changes = True
         if fft_i_r != args.fft_inner_radius:
             args.fft_inner_radius = fft_i_r
-            changes = True
+            self.rvt_changes = True
         if fft_o_r != args.fft_outer_radius:
             args.fft_outer_radius = fft_o_r
-            changes = True
+            self.rvt_changes = True
         if fft_rnt != args.fft_row_noise_threshold:
             args.fft_row_noise_threshold = fft_rnt
-            changes = True
+            self.rvt_changes = True
         if fft_cnt != args.fft_column_noise_threshold:
             args.fft_column_noise_threshold = fft_cnt
-            changes = True
+            self.rvt_changes = True
         if dra_w_s != args.dra_window_size:
             args.dra_window_size = dra_w_s
-            changes = True
+            self.rvt_changes = True
         if rvt_mnr != args.rvt_min_radius:
             args.rvt_min_radius = rvt_mnr
-            changes = True
+            self.rvt_changes = True
         if rvt_mxr != args.rvt_max_radius:
             args.rvt_max_radius = rvt_mxr
-            changes = True
+            self.rvt_changes = True
         if rvt_ups != args.rvt_upsample:
             args.rvt_upsample = rvt_ups
-            changes = True
-        if changes and args.gui_sync:
-            self.analysis.reset()
+            self.rvt_changes = True
+        if tracking_radius != args.tracking_radius:
+            args.tracking_radius = tracking_radius
+            self.loc_changes = True
+        if tracking_min_mass != args.tracking_min_mass:
+            args.tracking_min_mass = tracking_min_mass
+            self.loc_changes = True
+        if tracking_percentile != args.tracking_percentile:
+            args.tracking_percentile = tracking_percentile
+            self.loc_changes = True
+        if self.rvt_changes:
+            self.loc_changes = True
+        if args.gui_sync:
+            if self.rvt_changes:
+                self.analysis.reset()
+                self.rvt_changes = False
 
 def iscat_gui(analysis: Analysis):
     iw = fpl.widgets.image_widget._widget.ImageWidget(
@@ -264,13 +299,22 @@ def iscat_gui(analysis: Analysis):
     for subplot in iw.figure:
         subplot.axes.visible = False
 
-    sidebar = SideBar(iw.figure, 0.2*analysis.args.gui_width, "right", "Parameters", analysis)
+    sidebar_width = min(0.3*analysis.args.gui_width, 400)
+    sidebar = SideBar(iw.figure, sidebar_width, "right", "Parameters", analysis)
     iw.figure.add_gui(sidebar)
+    frame = 0
+    lc1 = iw.figure[1,0].add_line_collection([], thickness=2, colors="yellow")
+    lc2 = iw.figure[1,1].add_line_collection([], thickness=2, colors="yellow")
 
     def index_changed(index):
-        frame = index["t"]
+        nonlocal frame
+        new_frame = index["t"]
+        if frame == new_frame:
+            return
+        frame = new_frame
         analysis.sort_worklist(frame)
         analysis.advance()
+        redraw_circles()
 
     iw.add_event_handler(index_changed, event="current_index")
 
@@ -279,9 +323,31 @@ def iscat_gui(analysis: Analysis):
         iw.cmap = analysis.args.colormap
         # Update the ImageWidget
         iw.current_index = iw.current_index
+        if sidebar.loc_changes:
+            sidebar.loc_changes = False
+            redraw_circles()
+
+    def redraw_circles():
+        circles = list()
+        for _, row in analysis.locs[frame].iterrows():
+            x, y = float(row["x"]), float(row["y"])
+            circles.append(make_circle(x, y, analysis.args.tracking_radius))
+        nonlocal lc1, lc2
+        iw.figure[1,0].delete_graphic(lc1)
+        iw.figure[1,1].delete_graphic(lc2)
+        lc1 = iw.figure[1,0].add_line_collection(circles, thickness=2, colors="yellow")
+        lc2 = iw.figure[1,1].add_line_collection(circles, thickness=2, colors="yellow")
 
     iw.figure.add_animations(animation)
     iw.show()
+
+
+def make_circle(x: float, y: float, radius: float, n_points: int = 20) -> np.ndarray:
+    theta = np.linspace(0, 2 * np.pi, n_points)
+    xs = radius * np.sin(theta)
+    ys = radius * np.cos(theta)
+
+    return np.column_stack([xs, ys]) + np.array([x, y])
 
 
 ###############################################################################
@@ -310,16 +376,16 @@ def main():
     parser.add_argument("--frames", type=int, default=-1,
                         help="The number of frames of the input video to load.")
 
-    parser.add_argument("--normalize", action=argparse.BooleanOptionalAction, default=False,
+    parser.add_argument("--normalize", action=argparse.BooleanOptionalAction, default=True,
                         help="Whether to rescale the input video to the [0, 1] interval.")
 
     parser.add_argument("--gui", action=argparse.BooleanOptionalAction, default=True,
                         help="Whether to open a GUI to preview the parameters (default: True).")
 
-    parser.add_argument("--gui-width", type=int, default=1280,
+    parser.add_argument("--gui-width", type=int, default=1920,
                         help="The width of the GUI window in Pixels.")
 
-    parser.add_argument("--gui-height", type=int, default=768,
+    parser.add_argument("--gui-height", type=int, default=1080,
                         help="The height of the GUI window in Pixels.")
 
     parser.add_argument("--gui-sync", action=argparse.BooleanOptionalAction, default=True,
@@ -351,6 +417,15 @@ def main():
 
     parser.add_argument("--rvt-upsample", type=int, default=1,
                         help="The degree of upsampling during radial variance transform.")
+
+    parser.add_argument("--tracking-radius", type=int, default=4,
+                        help="The radius (in pixels) of structures to locate in the RVT image.")
+
+    parser.add_argument("--tracking-min-mass", type=float, default=0.0,
+                        help="The minimum mass of structures to locate in the RVT image.")
+
+    parser.add_argument("--tracking-percentile", type=float, default=90.0,
+                        help="Features must be brighter than this percentile to be considered for tracking.")
 
     args = parser.parse_args()
 

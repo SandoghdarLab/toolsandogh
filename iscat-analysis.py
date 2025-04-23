@@ -1,6 +1,6 @@
 #!/usr/bin/env -S uv run --script
 # /// script
-# requires-python = ">=3.11"
+# requires-python = "==3.11"
 # dependencies = [
 #     "imgui[sdl2]",
 #     "fastplotlib[imgui] @ git+https://github.com/fastplotlib/fastplotlib.git@a057faa#egg=fastplotlib[imgui]",
@@ -173,6 +173,7 @@ class Analysis:
                                               diameter=2*self.args.tracking_radius+1,
                                               minmass=self.args.tracking_min_mass,
                                               percentile=self.args.tracking_percentile,
+                                              topn=self.args.tracking_count,
                                               preprocess=False,
                                               characterize=False)
 
@@ -241,8 +242,9 @@ class SideBar(EdgeWindow):
 
         imgui.text("Tracking Parameters")
         _, tracking_radius = imgui.slider_int("tracking-radius", v=args.tracking_radius, v_min=0, v_max=20)
-        _, tracking_min_mass = imgui.slider_float("tracking-min-mass", v=args.tracking_min_mass, v_min=0.0, v_max=400.0)
+        _, tracking_min_mass = imgui.slider_float("tracking-min-mass", v=args.tracking_min_mass, v_min=0.0, v_max=5.0)
         _, tracking_percentile = imgui.slider_float("tracking-percentile", v=args.tracking_percentile, v_min=0.0, v_max=100.0)
+        _, tracking_count = imgui.slider_int("tracking-count", v=args.tracking_count, v_min=0, v_max=500)
         imgui.separator()
 
         # Changes
@@ -281,12 +283,16 @@ class SideBar(EdgeWindow):
         if tracking_percentile != args.tracking_percentile:
             args.tracking_percentile = tracking_percentile
             self.loc_changes = True
+        if tracking_count != args.tracking_count:
+            args.tracking_count = tracking_count
+            self.loc_changes = True
         if self.rvt_changes:
             self.loc_changes = True
         if args.gui_sync:
             if self.rvt_changes:
                 self.analysis.reset()
                 self.rvt_changes = False
+                self.loc_changes = False
 
 def iscat_gui(analysis: Analysis):
     iw = fpl.widgets.image_widget._widget.ImageWidget(
@@ -299,7 +305,7 @@ def iscat_gui(analysis: Analysis):
     for subplot in iw.figure:
         subplot.axes.visible = False
 
-    sidebar_width = min(0.3*analysis.args.gui_width, 400)
+    sidebar_width = min(0.3*analysis.args.gui_width, 390)
     sidebar = SideBar(iw.figure, sidebar_width, "right", "Parameters", analysis)
     iw.figure.add_gui(sidebar)
     frame = 0
@@ -412,7 +418,7 @@ def main():
     parser.add_argument("--rvt-min-radius", type=int, default=1,
                         help="The minimum radius (in pixels) to consider for radial variance transform.")
 
-    parser.add_argument("--rvt-max-radius", type=int, default=20,
+    parser.add_argument("--rvt-max-radius", type=int, default=8,
                         help="The maximum radius (in pixels) to consider for radial variance transform.")
 
     parser.add_argument("--rvt-upsample", type=int, default=1,
@@ -424,8 +430,11 @@ def main():
     parser.add_argument("--tracking-min-mass", type=float, default=0.0,
                         help="The minimum mass of structures to locate in the RVT image.")
 
-    parser.add_argument("--tracking-percentile", type=float, default=90.0,
+    parser.add_argument("--tracking-percentile", type=float, default=80.0,
                         help="Features must be brighter than this percentile to be considered for tracking.")
+
+    parser.add_argument("--tracking-count", type=float, default=200,
+                        help="Track only the specified number of brightest particles in each frame.")
 
     args = parser.parse_args()
 

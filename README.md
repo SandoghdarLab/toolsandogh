@@ -22,6 +22,16 @@ This repository collects data analysis scripts of the Sandoghdar Division of the
 |--------|-------------|-------|
 | ```iscat-analysis.py``` | iSCAT Analysis | ```./iscat_analysis.py -i input.tif -o output.tif``` |
 
+## Troubleshooting
+
+### "smudge filter lfs failed" on Windows when using uv
+
+Solution: Set the following environment variable in Powershell
+
+```powershell
+$env:GIT_LFS_SKIP_SMUDGE = "1"
+```
+
 ## Guidelines for New Scripts
 
 - Each script should be self-contained in a single file

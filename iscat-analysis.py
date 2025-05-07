@@ -1,6 +1,6 @@
 #!/usr/bin/env -S uv run --script
 # /// script
-# requires-python = "==3.11"
+# requires-python = ">3.12,<3.13"
 # dependencies = [
 #     "imgui[sdl2]",
 #     "fastplotlib[imgui] @ git+https://github.com/fastplotlib/fastplotlib.git@a057faa#egg=fastplotlib[imgui]",
@@ -25,10 +25,76 @@ import tqdm
 import math
 import trackpy
 import pandas
+from typing import TypeVar, Generic
+from multiprocessing.shared_memory import SharedMemory
 from fastplotlib.ui import EdgeWindow
 from imgui_bundle import imgui
 
-COLORMAPS = ["gray", "viridis", "plasma", "inferno", "magma", "cividis", "gnuplot2"]
+
+D = TypeVar('D', bound=npt.DTypeLike)
+
+
+###############################################################################
+###
+###  Utilities
+
+
+class SharedArray(Generic[D]):
+    _shape: tuple[int, ...]
+    _dtype: D
+    _shm: SharedMemory
+    _array: npt.NDArray[D]
+
+    def __init__(self, shape: tuple[int, ...], dtype: D):
+        self._shape = shape
+        self._dtype = np.dtype(dtype)
+        size = math.prod(shape) * np.dtype(self._dtype).itemsize
+        self._shm = SharedMemory(create=True, size=size)
+        self._array = np.ndarray(shape, dtype, buffer=self._shm.buf)
+
+    def __array__(self):
+        return self._array
+
+    def __getitem__(self, key):
+        return self._array.__getitem__(key)
+
+    def __setitem__(self, key, value):
+        return self._array.__setitem__(key, value)
+
+    def __len__(self):
+        return self._array.__len__()
+
+    def __str__(self):
+        return self._array.__str__()
+
+    def __getstate__(self):
+        return {
+            '_shape': self._shape,
+            '_dtype': self._dtype.name,
+            '_shm': self._shm,
+        }
+
+    def __setstate__(self, state):
+        self._shape = state['_shape']
+        self._dtype = np.dtype(state['_dtype'])
+        self._shm = state['_shm']
+        self._array = np.ndarray(
+            self._shape,
+            dtype=self._dtype,
+            buffer=self._shm.buf
+        )
+
+    def __del__(self):
+        self._shm.close()
+
+    def delete(self):
+        self._shm.unlink()
+
+    @property
+    def shape(self):
+        return self._shape
+
+
 
 ###############################################################################
 ###
@@ -40,36 +106,37 @@ class Analysis:
 
     Attributes:
         args (argparse.Namespace): The parsed command line arguments
-        video (npt.NDArray[np.float32]): The original video
-        fft (npt.NDArray[np.complex64]): FFT of the original video
-        fft_log_abs (npt.NDArray[np.float32]): log(abs(fft + 1))
-        corrected (npt.NDArray[np.float32]): The inverse FFT of fft_part
-        dra (npt.NDArray[np.float32]): Differential rolling average of corrected
-        rvt (npt.NDArray[np.float32]): Radial variance transform of dra
-        bits (npt.NDArray[np.bool_]): One bit per dra_window_size frames
+        video (SharedArray[np.float32]): The original video
+        fft (SharedArray[np.complex64]): FFT of the original video
+        fft_log_abs (SharedArray[np.float32]): log(abs(fft + 1))
+        corrected (SharedArray[np.float32]): The inverse FFT of fft_part
+        dra (SharedArray[np.float32]): Differential rolling average of corrected
+        rvt (SharedArray[np.float32]): Radial variance transform of dra
+        bits (SharedArray[np.bool_]): One bit per dra_window_size frames
         worklist (list[slice]): A list of dra slices that have yet to be computed
     """
 
     args: argparse.Namespace
-    video: npt.NDArray[np.float32]
-    fft: npt.NDArray[np.complex64]
-    fft_log_abs: npt.NDArray[np.float32]
-    corrected: npt.NDArray[np.float32]
-    dra: npt.NDArray[np.float32]
-    rvt: npt.NDArray[np.float32]
+    video: SharedArray[np.float32]
+    fft: SharedArray[np.complex64]
+    fft_log_abs: SharedArray[np.float32]
+    corrected: SharedArray[np.float32]
+    dra: SharedArray[np.float32]
+    rvt: SharedArray[np.float32]
     locs: list[pandas.DataFrame]
     worklist: list[slice]
 
     def __init__(self, args: argparse.Namespace, video: npt.NDArray[np.float32]):
-        assert video.ndim == 3
+        assert video.ndim == 3  # frames, height, width
         self.args = args
-        # initialize all buffers
-        self.video = video.astype(np.float32)
-        self.fft = np.zeros(video.shape, dtype=np.complex64)
-        self.fft_log_abs = np.zeros(video.shape, dtype=np.float32)
-        self.corrected = np.zeros(video.shape, dtype=np.float32)
-        self.dra = np.zeros(video.shape, dtype=np.float32)
-        self.rvt = np.zeros(video.shape, dtype=np.float32)
+        # initialize all shared arrays
+        self.video = SharedArray(video.shape, np.float32)
+        self.video[...] = video.astype(np.float32)
+        self.fft = SharedArray(video.shape, dtype=np.complex64)
+        self.fft_log_abs = SharedArray(video.shape, dtype=np.float32)
+        self.corrected = SharedArray(video.shape, dtype=np.float32)
+        self.dra = SharedArray(video.shape, dtype=np.float32)
+        self.rvt = SharedArray(video.shape, dtype=np.float32)
         self.locs = [pandas.DataFrame()] * video.shape[0]
         # initialize the worklist
         self.worklist = []
@@ -199,6 +266,9 @@ class Analysis:
 ### The iSCAT GUI
 
 
+COLORMAPS = ["gray", "viridis", "plasma", "inferno", "magma", "cividis", "gnuplot2"]
+
+
 class SideBar(EdgeWindow):
     analysis: Analysis
     rvt_changes: bool
@@ -296,7 +366,12 @@ class SideBar(EdgeWindow):
 
 def iscat_gui(analysis: Analysis):
     iw = fpl.widgets.image_widget._widget.ImageWidget(
-        data=[analysis.video, analysis.fft_log_abs, analysis.corrected, analysis.dra, analysis.rvt, analysis.rvt],
+        data=[analysis.video._array,
+              analysis.fft_log_abs._array,
+              analysis.corrected._array,
+              analysis.dra._array,
+              analysis.rvt._array,
+              analysis.rvt._array],
         names=["original", "fft", "corrected", "dra", "rvt", "rvt"],
         cmap="plasma",
         figure_kwargs={"size": (analysis.args.gui_width, analysis.args.gui_height),

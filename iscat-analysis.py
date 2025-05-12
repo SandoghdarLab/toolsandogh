@@ -173,7 +173,11 @@ class ComputeFFT(Task):
         col_start = round(ncols * (0.5 - col_offset))
         col_end = round(ncols * (0.5 + col_offset))
         cross[:, col_start:col_end] = True
-        mask = np.broadcast_to(np.logical_and(ring, ~cross), (nframes, nrows, ncols))
+        pattern = np.logical_and(ring, ~cross)
+        # Ensure the pattern is symmetric
+        pattern = np.logical_and(pattern, np.flip(pattern, axis=0))
+        pattern = np.logical_and(pattern, np.flip(pattern, axis=1))
+        mask = np.broadcast_to(pattern, (nframes, nrows, ncols))
 
         # Compute the FFT
         raw_fft = np.fft.fft2(self.video[self.start:self.end], axes=(1, 2))

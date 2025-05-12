@@ -315,6 +315,12 @@ class Analysis:
 
     def __exit__(self, exc_type, exc_value, traceback):
         self.finish()
+        self.video._shm.unlink()
+        self.fft._shm.unlink()
+        self.fft_log_abs._shm.unlink()
+        self.corrected._shm.unlink()
+        self.rvt._shm.unlink()
+        self.dra._shm.unlink()
         self.pool.close()
         self.pool.terminate()
 
@@ -789,4 +795,5 @@ def main():
 
 
 if __name__ == "__main__":
+    multiprocessing.set_start_method('spawn')
     main()

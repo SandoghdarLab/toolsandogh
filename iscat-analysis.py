@@ -17,21 +17,24 @@
 import argparse
 import os
 import fastplotlib as fpl
-import imgrvt as rvt
+import imgrvt
 import imageio.v3 as iio
+import itertools
+import multiprocessing
 import numpy as np
 import numpy.typing as npt
-import tqdm
 import math
+import time
 import trackpy
 import pandas
-from typing import TypeVar, Generic
+from typing import TypeVar, Generic, Literal, Callable
+import multiprocessing.pool
+from dataclasses import dataclass
 from multiprocessing.shared_memory import SharedMemory
 from fastplotlib.ui import EdgeWindow
 from imgui_bundle import imgui
 
-
-D = TypeVar('D', bound=npt.DTypeLike)
+_Dtype = TypeVar("_Dtype", bound=np.generic, covariant=True)
 
 
 ###############################################################################
@@ -39,16 +42,19 @@ D = TypeVar('D', bound=npt.DTypeLike)
 ###  Utilities
 
 
-class SharedArray(Generic[D]):
+class SharedArray(Generic[_Dtype]):
+    """
+    A Numpy array wrapper to make it inter-process shareable via pickling.
+    """
     _shape: tuple[int, ...]
-    _dtype: D
+    _dtype: np.dtype
     _shm: SharedMemory
-    _array: npt.NDArray[D]
+    _array: npt.NDArray[_Dtype]
 
-    def __init__(self, shape: tuple[int, ...], dtype: D):
+    def __init__(self, shape: tuple[int, ...], dtype: npt.DTypeLike):
         self._shape = shape
         self._dtype = np.dtype(dtype)
-        size = math.prod(shape) * np.dtype(self._dtype).itemsize
+        size = math.prod(shape) * self._dtype.itemsize
         self._shm = SharedMemory(create=True, size=size)
         self._array = np.ndarray(shape, dtype, buffer=self._shm.buf)
 
@@ -84,16 +90,9 @@ class SharedArray(Generic[D]):
             buffer=self._shm.buf
         )
 
-    def __del__(self):
-        self._shm.close()
-
-    def delete(self):
-        self._shm.unlink()
-
     @property
     def shape(self):
         return self._shape
-
 
 
 ###############################################################################
@@ -101,34 +100,193 @@ class SharedArray(Generic[D]):
 ###  Analysis
 
 
+@dataclass
+class Task:
+    dependencies: list['Task']
+    status: Literal['unscheduled', 'scheduled', 'finished']
+    start: int
+    end: int
+
+    def is_unscheduled(self):
+        return self.status == 'unscheduled'
+
+    def is_scheduled(self):
+        return self.status == 'scheduled'
+
+    def is_finished(self):
+        return self.status == 'finished'
+
+    def run(self):
+        pass
+
+    def schedule(self, pool: multiprocessing.pool.Pool):
+        assert self.is_unscheduled()
+        self.status = 'scheduled'
+
+        def callback(_):
+            self.status = 'finished'
+
+        def error_callback(exc):
+            raise exc
+
+        pool.apply_async(run_task,
+                         [self],
+                         callback=callback,
+                         error_callback=error_callback)
+
+
+def run_task(task: Task):
+    task.run()
+
+
+def filter_tasks(tasks: list[Task], start: int, end: int) -> list[Task]:
+    return [task for task in tasks if not ((end < task.start) or (task.end < start))]
+
+
+@dataclass
+class ComputeFFT(Task):
+    video: SharedArray[np.float32]
+    fft: SharedArray[np.complex64]
+    fft_log_abs: SharedArray[np.float32]
+    corrected: SharedArray[np.float32]
+    inner_radius: float
+    outer_radius: float
+    column_noise_threshold: float
+    row_noise_threshold: float
+
+    def run(self):
+        # Compute the FFT mask
+        nframes = self.end - self.start
+        (_, nrows, ncols) = self.video.shape
+        row, col = np.mgrid[:nrows, :ncols]
+        distance = np.sqrt((row - nrows / 2) ** 2 + (col - ncols / 2) ** 2)
+        dmax = np.max(distance)
+        inner = (self.inner_radius * dmax) <= distance
+        outer = distance <= (self.outer_radius * dmax)
+        ring = np.logical_and(inner, outer)
+        cross = np.zeros((nrows, ncols), dtype=np.bool_)
+        row_offset = self.column_noise_threshold / 2
+        row_start = round(nrows * (0.5 - row_offset))
+        row_end = round(nrows * (0.5 + row_offset))
+        cross[row_start:row_end, :] = True
+        col_offset = self.row_noise_threshold / 2
+        col_start = round(ncols * (0.5 - col_offset))
+        col_end = round(ncols * (0.5 + col_offset))
+        cross[:, col_start:col_end] = True
+        mask = np.broadcast_to(np.logical_and(ring, ~cross), (nframes, nrows, ncols))
+
+        # Compute the FFT
+        raw_fft = np.fft.fft2(self.video[self.start:self.end], axes=(1, 2))
+        shifted_fft = np.fft.fftshift(raw_fft, axes=(1, 2))
+        filtered_fft = np.where(mask, shifted_fft, 0.0)
+        ifft = np.fft.ifft2(np.fft.fftshift(filtered_fft, axes=(1,2)), axes=(1,2))
+        self.corrected[self.start:self.end] = np.real(ifft)
+        self.fft[self.start:self.end] = filtered_fft
+        self.fft_log_abs[self.start:self.end] = np.log(np.abs(filtered_fft + 1))
+
+
+@dataclass
+class ComputeDRA(Task):
+    video: SharedArray[np.float32]
+    dra: SharedArray[np.float32]
+    window_size: int
+
+    def run(self):
+        # Compute the rolling average
+        ndra = self.end - self.start
+        vid_end = self.end + (2 * self.window_size) - 1
+        padded = np.pad(self.video[self.start:vid_end], ((1, 0), (0, 0), (0, 0)),)
+        cumsum = np.cumsum(padded, axis=0)
+        ravg = cumsum[self.window_size:] - cumsum[0:-self.window_size]
+        if len(ravg) != (ndra + self.window_size):
+            raise RuntimeError(f"{self.start=} {self.end=} {vid_end=} {len(ravg)=}")
+        # Compute the differential rolling average
+        left = ravg[0:-self.window_size]
+        right = ravg[self.window_size:]
+        self.dra[self.start:self.end] = (left - right)
+
+
+@dataclass
+class ComputeRVT(Task):
+    video: SharedArray[np.float32]
+    rvt: SharedArray[np.float32]
+    min_radius: int
+    max_radius: int
+    upsample: int
+    start: int
+    end: int
+
+    def run(self):
+        for frame in range(self.start, self.end):
+            self.rvt[frame] = imgrvt.rvt(
+                self.video[frame],
+                rmin=self.min_radius,
+                rmax=self.max_radius,
+                upsample=self.upsample,
+                kind="normalized")
+
+
+@dataclass
+class ComputeLOC(Task):
+    video: SharedArray[np.float32]
+    loc: SharedArray
+    tracking_radius: int
+    tracking_min_mass: float
+    tracking_percentile: float
+    tracking_count: int
+    start: int
+    end: int
+    def run(self):
+        for frame in range(self.start, self.end):
+            self.loc[frame] = trackpy.locate(
+                self.video[frame],
+                diameter=2*self.tracking_radius+1,
+                minmass=self.tracking_min_mass,
+                percentile=self.tracking_percentile,
+                topn=self.tracking_count,
+                preprocess=False,
+                characterize=False)
+
 class Analysis:
     """All the data associated with one iSCAT Analysis run.
 
     Attributes:
         args (argparse.Namespace): The parsed command line arguments
         video (SharedArray[np.float32]): The original video
+        pool (multiprocessing.pool.Pool): The worker pool
+        work (list[multiprocessing.pool.AsyncResult]): List of pending calculations
+        current_frame (int): The frame being viewed right now
         fft (SharedArray[np.complex64]): FFT of the original video
         fft_log_abs (SharedArray[np.float32]): log(abs(fft + 1))
         corrected (SharedArray[np.float32]): The inverse FFT of fft_part
         dra (SharedArray[np.float32]): Differential rolling average of corrected
         rvt (SharedArray[np.float32]): Radial variance transform of dra
-        bits (SharedArray[np.bool_]): One bit per dra_window_size frames
-        worklist (list[slice]): A list of dra slices that have yet to be computed
+        loc (list[pandas.DataFrame]): Positions of detected particles
+        fft_tasks (list[ComputeFFT]): List of FFT tasks
+        dra_tasks (list[ComputeDRA]): List of DRA tasks
+        rvt_tasks (list[ComputeRVT]): List of RVT tasks
+        LOC_tasks (list[ComputeLOC]): List of LOC tasks
+        schedule (list[tuple]): All scheduled tasks
     """
 
     args: argparse.Namespace
+    video: SharedArray[np.float32]
+    pool: multiprocessing.pool.Pool
+    scheduled: list[multiprocessing.pool.AsyncResult]
     video: SharedArray[np.float32]
     fft: SharedArray[np.complex64]
     fft_log_abs: SharedArray[np.float32]
     corrected: SharedArray[np.float32]
     dra: SharedArray[np.float32]
     rvt: SharedArray[np.float32]
-    locs: list[pandas.DataFrame]
-    worklist: list[slice]
+    loc: list[pandas.DataFrame]
 
     def __init__(self, args: argparse.Namespace, video: npt.NDArray[np.float32]):
         assert video.ndim == 3  # frames, height, width
         self.args = args
+        self.pool = multiprocessing.Pool(processes=args.nprocs)
+        self.work = []
+        self.current_frame = 0
         # initialize all shared arrays
         self.video = SharedArray(video.shape, np.float32)
         self.video[...] = video.astype(np.float32)
@@ -137,122 +295,145 @@ class Analysis:
         self.corrected = SharedArray(video.shape, dtype=np.float32)
         self.dra = SharedArray(video.shape, dtype=np.float32)
         self.rvt = SharedArray(video.shape, dtype=np.float32)
-        self.locs = [pandas.DataFrame()] * video.shape[0]
-        # initialize the worklist
-        self.worklist = []
-        self.reset(clear_buffers=False)
+        self.loc = [pandas.DataFrame()] * video.shape[0]
+        # Initialize tasks
+        self.fft_tasks = []
+        self.dra_tasks = []
+        self.rvt_tasks = []
+        self.loc_tasks = []
+        self.invalidate_fft()
+        self.invalidate_dra()
+        self.invalidate_rvt()
+        self.invalidate_loc()
 
-    def sort_worklist(self, current_frame=0):
-        # Reorder the worklist
-        def slice_distance(s: slice) -> int:
-            if s.start <= current_frame < s.stop:
-                return 0
-            else:
-                return min(abs(s.start - current_frame),
-                           abs(s.stop - 1 - current_frame))
+    def __enter__(self):
+        return self
 
-        self.worklist = sorted(self.worklist, key=slice_distance, reverse=True)
+    def __exit__(self, exc_type, exc_value, traceback):
+        self.finish()
+        self.pool.close()
+        self.pool.terminate()
 
-    def reset(self, clear_buffers=True):
-        """Clear all buffers and reinitialize the worklist."""
-        # Clear all buffers
-        if clear_buffers:
-            self.fft[...] = 0
-            self.fft_log_abs[...] = 0
-            self.corrected[...] = 0
-            self.dra[...] = 0
-            self.rvt[...] = 0
-            for index in range(len(self.locs)):
-                self.locs[index] = pandas.DataFrame()
-        # Reinitialize the worklist
-        self.worklist.clear()
+    def change_current_frame(self, frame: int):
+        if self.current_frame != frame:
+            self.current_frame = frame
+
+    def invalidate_fft(self):
+        chunk_size = 16
+        self.fft_tasks = [
+            ComputeFFT(
+                dependencies=[],
+                status='unscheduled',
+                video=self.video,
+                fft=self.fft,
+                fft_log_abs=self.fft_log_abs,
+                corrected=self.corrected,
+                inner_radius=self.args.fft_inner_radius,
+                outer_radius=self.args.fft_outer_radius,
+                column_noise_threshold=self.args.fft_column_noise_threshold,
+                row_noise_threshold=self.args.fft_row_noise_threshold,
+                start=start,
+                end=min(start+chunk_size, len(self.video)))
+            for start in range(0, len(self.video), chunk_size)]
+
+    def invalidate_dra(self):
+        nframes = len(self.video)
         window_size = self.args.dra_window_size
-        nframes = self.video.shape[0] - 2 * window_size + 1
-        nchunks = (nframes // window_size)
-        chunk_size = math.ceil(nframes / nchunks)
-        for start in range(0, nframes - chunk_size, chunk_size):
-            if (nframes - start) < (2 * chunk_size):
-                end = nframes
-            else:
-                end = start + chunk_size
-            self.worklist.append(slice(start, end, 1))
-        self.sort_worklist()
+        ndra = nframes - (2 * window_size) + 1
+        chunk_size = max(16, window_size)
+        nchunks = math.floor(ndra / chunk_size)
+        rest = ndra % chunk_size
+        position = 0
+        bounds = []
+        for size in [chunk_size] * (nchunks - 1) + [chunk_size + rest]:
+            bounds.append((position, position+size))
+            position += size
+        self.dra_tasks = [
+            ComputeDRA(
+                dependencies=filter_tasks(self.fft_tasks, start, end + (2 * window_size) - 1),
+                status='unscheduled',
+                start=start,
+                end=end,
+                video=self.corrected,
+                dra=self.dra,
+                window_size=self.args.dra_window_size)
+            for (start, end) in bounds]
 
-    def advance(self):
-        """(Re)compute parts of the Analysis run.  Prefer those close to the current_frame."""
-        if len(self.worklist) == 0:
-            return
+    def invalidate_rvt(self):
+        nframes = len(self.video)
         window_size = self.args.dra_window_size
-        dra_frames = self.worklist.pop()
-        # print(f"Computing DRA/RVT frames from {dra_frames.start} to {dra_frames.stop - 1}.")
-        frames = slice(dra_frames.start, dra_frames.stop + 2 * window_size - 1)
-        (nframes, nrows, ncols) = self.video[frames].shape
+        nrvt = nframes - (2 * window_size) + 1
+        chunk_size = 16
+        self.rvt_tasks = [
+            ComputeRVT(
+                dependencies=filter_tasks(self.dra_tasks, start, start+chunk_size),
+                status='unscheduled',
+                start=start,
+                end=min(start+chunk_size, nrvt),
+                video=self.video,
+                rvt=self.rvt,
+                min_radius=self.args.rvt_min_radius,
+                max_radius=self.args.rvt_max_radius,
+                upsample=self.args.rvt_upsample
+            )
+            for start in range(0, nrvt, chunk_size)]
 
-        # Determine the FFT mask
-        row, col = np.mgrid[:nrows, :ncols]
-        distance = np.sqrt((row - nrows / 2) ** 2 + (col - ncols / 2) ** 2)
-        dmax = np.max(distance)
-        inner = (self.args.fft_inner_radius * dmax) <= distance
-        outer = distance <= (self.args.fft_outer_radius * dmax)
-        ring = np.logical_and(inner, outer)
-        cross = np.zeros((nrows, ncols), dtype=np.bool_)
-        row_offset = self.args.fft_column_noise_threshold / 2
-        row_start = round(nrows * (0.5 - row_offset))
-        row_end = round(nrows * (0.5 + row_offset))
-        cross[row_start:row_end, :] = True
-        col_offset = self.args.fft_row_noise_threshold / 2
-        col_start = round(ncols * (0.5 - col_offset))
-        col_end = round(ncols * (0.5 + col_offset))
-        cross[:, col_start:col_end] = True
-        mask = np.broadcast_to(np.logical_and(ring, ~cross), (nframes, nrows, ncols))
+    def invalidate_loc(self):
+        pass # TODO
 
-        # Compute the FFT
-        raw_fft = np.fft.fft2(self.video[frames], axes=(1, 2))
-        shifted_fft = np.fft.fftshift(raw_fft, axes=(1, 2))
-        filtered_fft = np.where(mask, shifted_fft, 0.0)
-        ifft = np.fft.ifft2(np.fft.fftshift(filtered_fft, axes=(1,2)), axes=(1,2))
-        corrected = np.real(ifft)
-        self.fft[frames] = filtered_fft
-        self.fft_log_abs[frames] = np.log(np.abs(filtered_fft + 1))
-        self.corrected[frames] = corrected
+    def available_tasks(self):
+        """
+        Returns a generator over tasks whose dependencies are satisfied.
+        """
+        def task_distance(task) -> int:
+            return abs(self.current_frame - task.start)
 
-        # Compute the rolling average
-        padded = np.pad(corrected, ((1, 0), (0, 0), (0, 0)),)
-        cumsum = np.cumsum(padded, axis=0)
-        ravg = cumsum[window_size:] - cumsum[0:-window_size]
+        # Determine which tasks are ready
+        for task in itertools.chain(
+                sorted(self.loc_tasks, key=task_distance),
+                sorted(self.rvt_tasks, key=task_distance),
+                sorted(self.dra_tasks, key=task_distance),
+                sorted(self.fft_tasks, key=task_distance)):
+            if task.is_unscheduled():
+                if all(dep.is_finished() for dep in task.dependencies):
+                    yield task
 
-        # Compute the differential rolling average
-        left = ravg[0:-window_size]
-        right = ravg[window_size:]
-        self.dra[dra_frames] = (left - right)
+    def next_batch_of_tasks(self, maxlength: int):
+        if maxlength == 0:
+            return []
+        it = itertools.batched(self.available_tasks(), maxlength)
+        try:
+            batch = next(it)
+            # print(f"Prepare {len(batch)} tasks for scheduling.")
+            return batch
+        except StopIteration:
+            return []
 
-        # Compute the RVT
-        for frame in range(dra_frames.start, dra_frames.stop):
-            self.rvt[frame] = rvt.rvt(self.dra[frame],
-                                      rmin=self.args.rvt_min_radius,
-                                      rmax=self.args.rvt_max_radius,
-                                      upsample=self.args.rvt_upsample,
-                                      kind="normalized")
-
-        # Track Particles
-        for frame in range(dra_frames.start, dra_frames.stop):
-            self.locs[frame] = trackpy.locate(self.rvt[frame],
-                                              diameter=2*self.args.tracking_radius+1,
-                                              minmass=self.args.tracking_min_mass,
-                                              percentile=self.args.tracking_percentile,
-                                              topn=self.args.tracking_count,
-                                              preprocess=False,
-                                              characterize=False)
-
+    def update_schedule(self):
+        # Ensure there are at least twice as many pending calculations as there
+        # are workers in the pool.
+        goal = 2 * self.args.nprocs
+        scheduled = []
+        completed = []
+        for result in self.work:
+            if result.is_finished():
+                completed.append(result)
+            else:
+                scheduled.append(result)
+        tasks = self.next_batch_of_tasks(goal - len(scheduled))
+        for task in tasks:
+            task.schedule(self.pool)
+        self.work = scheduled
 
     def finish(self):
         """Complete the Analysis run."""
+        # Print the parameters of the analysis run
         print("Performing iSCAT Analysis with the following parameters:")
         self.print_args()
-        if len(self.worklist) > 0:
-            for _ in tqdm.tqdm(range(len(self.worklist)), unit="chunks"):
-                self.advance()
-        assert len(self.worklist) == 0
+        # Complete the work
+        while not all(task.is_finished() for task in self.rvt_tasks):
+            self.update_schedule()
+            time.sleep(0.01)
 
     def print_args(self):
         print(f"{os.path.basename(__file__)}", end="")
@@ -271,8 +452,6 @@ COLORMAPS = ["gray", "viridis", "plasma", "inferno", "magma", "cividis", "gnuplo
 
 class SideBar(EdgeWindow):
     analysis: Analysis
-    rvt_changes: bool
-    loc_changes: bool
 
     def __init__(self, figure, size, location, title, analysis):
         super().__init__(figure=figure, size=size, location=location, title=title)
@@ -290,7 +469,6 @@ class SideBar(EdgeWindow):
                 if imgui.selectable(cmap, is_selected)[0]:
                     args.colormap = cmap
             imgui.end_combo()
-        _, gui_sync = imgui.checkbox("Apply Settings Immediately", args.gui_sync)
         imgui.separator()
 
         imgui.text("FFT Parameters")
@@ -301,7 +479,7 @@ class SideBar(EdgeWindow):
         imgui.separator()
 
         imgui.text("DRA Parameters")
-        _, dra_w_s = imgui.slider_int("dra-window-size", v=args.dra_window_size, v_min=0, v_max=min(500, args.frames // 3))
+        _, dra_w_s = imgui.slider_int("dra-window-size", v=args.dra_window_size, v_min=1, v_max=min(1000, (args.frames - 1) // 2))
         imgui.separator()
 
         imgui.text("RVT Parameters")
@@ -318,51 +496,61 @@ class SideBar(EdgeWindow):
         imgui.separator()
 
         # Changes
-        if gui_sync != args.gui_sync:
-            args.gui_sync = gui_sync
+        fft_changes: bool = False
+        dra_changes: bool = False
+        rvt_changes: bool = False
+        loc_changes: bool = False
         if fft_i_r != args.fft_inner_radius:
             args.fft_inner_radius = fft_i_r
-            self.rvt_changes = True
+            fft_changes = True
         if fft_o_r != args.fft_outer_radius:
             args.fft_outer_radius = fft_o_r
-            self.rvt_changes = True
+            fft_changes = True
         if fft_rnt != args.fft_row_noise_threshold:
             args.fft_row_noise_threshold = fft_rnt
-            self.rvt_changes = True
+            fft_changes = True
         if fft_cnt != args.fft_column_noise_threshold:
             args.fft_column_noise_threshold = fft_cnt
-            self.rvt_changes = True
+            fft_changes = True
         if dra_w_s != args.dra_window_size:
             args.dra_window_size = dra_w_s
-            self.rvt_changes = True
+            dra_changes = True
         if rvt_mnr != args.rvt_min_radius:
             args.rvt_min_radius = rvt_mnr
-            self.rvt_changes = True
+            rvt_changes = True
         if rvt_mxr != args.rvt_max_radius:
             args.rvt_max_radius = rvt_mxr
-            self.rvt_changes = True
+            rvt_changes = True
         if rvt_ups != args.rvt_upsample:
             args.rvt_upsample = rvt_ups
-            self.rvt_changes = True
+            rvt_changes = True
         if tracking_radius != args.tracking_radius:
             args.tracking_radius = tracking_radius
-            self.loc_changes = True
+            loc_changes = True
         if tracking_min_mass != args.tracking_min_mass:
             args.tracking_min_mass = tracking_min_mass
-            self.loc_changes = True
+            loc_changes = True
         if tracking_percentile != args.tracking_percentile:
             args.tracking_percentile = tracking_percentile
-            self.loc_changes = True
+            loc_changes = True
         if tracking_count != args.tracking_count:
             args.tracking_count = tracking_count
-            self.loc_changes = True
-        if self.rvt_changes:
-            self.loc_changes = True
-        if args.gui_sync:
-            if self.rvt_changes:
-                self.analysis.reset()
-                self.rvt_changes = False
-                self.loc_changes = False
+            loc_changes = True
+        if fft_changes:
+            dra_changes = True
+            rvt_changes = True
+            loc_changes = True
+        if dra_changes:
+            rvt_changes = True
+            loc_changes = True
+        if fft_changes:
+            self.analysis.invalidate_fft()
+        if dra_changes:
+            self.analysis.invalidate_dra()
+        if rvt_changes:
+            self.analysis.invalidate_rvt()
+        if loc_changes:
+            self.analysis.invalidate_loc()
 
 def iscat_gui(analysis: Analysis):
     iw = fpl.widgets.image_widget._widget.ImageWidget(
@@ -383,24 +571,20 @@ def iscat_gui(analysis: Analysis):
     sidebar_width = min(0.3*analysis.args.gui_width, 390)
     sidebar = SideBar(iw.figure, sidebar_width, "right", "Parameters", analysis)
     iw.figure.add_gui(sidebar)
-    frame = 0
     lc1 = iw.figure[1,0].add_line_collection([], thickness=2, colors="yellow")
     lc2 = iw.figure[1,1].add_line_collection([], thickness=2, colors="yellow")
 
     def index_changed(index):
-        nonlocal frame
         new_frame = index["t"]
-        if frame == new_frame:
+        if analysis.current_frame == new_frame:
             return
-        frame = new_frame
-        analysis.sort_worklist(frame)
-        analysis.advance()
+        analysis.current_frame = new_frame
         redraw_circles()
 
     iw.add_event_handler(index_changed, event="current_index")
 
     def animation():
-        analysis.advance()
+        analysis.update_schedule()
         iw.cmap = analysis.args.colormap
         # Update the ImageWidget
         iw.current_index = iw.current_index
@@ -410,7 +594,7 @@ def iscat_gui(analysis: Analysis):
 
     def redraw_circles():
         circles = list()
-        for _, row in analysis.locs[frame].iterrows():
+        for _, row in analysis.loc[analysis.current_frame].iterrows():
             x, y = float(row["x"]), float(row["y"])
             circles.append(make_circle(x, y, analysis.args.tracking_radius))
         nonlocal lc1, lc2
@@ -469,9 +653,6 @@ def main():
     parser.add_argument("--gui-height", type=int, default=1080,
                         help="The height of the GUI window in Pixels.")
 
-    parser.add_argument("--gui-sync", action=argparse.BooleanOptionalAction, default=True,
-                        help="Whether to keep the GUI in sync with the chosen parameters (default: True).")
-
     parser.add_argument("--colormap", type=str, default=COLORMAPS[0],
                         help="The colormap used for visualization in the GUI.")
 
@@ -510,6 +691,9 @@ def main():
 
     parser.add_argument("--tracking-count", type=float, default=200,
                         help="Track only the specified number of brightest particles in each frame.")
+
+    parser.add_argument("--nprocs", type=int, default=max(1, multiprocessing.cpu_count() // 2),
+                        help="The number of background processes to use for computing.")
 
     args = parser.parse_args()
 
@@ -586,16 +770,18 @@ def main():
         maximum = np.max(video)
         video = (video - minimum) / (maximum - minimum)
     # Start the iSCAT analysis
-    analysis = Analysis(args, video)
-    # Unless we have --no-gui, open a GUI for tuning the args
-    if args.gui:
-        # Compute the first batch of items before creating the GUI, so that we
-        # have sane bounds for each histogram.
-        analysis.advance()
-        iscat_gui(analysis)
-        fpl.loop.run()
-    # Finish the analysis and save the results.
-    analysis.finish()
+    with Analysis(args, video) as analysis:
+        # Unless we have --no-gui, open a GUI for tuning the args
+        if args.gui:
+            # Compute the first batch of items before creating the GUI, so that we
+            # have sane bounds for each histogram.
+            while not analysis.rvt_tasks[0].is_finished():
+                analysis.update_schedule()
+                time.sleep(0.01)
+            # Start the GUI
+            iscat_gui(analysis)
+            fpl.loop.run()
+
 
 
 if __name__ == "__main__":

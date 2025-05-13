@@ -26,7 +26,7 @@ import math
 import time
 import trackpy
 import pandas
-from typing import TypeVar, Generic, Literal, Callable
+from typing import TypeVar, Generic, Literal
 import multiprocessing.pool
 from dataclasses import dataclass
 from multiprocessing.shared_memory import SharedMemory
@@ -374,7 +374,7 @@ class Analysis:
         nframes = len(self.video)
         window_size = self.args.dra_window_size
         nrvt = nframes - (2 * window_size) + 1
-        chunk_size = 16
+        chunk_size = 8
         self.rvt_tasks = [
             ComputeRVT(
                 dependencies=filter_tasks(self.dra_tasks, start, start+chunk_size),

@@ -227,6 +227,7 @@ class ComputeRVT(Task):
                 rmin=self.min_radius,
                 rmax=self.max_radius,
                 upsample=self.upsample,
+                pad_mode="edge",
                 kind="normalized")
 
 
@@ -380,7 +381,7 @@ class Analysis:
                 status='unscheduled',
                 start=start,
                 end=min(start+chunk_size, nrvt),
-                video=self.video,
+                video=self.dra,
                 rvt=self.rvt,
                 min_radius=self.args.rvt_min_radius,
                 max_radius=self.args.rvt_max_radius,
@@ -466,7 +467,7 @@ class Analysis:
 ### The iSCAT GUI
 
 
-COLORMAPS = ["gray", "viridis", "plasma", "inferno", "magma", "cividis", "gnuplot2"]
+COLORMAPS = ["magma", "gray", "viridis", "plasma", "inferno", "cividis", "gnuplot2"]
 
 
 class SideBar(EdgeWindow):

@@ -16,7 +16,6 @@
 
 import argparse
 import os
-import fastplotlib as fpl
 import imgrvt
 import imageio.v3 as iio
 import itertools
@@ -31,6 +30,7 @@ from typing import TypeVar, Generic, Literal, Callable
 import multiprocessing.pool
 from dataclasses import dataclass
 from multiprocessing.shared_memory import SharedMemory
+import fastplotlib as fpl
 from fastplotlib.ui import EdgeWindow
 from imgui_bundle import imgui
 
@@ -446,10 +446,19 @@ class Analysis:
             time.sleep(0.01)
 
     def print_args(self):
-        print(f"{os.path.basename(__file__)}", end="")
+        flags = []
         for key, value in vars(self.args).items():
-            print(f" --{key}={value}", end="")
-        print("")
+            arg = key.replace("_", "-")
+            if isinstance(value, bool):
+                if value is True:
+                    flags.append(f"--{arg}")
+                else:
+                    flags.append(f"--no-{arg}")
+            elif isinstance(value, str):
+                flags.append(f"--{arg}='{value}'")
+            else:
+                flags.append(f"--{arg}={value}")
+        print(f"{os.path.basename(__file__)} {' '.join(flags)}")
 
 
 ###############################################################################
@@ -502,7 +511,6 @@ class SideBar(EdgeWindow):
         _, tracking_radius = imgui.slider_int("tracking-radius", v=args.tracking_radius, v_min=0, v_max=20)
         _, tracking_min_mass = imgui.slider_float("tracking-min-mass", v=args.tracking_min_mass, v_min=0.0, v_max=5.0)
         _, tracking_percentile = imgui.slider_float("tracking-percentile", v=args.tracking_percentile, v_min=0.0, v_max=100.0)
-        _, tracking_count = imgui.slider_int("tracking-count", v=args.tracking_count, v_min=0, v_max=500)
         imgui.separator()
 
         # Changes
@@ -542,9 +550,6 @@ class SideBar(EdgeWindow):
             loc_changes = True
         if tracking_percentile != args.tracking_percentile:
             args.tracking_percentile = tracking_percentile
-            loc_changes = True
-        if tracking_count != args.tracking_count:
-            args.tracking_count = tracking_count
             loc_changes = True
         if fft_changes:
             dra_changes = True

@@ -16,3 +16,7 @@ dependencies = [
     "imgrvt",
     "tqdm",
 ]
+
+[tool.pyright]
+venvPath = "."
+venv = ".venv"

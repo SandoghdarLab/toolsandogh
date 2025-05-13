@@ -25,7 +25,6 @@ import numpy.typing as npt
 import math
 import time
 import trackpy
-import pandas
 from typing import TypeVar, Generic, Literal
 import multiprocessing.pool
 from dataclasses import dataclass
@@ -102,19 +101,19 @@ class SharedArray(Generic[_Dtype]):
 
 @dataclass
 class Task:
-    dependencies: list['Task']
-    status: Literal['unscheduled', 'scheduled', 'finished']
+    dependencies: list["Task"]
+    status: Literal["unscheduled", "scheduled", "finished"]
     start: int
     end: int
 
     def is_unscheduled(self):
-        return self.status == 'unscheduled'
+        return self.status == "unscheduled"
 
     def is_scheduled(self):
-        return self.status == 'scheduled'
+        return self.status == "scheduled"
 
     def is_finished(self):
-        return self.status == 'finished'
+        return self.status == "finished"
 
     def run(self):
         pass
@@ -127,6 +126,7 @@ class Task:
             self.status = 'finished'
 
         def error_callback(exc):
+            print(f"Caught a {type(exc)}!")
             raise exc
 
         pool.apply_async(run_task,
@@ -137,6 +137,7 @@ class Task:
 
 def run_task(task: Task):
     task.run()
+    return task
 
 
 def filter_tasks(tasks: list[Task], start: int, end: int) -> list[Task]:
@@ -235,22 +236,30 @@ class ComputeRVT(Task):
 class ComputeLOC(Task):
     video: SharedArray[np.float32]
     loc: SharedArray
-    tracking_radius: int
-    tracking_min_mass: float
-    tracking_percentile: float
-    tracking_count: int
+    radius: int
+    min_mass: float
+    percentile: int
+    maxlocs: int
     start: int
     end: int
     def run(self):
         for frame in range(self.start, self.end):
-            self.loc[frame] = trackpy.locate(
+            locs = trackpy.locate(
                 self.video[frame],
-                diameter=2*self.tracking_radius+1,
-                minmass=self.tracking_min_mass,
-                percentile=self.tracking_percentile,
-                topn=self.tracking_count,
-                preprocess=False,
-                characterize=False)
+                diameter=2*self.radius+1,
+                minmass=self.min_mass,
+                percentile=self.percentile,
+                topn=self.maxlocs,
+                preprocess=False)
+            index = -1
+            for x, y, mass, size, _, signal, _, _ in locs.itertuples(name=None, index=False):
+                index += 1
+                self.loc[frame, index, 0] = np.float32(y)
+                self.loc[frame, index, 1] = np.float32(x)
+                self.loc[frame, index, 2] = np.float32(frame)
+                self.loc[frame, index, 3] = np.float32(mass)
+                self.loc[frame, index, 4] = np.float32(size)
+                self.loc[frame, index, 5] = np.float32(signal)
 
 class Analysis:
     """All the data associated with one iSCAT Analysis run.
@@ -266,30 +275,31 @@ class Analysis:
         corrected (SharedArray[np.float32]): The inverse FFT of fft_part
         dra (SharedArray[np.float32]): Differential rolling average of corrected
         rvt (SharedArray[np.float32]): Radial variance transform of dra
-        loc (list[pandas.DataFrame]): Positions of detected particles
+        loc (SharedArray[np.float32]): nframes x particles x (x, y, z, mass, size, signal)
         fft_tasks (list[ComputeFFT]): List of FFT tasks
         dra_tasks (list[ComputeDRA]): List of DRA tasks
         rvt_tasks (list[ComputeRVT]): List of RVT tasks
-        LOC_tasks (list[ComputeLOC]): List of LOC tasks
-        schedule (list[tuple]): All scheduled tasks
+        loc_tasks (list[ComputeLOC]): List of LOC tasks
     """
 
     args: argparse.Namespace
-    video: SharedArray[np.float32]
     pool: multiprocessing.pool.Pool
-    scheduled: list[multiprocessing.pool.AsyncResult]
     video: SharedArray[np.float32]
     fft: SharedArray[np.complex64]
     fft_log_abs: SharedArray[np.float32]
     corrected: SharedArray[np.float32]
     dra: SharedArray[np.float32]
     rvt: SharedArray[np.float32]
-    loc: list[pandas.DataFrame]
+    loc: SharedArray[np.float32]
+    fft_tasks: list[Task]
+    dra_tasks: list[Task]
+    rvt_tasks: list[Task]
+    loc_tasks: list[Task]
 
     def __init__(self, args: argparse.Namespace, video: npt.NDArray[np.float32]):
         assert video.ndim == 3  # frames, height, width
         self.args = args
-        self.pool = multiprocessing.Pool(processes=args.nprocs)
+        self.pool = multiprocessing.Pool(processes=args.processes)
         self.work = []
         self.current_frame = 0
         # initialize all shared arrays
@@ -300,7 +310,9 @@ class Analysis:
         self.corrected = SharedArray(video.shape, dtype=np.float32)
         self.dra = SharedArray(video.shape, dtype=np.float32)
         self.rvt = SharedArray(video.shape, dtype=np.float32)
-        self.loc = [pandas.DataFrame()] * video.shape[0]
+        nframes = video.shape[0]
+        nparticles = args.particles
+        self.loc = SharedArray((nframes, nparticles, 6), dtype=np.float32)
         # Initialize tasks
         self.fft_tasks = []
         self.dra_tasks = []
@@ -322,6 +334,7 @@ class Analysis:
         self.corrected._shm.unlink()
         self.rvt._shm.unlink()
         self.dra._shm.unlink()
+        self.loc._shm.unlink()
         self.pool.close()
         self.pool.terminate()
 
@@ -334,7 +347,7 @@ class Analysis:
         self.fft_tasks = [
             ComputeFFT(
                 dependencies=[],
-                status='unscheduled',
+                status="unscheduled",
                 video=self.video,
                 fft=self.fft,
                 fft_log_abs=self.fft_log_abs,
@@ -355,42 +368,66 @@ class Analysis:
         nchunks = math.floor(ndra / chunk_size)
         rest = ndra % chunk_size
         position = 0
-        bounds = []
+        bounds: list[tuple[int, int]] = []
         for size in [chunk_size] * (nchunks - 1) + [chunk_size + rest]:
             bounds.append((position, position+size))
             position += size
         self.dra_tasks = [
             ComputeDRA(
                 dependencies=filter_tasks(self.fft_tasks, start, end + (2 * window_size) - 1),
-                status='unscheduled',
+                status="unscheduled",
                 start=start,
                 end=end,
                 video=self.corrected,
                 dra=self.dra,
                 window_size=self.args.dra_window_size)
-            for (start, end) in bounds]
+            for start, end in bounds]
 
     def invalidate_rvt(self):
         nframes = len(self.video)
         window_size = self.args.dra_window_size
         nrvt = nframes - (2 * window_size) + 1
         chunk_size = 8
+        bounds: list[tuple[int, int]] = []
+        for start in range(0, nrvt, chunk_size):
+            end = min(nrvt, start + chunk_size)
+            bounds.append((start, end))
         self.rvt_tasks = [
             ComputeRVT(
                 dependencies=filter_tasks(self.dra_tasks, start, start+chunk_size),
-                status='unscheduled',
+                status="unscheduled",
                 start=start,
-                end=min(start+chunk_size, nrvt),
+                end=end,
                 video=self.dra,
                 rvt=self.rvt,
                 min_radius=self.args.rvt_min_radius,
                 max_radius=self.args.rvt_max_radius,
                 upsample=self.args.rvt_upsample
             )
-            for start in range(0, nrvt, chunk_size)]
+            for start, end in bounds]
 
     def invalidate_loc(self):
-        pass # TODO
+        nframes = len(self.video)
+        window_size = self.args.dra_window_size
+        nloc = nframes - (2 * window_size) + 1
+        chunk_size = 16
+        bounds: list[tuple[int, int]] = []
+        for start in range(0, nloc, chunk_size):
+            end = min(nloc, start + chunk_size)
+            bounds.append((start, end))
+        self.loc_tasks = [
+            ComputeLOC(
+                dependencies=filter_tasks(self.rvt_tasks, start, end),
+                status="unscheduled",
+                start=start,
+                end=end,
+                video=self.rvt,
+                loc=self.loc,
+                radius=self.args.tracking_radius,
+                min_mass=self.args.tracking_min_mass,
+                percentile=self.args.tracking_percentile,
+                maxlocs=self.args.particles)
+            for start, end in bounds]
 
     def all_tasks(self):
         def task_distance(task) -> int:
@@ -430,7 +467,7 @@ class Analysis:
     def update_schedule(self):
         # Ensure there are at least twice as many pending calculations as there
         # are workers in the pool.
-        goal = 2 * self.args.nprocs
+        goal = 2 * self.args.processes
         scheduled = []
         completed = []
         for result in self.work:
@@ -482,8 +519,6 @@ class SideBar(EdgeWindow):
 
     def __init__(self, figure, size, location, title, analysis):
         super().__init__(figure=figure, size=size, location=location, title=title)
-        self.rvt_changes = False
-        self.loc_changes = True
         self.analysis = analysis
 
     def update(self):
@@ -518,7 +553,7 @@ class SideBar(EdgeWindow):
         imgui.text("Tracking Parameters")
         _, tracking_radius = imgui.slider_int("tracking-radius", v=args.tracking_radius, v_min=0, v_max=20)
         _, tracking_min_mass = imgui.slider_float("tracking-min-mass", v=args.tracking_min_mass, v_min=0.0, v_max=5.0)
-        _, tracking_percentile = imgui.slider_float("tracking-percentile", v=args.tracking_percentile, v_min=0.0, v_max=100.0)
+        _, tracking_percentile = imgui.slider_int("tracking-percentile", v=args.tracking_percentile, v_min=0, v_max=100)
         imgui.separator()
 
         nunscheduled = 0
@@ -607,37 +642,31 @@ def iscat_gui(analysis: Analysis):
     sidebar_width = min(0.3*analysis.args.gui_width, 390)
     sidebar = SideBar(iw.figure, sidebar_width, "right", "Parameters", analysis)
     iw.figure.add_gui(sidebar)
-    lc1 = iw.figure[1,0].add_line_collection([], thickness=2, colors="yellow")
-    lc2 = iw.figure[1,1].add_line_collection([], thickness=2, colors="yellow")
+
+    # Draw a scatter plot of all localized particles
+    xy = np.zeros((analysis.args.particles, 2), dtype=np.float32)
+    scatter10 = iw.figure[1,0].add_scatter(xy, colors="yellow", alpha=0.1, sizes=10.0)
+    scatter11 = iw.figure[1,1].add_scatter(xy, colors="yellow", alpha=0.1, sizes=10.0)
 
     def index_changed(index):
         new_frame = index["t"]
         if analysis.current_frame == new_frame:
             return
         analysis.current_frame = new_frame
-        redraw_circles()
 
     iw.add_event_handler(index_changed, event="current_index")
 
     def animation():
         analysis.update_schedule()
         iw.cmap = analysis.args.colormap
+        # Update the scatter plot
+        frameloc = analysis.loc._array[analysis.current_frame]
+        scatter10.data[:,0] = frameloc[:, 0]
+        scatter10.data[:,1] = frameloc[:, 1]
+        scatter11.data[:,0] = frameloc[:, 0]
+        scatter11.data[:,1] = frameloc[:, 1]
         # Update the ImageWidget
         iw.current_index = iw.current_index
-        if sidebar.loc_changes:
-            sidebar.loc_changes = False
-            redraw_circles()
-
-    def redraw_circles():
-        circles = list()
-        for _, row in analysis.loc[analysis.current_frame].iterrows():
-            x, y = float(row["x"]), float(row["y"])
-            circles.append(make_circle(x, y, analysis.args.tracking_radius))
-        nonlocal lc1, lc2
-        iw.figure[1,0].delete_graphic(lc1)
-        iw.figure[1,1].delete_graphic(lc2)
-        lc1 = iw.figure[1,0].add_line_collection(circles, thickness=2, colors="yellow")
-        lc2 = iw.figure[1,1].add_line_collection(circles, thickness=2, colors="yellow")
 
     iw.figure.add_animations(animation)
     iw.show()
@@ -662,7 +691,7 @@ def main():
     parser.add_argument("-i", "--input-file", type=str, required=True,
                         help="Input file path")
 
-    parser.add_argument("-o", "--output-file", type=str, required=True,
+    parser.add_argument("-o", "--output-file", type=str,
                         help="Output file path")
 
     parser.add_argument("--dtype", type=str, default="",
@@ -722,13 +751,13 @@ def main():
     parser.add_argument("--tracking-min-mass", type=float, default=0.0,
                         help="The minimum mass of structures to locate in the RVT image.")
 
-    parser.add_argument("--tracking-percentile", type=float, default=80.0,
+    parser.add_argument("--tracking-percentile", type=int, default=80,
                         help="Features must be brighter than this percentile to be considered for tracking.")
 
-    parser.add_argument("--tracking-count", type=float, default=200,
+    parser.add_argument("--particles", type=int, default=200,
                         help="Track only the specified number of brightest particles in each frame.")
 
-    parser.add_argument("--nprocs", type=int, default=max(1, multiprocessing.cpu_count() // 2),
+    parser.add_argument("--processes", type=int, default=max(1, multiprocessing.cpu_count() // 2),
                         help="The number of background processes to use for computing.")
 
     args = parser.parse_args()
@@ -738,8 +767,9 @@ def main():
         parser.error(f"Input file '{args.input_file}' does not exist.")
 
     # Validate that output file doesn't exist
-    if os.path.exists(args.output_file):
-        parser.error(f"Output file '{args.output_file}' already exists.")
+    if args.output_file is not None:
+        if os.path.exists(args.output_file):
+            parser.error(f"Output file '{args.output_file}' already exists.")
 
     # Validate the video parameters
     if args.dtype:
@@ -811,7 +841,7 @@ def main():
         if args.gui:
             # Compute the first batch of items before creating the GUI, so that we
             # have sane bounds for each histogram.
-            while not analysis.rvt_tasks[0].is_finished():
+            while not analysis.loc_tasks[0].is_finished():
                 analysis.update_schedule()
                 time.sleep(0.01)
             # Start the GUI

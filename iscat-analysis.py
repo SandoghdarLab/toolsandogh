@@ -392,6 +392,17 @@ class Analysis:
     def invalidate_loc(self):
         pass # TODO
 
+    def all_tasks(self):
+        def task_distance(task) -> int:
+            return abs(self.current_frame - task.start)
+
+        # Determine which tasks are ready
+        a = sorted(self.loc_tasks, key=task_distance)
+        b = sorted(self.rvt_tasks, key=task_distance)
+        c = sorted(self.dra_tasks, key=task_distance)
+        d = sorted(self.fft_tasks, key=task_distance)
+        return itertools.chain(a, b, c, d)
+
     def available_tasks(self):
         """
         Returns a generator over tasks whose dependencies are satisfied.
@@ -400,11 +411,7 @@ class Analysis:
             return abs(self.current_frame - task.start)
 
         # Determine which tasks are ready
-        for task in itertools.chain(
-                sorted(self.loc_tasks, key=task_distance),
-                sorted(self.rvt_tasks, key=task_distance),
-                sorted(self.dra_tasks, key=task_distance),
-                sorted(self.fft_tasks, key=task_distance)):
+        for task in self.all_tasks():
             if task.is_unscheduled():
                 if all(dep.is_finished() for dep in task.dependencies):
                     yield task
@@ -513,6 +520,19 @@ class SideBar(EdgeWindow):
         _, tracking_min_mass = imgui.slider_float("tracking-min-mass", v=args.tracking_min_mass, v_min=0.0, v_max=5.0)
         _, tracking_percentile = imgui.slider_float("tracking-percentile", v=args.tracking_percentile, v_min=0.0, v_max=100.0)
         imgui.separator()
+
+        nunscheduled = 0
+        nscheduled = 0
+        nfinished = 0
+        for task in self.analysis.all_tasks():
+            if task.is_finished():
+                nfinished += 1
+            elif task.is_scheduled():
+                nscheduled += 1
+            else:
+                nunscheduled += 1
+        ntasks = nfinished + nscheduled + nunscheduled
+        imgui.text(f"Status: {nfinished}/{ntasks} computed ({nscheduled} scheduled)")
 
         # Changes
         fft_changes: bool = False

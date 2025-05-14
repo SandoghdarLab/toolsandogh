@@ -4,17 +4,21 @@
 # dependencies = [
 #     "imgui[sdl2]",
 #     "fastplotlib[imgui] @ git+https://github.com/fastplotlib/fastplotlib.git@a057faa#egg=fastplotlib[imgui]",
-#     "imageio[ffmpeg]",
 #     "numpy",
 #     "scipy",
 #     "scikit-image",
 #     "trackpy",
 #     "imgrvt",
 #     "tqdm",
+#     "imageio[ffmpeg]",
+#     "bioio",
+#     "bioio-bioformats",
 # ]
 # ///
 
 import argparse
+import bioio
+import bioio_bioformats
 import os
 import imgrvt
 import imageio.v3 as iio
@@ -706,6 +710,9 @@ def main():
     parser.add_argument("--frames", type=int, default=-1,
                         help="The number of frames of the input video to load.")
 
+    parser.add_argument("--channel", type=int, default=0,
+                        help="What channel of the video to load.")
+
     parser.add_argument("--normalize", action=argparse.BooleanOptionalAction, default=True,
                         help="Whether to rescale the input video to the [0, 1] interval.")
 
@@ -825,11 +832,11 @@ def main():
         pixels = np.fromfile(args.input_file, dtype=dtype, count=count)
         video = np.reshape(pixels, shape)
     else:
-        # Read video using imageio
-        data = iio.imread(args.input_file)
-        if not 0 < data.ndim <= 3:
-            raise ValueError(f"Unexpected input video shape: {data.shape}")
-        video = np.reshape(data, ( (1,) * (3 - data.ndim) + data.shape))
+        # Read video using bioio
+        img = bioio.BioImage(args.input_file, reader=bioio_bioformats.Reader)
+        if img.dims.Z > 1:
+            parser.error(f"Input data must not have a Z stack.")
+        video = img.data[:,args.channel,0] # TCZYX -> TYX
     # Normalize the video if desired.
     if args.normalize:
         minimum = np.min(video)
@@ -851,5 +858,5 @@ def main():
 
 
 if __name__ == "__main__":
-    multiprocessing.set_start_method('spawn')
+    multiprocessing.set_start_method("spawn")
     main()

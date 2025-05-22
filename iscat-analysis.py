@@ -18,10 +18,11 @@
 
 import argparse
 import bioio
+import bioio.writers
 import bioio_bioformats
 import os
 import imgrvt
-import imageio.v3 as iio
+import imageio
 import itertools
 import multiprocessing
 import numpy as np
@@ -35,7 +36,7 @@ from dataclasses import dataclass
 from multiprocessing.shared_memory import SharedMemory
 import fastplotlib as fpl
 from fastplotlib.ui import EdgeWindow
-from imgui_bundle import imgui
+from imgui_bundle import imgui, portable_file_dialogs
 
 _Dtype = TypeVar("_Dtype", bound=np.generic, covariant=True)
 
@@ -61,8 +62,13 @@ class SharedArray(Generic[_Dtype]):
         self._shm = SharedMemory(create=True, size=size)
         self._array = np.ndarray(shape, dtype, buffer=self._shm.buf)
 
-    def __array__(self):
-        return self._array
+    def __array__(self, dtype=None, copy=None):
+        array = self._array
+        if dtype:
+            array = array.astype(dtype)
+        if copy:
+            array = array.copy()
+        return array
 
     def __getitem__(self, key):
         return self._array.__getitem__(key)
@@ -560,6 +566,38 @@ class SideBar(EdgeWindow):
         _, tracking_percentile = imgui.slider_int("tracking-percentile", v=args.tracking_percentile, v_min=0, v_max=100)
         imgui.separator()
 
+        imgui.text("Save Files")
+
+        def truncate_path(path: str, maxlen=35):
+            if len(path) > (maxlen - 3):
+                return "..." + path[-maxlen:]
+            else:
+                return path
+
+        pfd = portable_file_dialogs
+        filters = ["TIFF files", "*.tif *.tiff"
+                   "AVI Files", "*.avi",
+                   "MP4 Files", "*.mp4",
+                   "Numpy files", "*.npy",
+                   ]
+        if imgui.button(f"FFT File: {truncate_path(args.fft_file)}"):
+            filename = pfd.save_file("fft-file", args.fft_file, filters).result()
+            if filename:
+                args.fft_file = filename
+        if imgui.button(f"DRA File: {truncate_path(args.dra_file)}"):
+            filename = pfd.save_file("dra-file", args.dra_file, filters).result()
+            if filename:
+                args.dra_file = filename
+        if imgui.button(f"RVT File: {truncate_path(args.rvt_file)}"):
+            filename = pfd.save_file("rvt-file", args.rvt_file, filters).result()
+            if filename:
+                args.rvt_file = filename
+        if imgui.button(f"LOC File: {truncate_path(args.loc_file)}"):
+            filename = pfd.save_file("loc-file", args.loc_file, filters).result()
+            if filename:
+                args.loc_file = filename
+        imgui.separator()
+
         nunscheduled = 0
         nscheduled = 0
         nfinished = 0
@@ -695,8 +733,17 @@ def main():
     parser.add_argument("-i", "--input-file", type=str, required=True,
                         help="Input file path")
 
-    parser.add_argument("-o", "--output-file", type=str,
-                        help="Output file path")
+    parser.add_argument("--fft-file", type=str, default="",
+                        help="FFT output file path")
+
+    parser.add_argument("--dra-file", type=str, default="",
+                        help="DRA output file path")
+
+    parser.add_argument("--rvt-file", type=str, default="",
+                        help="RVT output file path")
+
+    parser.add_argument("--loc-file", type=str, default="",
+                        help="LOC output file path")
 
     parser.add_argument("--dtype", type=str, default="",
                         help="The dtype of the RAW file to load, or an empty string.")
@@ -773,10 +820,16 @@ def main():
     if not os.path.isfile(args.input_file):
         parser.error(f"Input file '{args.input_file}' does not exist.")
 
-    # Validate that output file doesn't exist
-    if args.output_file is not None:
-        if os.path.exists(args.output_file):
-            parser.error(f"Output file '{args.output_file}' already exists.")
+    # Ensure that output files don't exist
+    def check_output_file(output_file):
+        if output_file:
+            if os.path.exists(output_file):
+                parser.error(f"Cannot write to existing file '{output_file}'.")
+
+    check_output_file(args.fft_file)
+    check_output_file(args.dra_file)
+    check_output_file(args.rvt_file)
+    check_output_file(args.loc_file)
 
     # Validate the video parameters
     if args.dtype:
@@ -854,9 +907,21 @@ def main():
             # Start the GUI
             iscat_gui(analysis)
             fpl.loop.run()
+        # Save the results
 
+        def maybe_save(filename: str, array: npt.ArrayLike):
+            if not filename:
+                return
+            imageio.mimwrite(filename, np.array(array))
+
+        maybe_save(args.fft_file, analysis.fft)
+        maybe_save(args.dra_file, analysis.dra)
+        maybe_save(args.rvt_file, analysis.rvt)
+        # TODO loc file
 
 
 if __name__ == "__main__":
+    # Spawn new children rather then forking them off, to avoid that shared
+    # arrays are pickled and then never freed.
     multiprocessing.set_start_method("spawn")
     main()

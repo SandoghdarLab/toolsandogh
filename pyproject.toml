@@ -15,6 +15,8 @@ dependencies = [
     "trackpy",
     "imgrvt",
     "tqdm",
+    "bioio",
+    "bioio-bioformats",
 ]
 
 [tool.pyright]

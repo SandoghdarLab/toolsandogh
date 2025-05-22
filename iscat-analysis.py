@@ -760,6 +760,9 @@ def main():
     parser.add_argument("--channel", type=int, default=0,
                         help="What channel of the video to load.")
 
+    parser.add_argument("--zstack", type=int, default=0,
+                        help="What slice of the Z stack to load.")
+
     parser.add_argument("--normalize", action=argparse.BooleanOptionalAction, default=True,
                         help="Whether to rescale the input video to the [0, 1] interval.")
 
@@ -874,7 +877,7 @@ def main():
 
     if args.dtype:
         dtype = np.dtype(args.dtype)
-        # Derive the number of frames when it is not set.
+        # Derive the number of frames when it is not set
         if args.frames == -1:
             bytes_per_frame = dtype.itemsize * args.rows * args.columns
             args.frames = os.path.getsize(args.input_file) // bytes_per_frame
@@ -887,9 +890,15 @@ def main():
     else:
         # Read video using bioio
         img = bioio.BioImage(args.input_file, reader=bioio_bioformats.Reader)
-        if img.dims.Z > 1:
-            parser.error(f"Input data must not have a Z stack.")
-        video = img.data[:,args.channel,0] # TCZYX -> TYX
+        video = img.get_image_data("TYX", T=range(args.frames), C=args.channel, Z=args.zstack)
+    # Check that the video matches the prescribed parameters
+    assert len(video.shape) == 3
+    if args.frames:
+        assert video.shape[0] == args.frames
+    if args.rows:
+        assert video.shape[1] == args.rows
+    if args.columns:
+        assert video.shape[2] == args.columns
     # Normalize the video if desired.
     if args.normalize:
         minimum = np.min(video)

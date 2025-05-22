@@ -923,7 +923,7 @@ def main():
                 return
             imageio.mimwrite(filename, np.array(array))
 
-        maybe_save(args.fft_file, analysis.fft)
+        maybe_save(args.fft_file, analysis.corrected)
         maybe_save(args.dra_file, analysis.dra)
         maybe_save(args.rvt_file, analysis.rvt)
         # TODO loc file

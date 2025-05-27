@@ -3,7 +3,7 @@
 # requires-python = ">3.12,<3.13"
 # dependencies = [
 #     "imgui[sdl2]",
-#     "fastplotlib[imgui] @ git+https://github.com/fastplotlib/fastplotlib.git@a057faa#egg=fastplotlib[imgui]",
+#     "fastplotlib[imgui]",
 #     "numpy",
 #     "scipy",
 #     "scikit-image",

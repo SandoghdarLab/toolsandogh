@@ -253,6 +253,7 @@ class ComputeLOC(Task):
     start: int
     end: int
     def run(self):
+        self.loc[self.start:self.end] = 0
         for frame in range(self.start, self.end):
             locs = trackpy.locate(
                 self.video[frame],
@@ -523,6 +524,8 @@ class Analysis:
 
 COLORMAPS = ["magma", "gray", "viridis", "plasma", "inferno", "cividis", "gnuplot2"]
 
+CIRCLE_POINTS = 10
+
 
 class SideBar(EdgeWindow):
     analysis: Analysis
@@ -685,10 +688,11 @@ def iscat_gui(analysis: Analysis):
     sidebar = SideBar(iw.figure, sidebar_width, "right", "Parameters", analysis)
     iw.figure.add_gui(sidebar)
 
-    # Draw a scatter plot of all localized particles
-    xy = np.zeros((analysis.args.particles, 2), dtype=np.float32)
-    scatter10 = iw.figure[1,0].add_scatter(xy, colors="yellow", alpha=0.1, sizes=10.0)
-    scatter11 = iw.figure[1,1].add_scatter(xy, colors="yellow", alpha=0.1, sizes=10.0)
+    # Draw circles around all localized particles
+    localizations = analysis.loc[analysis.current_frame]
+    data = circle_data(localizations)
+    ls10 = iw.figure[1,0].add_line_collection(data, colors="yellow")
+    ls11 = iw.figure[1,1].add_line_collection(data, colors="yellow")
 
     def index_changed(index):
         new_frame = index["t"]
@@ -702,11 +706,10 @@ def iscat_gui(analysis: Analysis):
         analysis.update_schedule()
         iw.cmap = analysis.args.colormap
         # Update the scatter plot
-        frameloc = analysis.loc._array[analysis.current_frame]
-        scatter10.data[:,0] = frameloc[:, 0]
-        scatter10.data[:,1] = frameloc[:, 1]
-        scatter11.data[:,0] = frameloc[:, 0]
-        scatter11.data[:,1] = frameloc[:, 1]
+        localizations = analysis.loc[analysis.current_frame]
+        data = circle_data(localizations)
+        ls10.data = data
+        ls11.data = data
         # Update the ImageWidget
         iw.current_index = iw.current_index
 
@@ -714,13 +717,24 @@ def iscat_gui(analysis: Analysis):
     iw.show()
 
 
-def make_circle(x: float, y: float, radius: float, n_points: int = 20) -> np.ndarray:
-    theta = np.linspace(0, 2 * np.pi, n_points)
-    xs = radius * np.sin(theta)
-    ys = radius * np.cos(theta)
-
-    return np.column_stack([xs, ys]) + np.array([x, y])
-
+def circle_data(localizations):
+    """
+    Turn a nparticles x (x, y, z, mass, size, signal) array into a
+    nparticles x CIRCLE_POINTS x 2 array of line segments."""
+    # determine circle centers and radii
+    xs = localizations[:, 0]
+    ys = localizations[:, 1]
+    rs = localizations[:, 4]
+    # determine the X and Y offsets
+    nparticles = len(localizations)
+    theta = np.linspace(0, 2 * np.pi, CIRCLE_POINTS)
+    oxs = rs.reshape((nparticles, 1)) * np.sin(theta)
+    oys = rs.reshape((nparticles, 1)) * np.cos(theta)
+    # determine and return the line segments
+    lxs = xs.reshape((nparticles, 1)) + oxs
+    lys = ys.reshape((nparticles, 1)) + oys
+    lzs = np.zeros((nparticles, CIRCLE_POINTS))
+    return np.stack([lxs, lys, lzs], axis=2)
 
 ###############################################################################
 ###

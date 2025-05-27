@@ -524,7 +524,7 @@ class Analysis:
 
 COLORMAPS = ["magma", "gray", "viridis", "plasma", "inferno", "cividis", "gnuplot2"]
 
-CIRCLE_POINTS = 10
+CIRCLE_POINTS = 16
 
 
 class SideBar(EdgeWindow):
@@ -567,6 +567,7 @@ class SideBar(EdgeWindow):
         _, tracking_radius = imgui.slider_int("tracking-radius", v=args.tracking_radius, v_min=0, v_max=20)
         _, tracking_min_mass = imgui.slider_float("tracking-min-mass", v=args.tracking_min_mass, v_min=0.0, v_max=5.0)
         _, tracking_percentile = imgui.slider_int("tracking-percentile", v=args.tracking_percentile, v_min=0, v_max=100)
+        _, args.circle_alpha = imgui.slider_float("circle-alpha", v=args.circle_alpha, v_min=0.0, v_max=1.0)
         imgui.separator()
 
         imgui.text("Save Files")
@@ -691,8 +692,9 @@ def iscat_gui(analysis: Analysis):
     # Draw circles around all localized particles
     localizations = analysis.loc[analysis.current_frame]
     data = circle_data(localizations)
-    ls10 = iw.figure[1,0].add_line_collection(data, colors="yellow")
-    ls11 = iw.figure[1,1].add_line_collection(data, colors="yellow")
+    color = np.array([1.0, 1.0, 0.0, analysis.args.circle_alpha])
+    ls10 = iw.figure[1,0].add_line_collection(data, colors=color)
+    ls11 = iw.figure[1,1].add_line_collection(data, colors=color)
 
     def index_changed(index):
         new_frame = index["t"]
@@ -705,11 +707,14 @@ def iscat_gui(analysis: Analysis):
     def animation():
         analysis.update_schedule()
         iw.cmap = analysis.args.colormap
-        # Update the scatter plot
+        # Update the Circle Plot
         localizations = analysis.loc[analysis.current_frame]
         data = circle_data(localizations)
+        color = f"#ffff00{math.floor(255 * analysis.args.circle_alpha):02x}"
         ls10.data = data
         ls11.data = data
+        ls10.colors = color
+        ls11.colors = color
         # Update the ImageWidget
         iw.current_index = iw.current_index
 
@@ -828,6 +833,9 @@ def main():
     parser.add_argument("--particles", type=int, default=200,
                         help="Track only the specified number of brightest particles in each frame.")
 
+    parser.add_argument("--circle-alpha", type=float, default=1.0,
+                        help="Alpha channel of the circles drawn around each localized particle.")
+
     parser.add_argument("--processes", type=int, default=max(1, multiprocessing.cpu_count() // 2),
                         help="The number of background processes to use for computing.")
 
@@ -888,6 +896,10 @@ def main():
         parser.error(f"The --rvt-max-radius must be larger than {args.rvt_min_radius}, got {args.rvt_max_radius}")
     if not args.rvt_upsample > 0:
         parser.error(f"The --rvt-upsample must be non-negative, got {args.rvt_upsample}")
+
+    # Validate the LOC parameters
+    if not (0 <= args.circle_alpha <= 1):
+        parser.error(f"The --circle-alpha must be between zero and one.")
 
     if args.dtype:
         dtype = np.dtype(args.dtype)

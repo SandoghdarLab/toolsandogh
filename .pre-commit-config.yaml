@@ -1,0 +1,40 @@
+repos:
+- repo: https://github.com/pre-commit/pre-commit-hooks
+  rev: v5.0.0
+  hooks:
+    - id: check-case-conflict
+    - id: check-illegal-windows-names
+    - id: check-symlinks
+    - id: destroyed-symlinks
+    - id: trailing-whitespace
+    - id: end-of-file-fixer
+    - id: check-yaml
+    - id: check-added-large-files
+
+- repo: https://github.com/astral-sh/ruff-pre-commit
+  rev: v0.9.9
+  hooks:
+    - id: ruff-format
+    - id: ruff
+      args: [ --fix ]
+
+- repo: https://github.com/abravalheri/validate-pyproject
+  rev: v0.23
+  hooks:
+    - id: validate-pyproject
+      additional_dependencies: ["validate-pyproject-schema-store[all]"]
+
+- repo: https://github.com/RobertCraigie/pyright-python
+  rev: v1.1.396
+  hooks:
+    - id: pyright
+
+- repo: local
+  hooks:
+  - id: pytest
+    name: pytest
+    entry: uv run ./.venv/bin/pytest toolsandogh
+    language: system
+    types: [python]
+    pass_filenames: false
+    always_run: true

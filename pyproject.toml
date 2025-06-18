@@ -23,9 +23,10 @@ dependencies = [
 ]
 keywords = ["tools", "utilities", "python"]
 
-[project.optional-dependencies]
+[dependency-groups]
 dev = [
   "ruff",
+  "pre-commit",
   "pyright",
   "pytest",
   "setuptools",
@@ -43,6 +44,9 @@ packages = ["toolsandogh"]
 
 [tool.ruff]
 line-length = 88
+fix = true
+
+[tool.ruff.lint]
 select = [
   "E",  # pycodestyle errors
   "W",  # pycodestyle warnings
@@ -57,7 +61,6 @@ ignore = [
   "E501",  # Line too long (handled by line-length)
   "E402",  # Module level import not at top of file (isort handles this)
 ]
-fix = true
 unfixable = ["F821"] # Don't try to fix name definition
 
 [tool.pyright]
@@ -69,7 +72,6 @@ include = ["toolsandogh"]
 exclude = [".venv"]
 venvPath = "."
 venv = ".venv"
-
 
 [tool.pytest.ini_options]
 testpaths = ["toolsandogh/tests"]

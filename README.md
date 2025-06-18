@@ -16,11 +16,9 @@ This repository collects data analysis scripts of the Sandoghdar Division of the
 
 ## Scripts
 
-### iSCAT Analysis
-
-| Script | Description | Usage |
-|--------|-------------|-------|
-| ```iscat-analysis.py``` | iSCAT Analysis | ```./iscat_analysis.py -i input.tif -o output.tif``` |
+| Script                  | Description    | Usage                                                |
+|-------------------------|----------------|------------------------------------------------------|
+| ```iscat_analysis.py``` | iSCAT Analysis | ```./iscat_analysis.py -i input.tif -o output.tif``` |
 
 ## Troubleshooting
 

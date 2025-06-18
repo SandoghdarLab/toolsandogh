@@ -1,7 +1,10 @@
 [project]
 name = "toolsandogh"
 version = "0.1.0"
-description = "Add your description here"
+description = "A collection of Python scripts for iSCAT microscopy data analysis"
+authors = [
+  { name = "Marco Heisig", email = "marco.heisig@mpl.mpg.de" }
+]
 readme = "README.md"
 license = {text = "GPL-3.0-or-later"}
 requires-python = ">=3.12"
@@ -18,7 +21,58 @@ dependencies = [
     "bioio",
     "bioio-bioformats",
 ]
+keywords = ["tools", "utilities", "python"]
+
+[project.optional-dependencies]
+dev = [
+  "ruff",
+  "pyright",
+  "pytest",
+  "setuptools",
+  "coverage",
+]
+
+
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["toolsandogh"]
+
+
+[tool.ruff]
+line-length = 88
+select = [
+  "E",  # pycodestyle errors
+  "W",  # pycodestyle warnings
+  "F",  # pyflakes errors
+  "I",  # isort
+  "C",  # Complexity
+  "RET", # Retweet (flake8-retweet)
+  "YTT", # Truthiness
+  "TRY", # Try block errors
+]
+ignore = [
+  "E501",  # Line too long (handled by line-length)
+  "E402",  # Module level import not at top of file (isort handles this)
+]
+fix = true
+unfixable = ["F821"] # Don't try to fix name definition
 
 [tool.pyright]
+pythonVersion = "3.12"
+reportMissingImports = true
+reportUnusedImports = true
+reportUnusedVariables = true
+include = ["toolsandogh"]
+exclude = [".venv"]
 venvPath = "."
 venv = ".venv"
+
+
+[tool.pytest.ini_options]
+testpaths = ["toolsandogh/tests"]
+
+[tool.coverage.paths]
+source = ["toolsandogh"]

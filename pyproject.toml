@@ -61,6 +61,7 @@ ignore = [
   "C901",  # Function too complex
   "E501",  # Line too long (handled by line-length)
   "E402",  # Module level import not at top of file (isort handles this)
+  "TRY003",  # Long message outside exception class
 ]
 unfixable = ["F821"] # Don't try to fix name definition
 

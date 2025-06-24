@@ -58,6 +58,7 @@ select = [
   "TRY", # Try block errors
 ]
 ignore = [
+  "C901",  # Function too complex
   "E501",  # Line too long (handled by line-length)
   "E402",  # Module level import not at top of file (isort handles this)
 ]

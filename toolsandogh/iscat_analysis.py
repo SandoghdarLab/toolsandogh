@@ -30,14 +30,21 @@ from typing import Generic, Literal, TypeVar
 import bioio
 import bioio.writers
 import bioio_bioformats
-import fastplotlib as fpl
 import imageio
 import imgrvt
 import numpy as np
 import numpy.typing as npt
 import trackpy
-from fastplotlib.ui import EdgeWindow
 from imgui_bundle import imgui, portable_file_dialogs
+
+if __name__ == "__main__":
+    from fastplotlib.ui import EdgeWindow  # type: ignore
+else:
+    # If we are not in the GUI thread, define a dummy EdgeWindow
+    class EdgeWindow:
+        def __init__(self, figure, size, location, title):
+            pass
+
 
 _Dtype = TypeVar("_Dtype", bound=np.generic, covariant=True)
 
@@ -722,6 +729,8 @@ class SideBar(EdgeWindow):
 
 
 def iscat_gui(analysis: Analysis):
+    import fastplotlib as fpl
+
     iw = fpl.widgets.image_widget._widget.ImageWidget(
         data=[
             analysis.video._array,
@@ -744,7 +753,7 @@ def iscat_gui(analysis: Analysis):
 
     sidebar_width = min(0.3 * analysis.args.gui_width, 390)
     sidebar = SideBar(iw.figure, sidebar_width, "right", "Parameters", analysis)
-    iw.figure.add_gui(sidebar)
+    iw.figure.add_gui(sidebar)  # type: ignore
 
     # Draw circles around all localized particles
     localizations = analysis.loc[analysis.current_frame]
@@ -777,6 +786,7 @@ def iscat_gui(analysis: Analysis):
 
     iw.figure.add_animations(animation)
     iw.show()
+    fpl.loop.run()
 
 
 def circle_data(localizations):
@@ -1122,7 +1132,6 @@ def main():
                 time.sleep(0.01)
             # Start the GUI
             iscat_gui(analysis)
-            fpl.loop.run()
         # Save the results
 
         def maybe_save(filename: str, array: npt.ArrayLike):

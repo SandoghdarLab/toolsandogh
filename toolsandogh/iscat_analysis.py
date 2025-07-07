@@ -2,7 +2,7 @@
 # /// script
 # requires-python = ">3.12,<3.13"
 # dependencies = [
-#     "imgui[sdl2]",
+#     "imgui-bundle<1.92.0",
 #     "fastplotlib[imgui]",
 #     "numpy",
 #     "scipy",

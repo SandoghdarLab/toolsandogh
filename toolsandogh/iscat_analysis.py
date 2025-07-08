@@ -160,6 +160,15 @@ def filter_tasks(tasks: list[Task], start: int, end: int) -> list[Task]:
 
 
 @dataclass
+class CopyFrames(Task):
+    src: SharedArray[np.float32]
+    dst: SharedArray[np.float32]
+
+    def run(self):
+        self.dst[self.start : self.end] = self.src[self.start : self.end]
+
+
+@dataclass
 class ComputeFFT(Task):
     video: SharedArray[np.float32]
     fft: SharedArray[np.complex64]
@@ -222,7 +231,7 @@ class ComputeDRA(Task):
         cumsum = np.cumsum(padded, axis=0)
         ravg = cumsum[self.window_size :] - cumsum[0 : -self.window_size]
         if len(ravg) != (ndra + self.window_size):
-            msg = f"{self.start=} {self.end=} {vid_end=} {len(ravg)=}"
+            msg = f"DRA Error: {self.start=} {self.end=} {vid_end=} {len(ravg)=}"
             raise RuntimeError(msg)
         # Compute the differential rolling average
         left = ravg[0 : -self.window_size]
@@ -396,7 +405,7 @@ class Analysis:
             warnings.warn(f"""Truncating DRA window size to {window_size_limit}.""")
             self.args.dra_window_size = window_size_limit
             window_size = window_size_limit
-        ndra = nframes - (2 * window_size) + 1
+        ndra = nframes if window_size == 0 else nframes - (2 * window_size) + 1
         chunk_size = max(16, window_size)
         nchunks = math.floor(ndra / chunk_size)
         rest = ndra % chunk_size
@@ -405,25 +414,38 @@ class Analysis:
         for size in [chunk_size] * nchunks + [rest]:
             bounds.append((position, position + size))
             position += size
-        self.dra_tasks = [
-            ComputeDRA(
-                dependencies=filter_tasks(
-                    self.fft_tasks, start, end + (2 * window_size) - 1
-                ),
-                status="unscheduled",
-                start=start,
-                end=end,
-                video=self.corrected,
-                dra=self.dra,
-                window_size=self.args.dra_window_size,
-            )
-            for start, end in bounds
-        ]
+        if window_size == 0:
+            self.dra_tasks = [
+                CopyFrames(
+                    dependencies=filter_tasks(self.fft_tasks, start, end),
+                    status="unscheduled",
+                    start=start,
+                    end=end,
+                    src=self.corrected,
+                    dst=self.dra,
+                )
+                for start, end in bounds
+            ]
+        else:
+            self.dra_tasks = [
+                ComputeDRA(
+                    dependencies=filter_tasks(
+                        self.fft_tasks, start, end + (2 * window_size) - 1
+                    ),
+                    status="unscheduled",
+                    start=start,
+                    end=end,
+                    video=self.corrected,
+                    dra=self.dra,
+                    window_size=self.args.dra_window_size,
+                )
+                for start, end in bounds
+            ]
 
     def invalidate_rvt(self):
         nframes = len(self.video)
         window_size = self.args.dra_window_size
-        nrvt = nframes - (2 * window_size) + 1
+        nrvt = nframes if window_size == 0 else nframes - (2 * window_size) + 1
         chunk_size = 8
         bounds: list[tuple[int, int]] = []
         for start in range(0, nrvt, chunk_size):
@@ -447,7 +469,7 @@ class Analysis:
     def invalidate_loc(self):
         nframes = len(self.video)
         window_size = self.args.dra_window_size
-        nloc = nframes - (2 * window_size) + 1
+        nloc = nframes if window_size == 0 else nframes - (2 * window_size) + 1
         chunk_size = 16
         bounds: list[tuple[int, int]] = []
         for start in range(0, nloc, chunk_size):
@@ -599,7 +621,7 @@ class SideBar(EdgeWindow):
         _, dra_w_s = imgui.slider_int(
             "dra-window-size",
             v=args.dra_window_size,
-            v_min=1,
+            v_min=0,
             v_max=min(1000, args.frames // 2),
         )
         imgui.separator()
@@ -821,6 +843,7 @@ def circle_data(localizations):
 
 
 def main():
+    """Parse command-line arguments and start iSCAT processing."""
     parser = argparse.ArgumentParser(description="Analyze iSCAT recordings.")
 
     parser.add_argument(
@@ -1074,9 +1097,9 @@ def main():
         )
 
     # Validate the DRA parameters
-    if args.dra_window_size < 1:
+    if args.dra_window_size < 0:
         parser.error(
-            f"The --dra-window-size must be at least one, got {args.dra_window_size}"
+            f"The --dra-window-size must be non-negative, got {args.dra_window_size}"
         )
 
     # Validate the RVT parameters
@@ -1093,10 +1116,12 @@ def main():
             f"The --rvt-upsample must be non-negative, got {args.rvt_upsample}"
         )
 
-    # Validate the LOC parameters
+    # Validate the localization parameters
     if not (0 <= args.circle_alpha <= 1):
         parser.error("The --circle-alpha must be between zero and one.")
 
+    # Load the input file, either from raw data or from a suitable image or
+    # video file.
     if args.raw_dtype:
         dtype = np.dtype(args.raw_dtype)
         # Derive the number of frames when it is not set
@@ -1155,4 +1180,5 @@ if __name__ == "__main__":
     # Spawn new children rather then forking them off, to avoid that shared
     # arrays are pickled and then never freed.
     multiprocessing.set_start_method("spawn")
+    # Run the actual main function.
     main()

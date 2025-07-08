@@ -23,6 +23,7 @@ import multiprocessing
 import multiprocessing.pool
 import os
 import time
+import warnings
 from dataclasses import dataclass
 from multiprocessing.shared_memory import SharedMemory
 from typing import Generic, Literal, TypeVar
@@ -389,14 +390,19 @@ class Analysis:
 
     def invalidate_dra(self):
         nframes = len(self.video)
+        window_size_limit = nframes // 2
         window_size = self.args.dra_window_size
+        if window_size > window_size_limit:
+            warnings.warn(f"""Truncating DRA window size to {window_size_limit}.""")
+            self.args.dra_window_size = window_size_limit
+            window_size = window_size_limit
         ndra = nframes - (2 * window_size) + 1
         chunk_size = max(16, window_size)
         nchunks = math.floor(ndra / chunk_size)
         rest = ndra % chunk_size
         position = 0
         bounds: list[tuple[int, int]] = []
-        for size in [chunk_size] * (nchunks - 1) + [chunk_size + rest]:
+        for size in [chunk_size] * nchunks + [rest]:
             bounds.append((position, position + size))
             position += size
         self.dra_tasks = [
@@ -594,7 +600,7 @@ class SideBar(EdgeWindow):
             "dra-window-size",
             v=args.dra_window_size,
             v_min=1,
-            v_max=min(1000, (args.frames - 1) // 2),
+            v_max=min(1000, args.frames // 2),
         )
         imgui.separator()
 

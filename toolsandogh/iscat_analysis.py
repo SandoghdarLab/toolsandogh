@@ -344,7 +344,9 @@ class Analysis:
         self.fft_log_abs = SharedArray(video.shape, dtype=np.float32)
         self.corrected = SharedArray(video.shape, dtype=np.float32)
         self.dra = SharedArray(video.shape, dtype=np.float32)
-        self.rvt = SharedArray(video.shape, dtype=np.float32)
+        (f, h, w) = video.shape
+        u = self.args.rvt_upsample
+        self.rvt = SharedArray((f, h * u, w * u), dtype=np.float32)
         nframes = video.shape[0]
         nparticles = args.particles
         self.loc = SharedArray((nframes, nparticles, 6), dtype=np.float32)
@@ -633,9 +635,6 @@ class SideBar(EdgeWindow):
         _, rvt_mxr = imgui.slider_int(
             "rvt-max-radius", v=args.rvt_max_radius, v_min=0, v_max=50
         )
-        _, rvt_ups = imgui.slider_int(
-            "rvt-upsample", v=args.rvt_upsample, v_min=0, v_max=4
-        )
         imgui.separator()
 
         imgui.text("Tracking Parameters")
@@ -726,9 +725,6 @@ class SideBar(EdgeWindow):
             rvt_changes = True
         if rvt_mxr != args.rvt_max_radius:
             args.rvt_max_radius = rvt_mxr
-            rvt_changes = True
-        if rvt_ups != args.rvt_upsample:
-            args.rvt_upsample = rvt_ups
             rvt_changes = True
         if tracking_radius != args.tracking_radius:
             args.tracking_radius = tracking_radius

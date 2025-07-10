@@ -2,11 +2,9 @@
 name = "toolsandogh"
 version = "0.1.0"
 description = "A collection of Python scripts for iSCAT microscopy data analysis"
-authors = [
-  { name = "Marco Heisig", email = "marco.heisig@mpl.mpg.de" }
-]
+authors = [{ name = "Marco Heisig", email = "marco.heisig@mpl.mpg.de" }]
 readme = "README.md"
-license = {text = "GPL-3.0-or-later"}
+license = { text = "GPL-3.0-or-later" }
 requires-python = ">=3.12"
 dependencies = [
     "imgui[glfw,sdl2]",
@@ -20,18 +18,12 @@ dependencies = [
     "tqdm",
     "bioio",
     "bioio-bioformats",
+    "bioio-imageio>=1.2",
 ]
 keywords = ["tools", "utilities", "python"]
 
 [dependency-groups]
-dev = [
-  "ruff",
-  "pre-commit",
-  "pyright",
-  "pytest",
-  "setuptools",
-  "coverage",
-]
+dev = ["ruff", "pre-commit", "pyright", "pytest", "setuptools", "coverage"]
 
 
 [build-system]
@@ -48,20 +40,20 @@ fix = true
 
 [tool.ruff.lint]
 select = [
-  "E",  # pycodestyle errors
-  "W",  # pycodestyle warnings
-  "F",  # pyflakes errors
-  "I",  # isort
-  "C",  # Complexity
-  "RET", # Retweet (flake8-retweet)
-  "YTT", # Truthiness
-  "TRY", # Try block errors
+    "E",   # pycodestyle errors
+    "W",   # pycodestyle warnings
+    "F",   # pyflakes errors
+    "I",   # isort
+    "C",   # Complexity
+    "RET", # Retweet (flake8-retweet)
+    "YTT", # Truthiness
+    "TRY", # Try block errors
 ]
 ignore = [
-  "C901",  # Function too complex
-  "E501",  # Line too long (handled by line-length)
-  "E402",  # Module level import not at top of file (isort handles this)
-  "TRY003",  # Long message outside exception class
+    "C901",   # Function too complex
+    "E501",   # Line too long (handled by line-length)
+    "E402",   # Module level import not at top of file (isort handles this)
+    "TRY003", # Long message outside exception class
 ]
 unfixable = ["F821"] # Don't try to fix name definition
 

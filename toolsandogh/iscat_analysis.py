@@ -117,6 +117,8 @@ class SharedArray(Generic[_Dtype]):
 
 @dataclass
 class Task:
+    """Base class for schedulable work items."""
+
     dependencies: list["Task"]
     status: Literal["unscheduled", "scheduled", "finished"]
     start: int
@@ -170,6 +172,8 @@ class CopyFrames(Task):
 
 @dataclass
 class ComputeFFT(Task):
+    """Perform Fourier space corrections for the selected range of frames."""
+
     video: SharedArray[np.float32]
     fft: SharedArray[np.complex64]
     fft_log_abs: SharedArray[np.float32]
@@ -216,6 +220,8 @@ class ComputeFFT(Task):
 
 @dataclass
 class ComputeDRA(Task):
+    """Compute the differential rolling average."""
+
     video: SharedArray[np.float32]
     dra: SharedArray[np.float32]
     window_size: int
@@ -241,6 +247,8 @@ class ComputeDRA(Task):
 
 @dataclass
 class ComputeRVT(Task):
+    """Compute the radial variance transform (RVT)."""
+
     video: SharedArray[np.float32]
     rvt: SharedArray[np.float32]
     min_radius: int
@@ -263,6 +271,8 @@ class ComputeRVT(Task):
 
 @dataclass
 class ComputeLOC(Task):
+    """Localize particles using trackpy."""
+
     video: SharedArray[np.float32]
     loc: SharedArray
     radius: int

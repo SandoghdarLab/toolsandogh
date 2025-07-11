@@ -13,6 +13,8 @@
 #     "imageio[ffmpeg]",
 #     "bioio",
 #     "bioio-bioformats",
+#     "xarray",
+#     "dask",
 # ]
 # ///
 
@@ -31,11 +33,13 @@ from typing import Generic, Literal, TypeVar
 import bioio
 import bioio.writers
 import bioio_bioformats
+import dask.array as da
 import imageio
 import imgrvt
 import numpy as np
 import numpy.typing as npt
 import trackpy
+import xarray as xr
 from imgui_bundle import imgui, portable_file_dialogs
 
 if __name__ == "__main__":
@@ -341,8 +345,8 @@ class Analysis:
     rvt_tasks: list[Task]
     loc_tasks: list[Task]
 
-    def __init__(self, args: argparse.Namespace, video: npt.NDArray[np.float32]):
-        assert video.ndim == 3  # frames, height, width
+    def __init__(self, args: argparse.Namespace, video: xr.DataArray):
+        assert video.dims == ("T", "Y", "X")
         self.args = args
         self.pool = multiprocessing.Pool(processes=args.processes)
         self.work = []
@@ -709,6 +713,10 @@ class SideBar(EdgeWindow):
                 nunscheduled += 1
         ntasks = nfinished + nscheduled + nunscheduled
         imgui.text(f"Status: {nfinished}/{ntasks} computed ({nscheduled} scheduled)")
+
+        # Ensure RVT min and max radius are consistent with each other
+        if rvt_mxr <= rvt_mnr:
+            rvt_mxr = rvt_mnr + 1
 
         # Changes
         fft_changes: bool = False
@@ -1128,6 +1136,7 @@ def main():
 
     # Load the input file, either from raw data or from a suitable image or
     # video file.
+    video: xr.DataArray
     if args.raw_dtype:
         dtype = np.dtype(args.raw_dtype)
         # Derive the number of frames when it is not set
@@ -1137,22 +1146,32 @@ def main():
 
         # Load the raw video
         shape = (args.frames, args.rows, args.columns)
-        count = shape[0] * shape[1] * shape[2]
-        pixels = np.fromfile(args.input_file, dtype=dtype, count=count)
-        video = np.reshape(pixels, shape)
+        bytes_per_frame = args.rows * args.columns * dtype.itemsize
+        offset = args.initial_frame * bytes_per_frame
+        mmap_array = np.memmap(
+            args.input_file, dtype=dtype, mode="r", shape=shape, offset=offset
+        )
+        dask_array = da.from_array(mmap_array)
+        video = xr.DataArray(dask_array, dims=("T", "Y", "X"))
     else:
         # Read video using bioio
         img = bioio.BioImage(args.input_file, reader=bioio_bioformats.Reader)
-        T = slice(args.initial_frame, args.initial_frame + args.frames, 1)
-        video = img.get_image_data("TYX", T=T, C=args.channel, Z=args.zstack)
+        T = slice(
+            args.initial_frame,
+            None if args.frames == -1 else args.initial_frame + args.frames,
+            1,
+        )
+        xarr = img.get_xarray_stack()
+        video = xarr.isel(I=0, T=T, C=args.channel, Z=args.zstack)
     # Check that the video matches the prescribed parameters
-    assert len(video.shape) == 3
-    if args.frames:
-        assert video.shape[0] == args.frames
-    if args.rows:
-        assert video.shape[1] == args.rows
-    if args.columns:
-        assert video.shape[2] == args.columns
+    assert video.dims == ("T", "Y", "X")
+    if args.frames == -1:
+        args.frames = video.shape[0]
+    if args.rows == -1:
+        args.rows = video.shape[1]
+    if args.columns == -1:
+        args.columns = video.shape[2]
+    assert video.shape == (args.frames, args.rows, args.columns)
     # Normalize the video if desired.
     if args.normalize:
         minimum = np.min(video)

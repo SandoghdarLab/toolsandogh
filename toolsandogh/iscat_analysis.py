@@ -141,10 +141,11 @@ class Task:
         pass
 
     def schedule(self, pool: multiprocessing.pool.Pool):
-        assert self.is_unscheduled()
+        assert self.status == "unscheduled"
         self.status = "scheduled"
 
         def callback(_):
+            assert self.status == "scheduled"
             self.status = "finished"
 
         def error_callback(exc):
@@ -486,7 +487,7 @@ class Analysis:
         nframes = len(self.video)
         window_size = self.args.dra_window_size
         nloc = nframes if window_size == 0 else nframes - (2 * window_size) + 1
-        chunk_size = 16
+        chunk_size = 8
         bounds: list[tuple[int, int]] = []
         for start in range(0, nloc, chunk_size):
             end = min(nloc, start + chunk_size)
@@ -533,6 +534,9 @@ class Analysis:
                     yield task
 
     def next_batch_of_tasks(self, maxlength: int):
+        """
+        Returns up to maxlength tasks whose dependencies are satisfied.
+        """
         if maxlength == 0:
             return []
         it = itertools.batched(self.available_tasks(), maxlength)
@@ -547,14 +551,17 @@ class Analysis:
         goal = 2 * self.args.processes
         scheduled = []
         completed = []
-        for result in self.work:
-            if result.is_finished():
-                completed.append(result)
+        for task in self.work:
+            if task.is_finished():
+                completed.append(task)
             else:
-                scheduled.append(result)
-        tasks = self.next_batch_of_tasks(goal - len(scheduled))
+                scheduled.append(task)
+        max_tasks = max(0, goal - len(scheduled))
+        tasks = self.next_batch_of_tasks(max_tasks)
         for task in tasks:
             task.schedule(self.pool)
+            scheduled.append(task)
+        # Remove all the completed tasks
         self.work = scheduled
 
     def finish(self):
@@ -563,7 +570,7 @@ class Analysis:
         print("Performing iSCAT Analysis with the following parameters:")
         self.print_args()
         # Complete the work
-        while not all(task.is_finished() for task in self.rvt_tasks):
+        while not all(task.is_finished() for task in self.loc_tasks):
             self.update_schedule()
             time.sleep(0.01)
 

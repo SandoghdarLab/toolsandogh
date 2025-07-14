@@ -13,17 +13,29 @@
 #     "imageio[ffmpeg]",
 #     "bioio",
 #     "bioio-bioformats",
+#     "bioio-czi",
+#     "bioio-dv",
+#     "bioio-imageio",
+#     "bioio-lif",
+#     "bioio-nd2",
+#     "bioio-ome-tiff",
+#     "bioio-ome-zarr",
+#     "bioio-sldy",
+#     "bioio-tifffile",
+#     "bioio-tiff-glob",
 #     "xarray",
 #     "dask",
 # ]
 # ///
 
 import argparse
+import collections
 import itertools
 import math
 import multiprocessing
 import multiprocessing.pool
 import os
+import pathlib
 import time
 import warnings
 from dataclasses import dataclass
@@ -31,16 +43,16 @@ from multiprocessing.shared_memory import SharedMemory
 from typing import Generic, Literal, TypeVar
 
 import bioio
-import bioio.writers
 import bioio_bioformats
 import dask.array as da
-import imageio
+import imageio.v3 as iio
 import imgrvt
 import numpy as np
 import numpy.typing as npt
 import trackpy
 import xarray as xr
-from imgui_bundle import imgui, portable_file_dialogs
+from imgui_bundle import imgui
+from imgui_bundle import portable_file_dialogs as pfd
 
 if __name__ == "__main__":
     from fastplotlib.ui import EdgeWindow  # type: ignore
@@ -500,9 +512,9 @@ class Analysis:
                 end=end,
                 video=self.rvt,
                 loc=self.loc,
-                radius=self.args.localization_radius,
-                min_mass=self.args.localization_min_mass,
-                percentile=self.args.localization_percentile,
+                radius=self.args.loc_radius,
+                min_mass=self.args.loc_min_mass,
+                percentile=self.args.loc_percentile,
                 maxlocs=self.args.particles,
             )
             for start, end in bounds
@@ -617,9 +629,10 @@ class SideBar(EdgeWindow):
                 if imgui.selectable(cmap, is_selected)[0]:
                     args.colormap = cmap
             imgui.end_combo()
-        imgui.separator()
 
+        imgui.separator()
         imgui.text("FFT Parameters")
+
         _, fft_i_r = imgui.slider_float(
             "fft-inner-radius", v=args.fft_inner_radius, v_min=0.0, v_max=0.25
         )
@@ -639,8 +652,8 @@ class SideBar(EdgeWindow):
             v_max=0.125,
         )
         imgui.separator()
-
         imgui.text("DRA Parameters")
+
         _, dra_w_s = imgui.slider_int(
             "dra-window-size",
             v=args.dra_window_size,
@@ -648,26 +661,25 @@ class SideBar(EdgeWindow):
             v_max=min(1000, args.frames // 2),
         )
         imgui.separator()
-
         imgui.text("RVT Parameters")
+
         _, rvt_mnr = imgui.slider_int(
             "rvt-min-radius", v=args.rvt_min_radius, v_min=0, v_max=20
         )
         _, rvt_mxr = imgui.slider_int(
             "rvt-max-radius", v=args.rvt_max_radius, v_min=0, v_max=50
         )
-        imgui.separator()
 
         imgui.text("Localization Parameters")
-        _, localization_radius = imgui.slider_int(
-            "localization-radius", v=args.localization_radius, v_min=0, v_max=20
+        _, loc_radius = imgui.slider_int(
+            "loc-radius", v=args.loc_radius, v_min=0, v_max=20
         )
-        _, localization_min_mass = imgui.slider_float(
-            "localization-min-mass", v=args.localization_min_mass, v_min=0.0, v_max=5.0
+        _, loc_min_mass = imgui.slider_float(
+            "loc-min-mass", v=args.loc_min_mass, v_min=0.0, v_max=5.0
         )
-        _, localization_percentile = imgui.slider_int(
-            "localization-percentile",
-            v=args.localization_percentile,
+        _, loc_percentile = imgui.slider_int(
+            "loc-percentile",
+            v=args.loc_percentile,
             v_min=0,
             v_max=100,
         )
@@ -676,42 +688,38 @@ class SideBar(EdgeWindow):
         )
 
         imgui.separator()
+        imgui.text("Output Files")
 
-        imgui.text("Save Files")
+        args.dra_file, args.dra_overwrite = save_file_widget("DRA", args.dra_file)
+        args.rvt_file, args.rvt_overwrite = save_file_widget("RVT", args.rvt_file)
+        args.loc_file, args.loc_overwrite = save_file_widget("LOC", args.loc_file)
 
-        def truncate_path(path: str, maxlen=35):
-            if len(path) > (maxlen - 3):
-                return "..." + path[-maxlen:]
-            return path
-
-        pfd = portable_file_dialogs
-        filters = [
-            "TIFF files",
-            "*.tif *.tiffAVI Files",
-            "*.avi",
-            "MP4 Files",
-            "*.mp4",
-            "Numpy files",
-            "*.npy",
-        ]
-        if imgui.button(f"FFT File: {truncate_path(args.fft_file)}"):
-            filename = pfd.save_file("fft-file", args.fft_file, filters).result()
-            if filename:
-                args.fft_file = filename
-        if imgui.button(f"DRA File: {truncate_path(args.dra_file)}"):
-            filename = pfd.save_file("dra-file", args.dra_file, filters).result()
-            if filename:
-                args.dra_file = filename
-        if imgui.button(f"RVT File: {truncate_path(args.rvt_file)}"):
-            filename = pfd.save_file("rvt-file", args.rvt_file, filters).result()
-            if filename:
-                args.rvt_file = filename
-        if imgui.button(f"LOC File: {truncate_path(args.loc_file)}"):
-            filename = pfd.save_file("loc-file", args.loc_file, filters).result()
-            if filename:
-                args.loc_file = filename
         imgui.separator()
+        imgui.begin_horizontal("save dialog")
+        if imgui.button("Compute & Save"):
+            # Finish all calculations
+            self.analysis.finish()
 
+            # Write the DRA file
+            if args.dra_file:
+                dst = prepare_path_for_saving(args.dra_file, args.dra_overwrite)
+                arr = np.array(self.analysis.dra)
+                iio.imwrite(dst, arr)
+
+            # Write the RVT file
+            if args.rvt_file:
+                dst = prepare_path_for_saving(args.rvt_file, args.rvt_overwrite)
+                arr = np.array(self.analysis.rvt)
+                iio.imwrite(dst, arr)
+
+            # Write the LOC file
+            if args.loc_file:
+                pass  # TODO
+        if imgui.button("Compute All & Save"):
+            warnings.warn("Computing all frames is not implemented yet.")
+        imgui.end_horizontal()
+
+        # Display how many tasks are in which state.
         nunscheduled = 0
         nscheduled = 0
         nfinished = 0
@@ -755,14 +763,14 @@ class SideBar(EdgeWindow):
         if rvt_mxr != args.rvt_max_radius:
             args.rvt_max_radius = rvt_mxr
             rvt_changes = True
-        if localization_radius != args.localization_radius:
-            args.localization_radius = localization_radius
+        if loc_radius != args.loc_radius:
+            args.loc_radius = loc_radius
             loc_changes = True
-        if localization_min_mass != args.localization_min_mass:
-            args.localization_min_mass = localization_min_mass
+        if loc_min_mass != args.loc_min_mass:
+            args.loc_min_mass = loc_min_mass
             loc_changes = True
-        if localization_percentile != args.localization_percentile:
-            args.localization_percentile = localization_percentile
+        if loc_percentile != args.loc_percentile:
+            args.loc_percentile = loc_percentile
             loc_changes = True
         if fft_changes:
             dra_changes = True
@@ -779,6 +787,83 @@ class SideBar(EdgeWindow):
             self.analysis.invalidate_rvt()
         if loc_changes:
             self.analysis.invalidate_loc()
+
+
+@dataclass
+class SaveFileState:
+    """The state involved in determining a file to save to."""
+
+    dialog: pfd.save_file | None = None
+    path: str | None = None
+    overwrite: bool = False
+
+
+save_file_state: dict[str, SaveFileState] = collections.defaultdict(
+    lambda: SaveFileState()
+)
+
+
+def save_file_widget(name: str, default: str, filters=None) -> tuple[str | None, bool]:
+    label = f"Set {name} Save File"
+    imgui.push_id(label)
+    state = save_file_state[label]
+
+    imgui.begin_horizontal("box & button")
+    # Render a button that opens a dialog when pressed
+    if imgui.button(label):
+        state.dialog = pfd.save_file(label, default, filters)
+    # Render a button that toggles overwriting when pressed
+    _, state.overwrite = imgui.checkbox("overwrite", state.overwrite)
+    imgui.end_horizontal()
+
+    # Handle the result of a save file dialog
+    if state.dialog is not None and state.dialog.ready():
+        state.path = state.dialog.result()
+        state.dialog = None
+    else:
+        state.path = default
+
+    # Print the truncated pathname
+    text = "" if state.path is None else str(state.path)
+    maxlen = 50
+    if not text:
+        imgui.text("no file selected")
+    elif len(text) <= maxlen:
+        imgui.text(text)
+    else:
+        imgui.text("..." + text[-(maxlen - 3) :])
+
+    imgui.spacing()
+    imgui.pop_id()
+    return (state.path or default, state.overwrite)
+
+
+def prepare_path_for_saving(filename: str, overwrite: bool = False) -> str:
+    path = pathlib.Path(filename)
+    # Return immediately if there is no file of the given name
+    if not path.is_file():
+        return filename
+    # If the override flag is set, delete any existing file
+    if overwrite:
+        path.unlink()
+        return filename
+    # Otherwise, uniquify the filename by appending an integer suffix
+    return uniquify_filename(filename)
+
+
+def uniquify_filename(filepath: str) -> str:
+    path = pathlib.Path(filepath)
+    parent = path.parent
+    stem = path.stem  # basename without extension
+    suffix = path.suffix  # includes the dot, e.g., ".txt"
+
+    counter = 1
+    while True:
+        new_name = f"{stem}_{counter:04d}{suffix}"
+        new_path = parent / new_name
+        if not new_path.exists():
+            return str(new_path)
+        counter += 1
 
 
 def iscat_gui(analysis: Analysis):
@@ -889,13 +974,28 @@ def main():
         help="The number of frames of the input video to load.",
     )
 
-    parser.add_argument("--fft-file", type=str, default="", help="FFT output file path")
-
     parser.add_argument("--dra-file", type=str, default="", help="DRA output file path")
-
     parser.add_argument("--rvt-file", type=str, default="", help="RVT output file path")
-
     parser.add_argument("--loc-file", type=str, default="", help="LOC output file path")
+
+    parser.add_argument(
+        "--dra-overwrite",
+        type=bool,
+        default=False,
+        help="Wheter to overwrite existing DRA file",
+    )
+    parser.add_argument(
+        "--rvt-overwrite",
+        type=bool,
+        default=False,
+        help="Wheter to overwrite existing RVT file",
+    )
+    parser.add_argument(
+        "--loc-overwrite",
+        type=bool,
+        default=False,
+        help="Wheter to overwrite existing LOC file",
+    )
 
     parser.add_argument(
         "--raw-dtype",
@@ -1018,21 +1118,21 @@ def main():
     )
 
     parser.add_argument(
-        "--localization-radius",
+        "--loc-radius",
         type=int,
         default=4,
         help="The radius (in pixels) of structures to locate in the RVT image.",
     )
 
     parser.add_argument(
-        "--localization-min-mass",
+        "--loc-min-mass",
         type=float,
         default=0.0,
         help="The minimum mass of structures to locate in the RVT image.",
     )
 
     parser.add_argument(
-        "--localization-percentile",
+        "--loc-percentile",
         type=int,
         default=80,
         help="Features must be brighter than this percentile to be considered for localization.",
@@ -1063,18 +1163,7 @@ def main():
 
     # Validate that input file exists
     if not os.path.isfile(args.input_file):
-        parser.error(f"Input file '{args.input_file}' does not exist.")
-
-    # Ensure that output files don't exist
-    def check_output_file(output_file):
-        if output_file:
-            if os.path.exists(output_file):
-                parser.error(f"Cannot write to existing file '{output_file}'.")
-
-    check_output_file(args.fft_file)
-    check_output_file(args.dra_file)
-    check_output_file(args.rvt_file)
-    check_output_file(args.loc_file)
+        parser.error(f"Input file '{args.input_file}' doesn't exist.")
 
     # Validate the video parameters
     if args.initial_frame < 0:
@@ -1199,17 +1288,6 @@ def main():
                 time.sleep(0.01)
             # Start the GUI
             iscat_gui(analysis)
-        # Save the results
-
-        def maybe_save(filename: str, array: npt.ArrayLike):
-            if not filename:
-                return
-            imageio.mimwrite(filename, [np.array(array)])
-
-        maybe_save(args.fft_file, analysis.corrected)
-        maybe_save(args.dra_file, analysis.dra)
-        maybe_save(args.rvt_file, analysis.rvt)
-        # TODO loc file
 
 
 if __name__ == "__main__":

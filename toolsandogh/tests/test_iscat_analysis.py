@@ -54,9 +54,9 @@ def test_Analysis():
         dra_window_size=0,
         rvt_min_radius=1,
         rvt_max_radius=2,
-        tracking_radius=1,
-        tracking_min_mass=0.0,
-        tracking_percentile=75,
+        localization_radius=1,
+        localization_min_mass=0.0,
+        localization_percentile=75,
         circle_alpha=1.0,
     )
     a2 = argparse.Namespace(
@@ -70,9 +70,9 @@ def test_Analysis():
         dra_window_size=5,
         rvt_min_radius=1,
         rvt_max_radius=3,
-        tracking_radius=2,
-        tracking_min_mass=0.1,
-        tracking_percentile=75,
+        localization_radius=2,
+        localization_min_mass=0.1,
+        localization_percentile=75,
         circle_alpha=0.8,
     )
 

@@ -500,9 +500,9 @@ class Analysis:
                 end=end,
                 video=self.rvt,
                 loc=self.loc,
-                radius=self.args.tracking_radius,
-                min_mass=self.args.tracking_min_mass,
-                percentile=self.args.tracking_percentile,
+                radius=self.args.localization_radius,
+                min_mass=self.args.localization_min_mass,
+                percentile=self.args.localization_percentile,
                 maxlocs=self.args.particles,
             )
             for start, end in bounds
@@ -658,19 +658,23 @@ class SideBar(EdgeWindow):
         )
         imgui.separator()
 
-        imgui.text("Tracking Parameters")
-        _, tracking_radius = imgui.slider_int(
-            "tracking-radius", v=args.tracking_radius, v_min=0, v_max=20
+        imgui.text("Localization Parameters")
+        _, localization_radius = imgui.slider_int(
+            "localization-radius", v=args.localization_radius, v_min=0, v_max=20
         )
-        _, tracking_min_mass = imgui.slider_float(
-            "tracking-min-mass", v=args.tracking_min_mass, v_min=0.0, v_max=5.0
+        _, localization_min_mass = imgui.slider_float(
+            "localization-min-mass", v=args.localization_min_mass, v_min=0.0, v_max=5.0
         )
-        _, tracking_percentile = imgui.slider_int(
-            "tracking-percentile", v=args.tracking_percentile, v_min=0, v_max=100
+        _, localization_percentile = imgui.slider_int(
+            "localization-percentile",
+            v=args.localization_percentile,
+            v_min=0,
+            v_max=100,
         )
         _, args.circle_alpha = imgui.slider_float(
             "circle-alpha", v=args.circle_alpha, v_min=0.0, v_max=1.0
         )
+
         imgui.separator()
 
         imgui.text("Save Files")
@@ -751,14 +755,14 @@ class SideBar(EdgeWindow):
         if rvt_mxr != args.rvt_max_radius:
             args.rvt_max_radius = rvt_mxr
             rvt_changes = True
-        if tracking_radius != args.tracking_radius:
-            args.tracking_radius = tracking_radius
+        if localization_radius != args.localization_radius:
+            args.localization_radius = localization_radius
             loc_changes = True
-        if tracking_min_mass != args.tracking_min_mass:
-            args.tracking_min_mass = tracking_min_mass
+        if localization_min_mass != args.localization_min_mass:
+            args.localization_min_mass = localization_min_mass
             loc_changes = True
-        if tracking_percentile != args.tracking_percentile:
-            args.tracking_percentile = tracking_percentile
+        if localization_percentile != args.localization_percentile:
+            args.localization_percentile = localization_percentile
             loc_changes = True
         if fft_changes:
             dra_changes = True
@@ -1014,24 +1018,24 @@ def main():
     )
 
     parser.add_argument(
-        "--tracking-radius",
+        "--localization-radius",
         type=int,
         default=4,
         help="The radius (in pixels) of structures to locate in the RVT image.",
     )
 
     parser.add_argument(
-        "--tracking-min-mass",
+        "--localization-min-mass",
         type=float,
         default=0.0,
         help="The minimum mass of structures to locate in the RVT image.",
     )
 
     parser.add_argument(
-        "--tracking-percentile",
+        "--localization-percentile",
         type=int,
         default=80,
-        help="Features must be brighter than this percentile to be considered for tracking.",
+        help="Features must be brighter than this percentile to be considered for localization.",
     )
 
     parser.add_argument(

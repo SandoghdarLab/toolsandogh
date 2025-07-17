@@ -1,12 +1,16 @@
 import argparse
+import contextlib
+import io
 import itertools
 import math
+import pathlib
+import shlex
 from multiprocessing import Pool
 
 import numpy as np
 import xarray as xr
 
-from toolsandogh.iscat_analysis import Analysis, SharedArray
+import toolsandogh.iscat_analysis as iscat_analysis
 
 
 def test_SharedArray():
@@ -15,7 +19,7 @@ def test_SharedArray():
     for dtype in dtypes:
         for shape in shapes:
             # Test individual array access
-            sa = SharedArray(shape, dtype=dtype)
+            sa = iscat_analysis.SharedArray(shape, dtype=dtype)
             indices = itertools.product(*[list(range(dim)) for dim in shape])
             for index in indices:
                 value = dtype(np.random.randint(256))
@@ -43,7 +47,12 @@ def test_SharedArray():
 def test_Analysis():
     """Test Analysis class creation and finalization."""
     # Create some test video data
+    parent = pathlib.Path(__file__).resolve().parent
+    testfile = str(parent / "testfile.tiff")
     a1 = argparse.Namespace(
+        input_file=testfile,
+        initial_frame=0,
+        frames=1,
         processes=1,
         rvt_upsample=1,
         particles=2,
@@ -60,6 +69,9 @@ def test_Analysis():
         circle_alpha=1.0,
     )
     a2 = argparse.Namespace(
+        input_file=testfile,
+        initial_frame=0,
+        frames=1,
         processes=2,
         rvt_upsample=2,
         particles=42,
@@ -79,5 +91,16 @@ def test_Analysis():
     for args in [a1, a2]:
         video = np.random.random((10, 32, 32)).astype(np.float32)
         xarr = xr.DataArray(video, dims=("T", "Y", "X"))
-        with Analysis(args, xarr) as analysis:
+        with iscat_analysis.Analysis(args, xarr) as analysis:
+            # Ensure that arguments are print-read consistent
+            with contextlib.redirect_stdout(io.StringIO()) as target:
+                analysis.print_args()
+            parser = iscat_analysis.argument_parser()
+            argv = shlex.split(target.getvalue())
+            args = parser.parse_args(argv[1:])
+            iscat_analysis.validate_arguments(parser, args)
+            for var in vars(analysis.args):
+                assert getattr(args, var) == getattr(analysis.args, var)
+
+            # Run the analysis to completion
             analysis.finish()

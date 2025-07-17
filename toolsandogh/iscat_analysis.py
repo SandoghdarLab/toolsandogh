@@ -954,6 +954,67 @@ def circle_data(localizations):
 
 def main():
     """Parse command-line arguments and start iSCAT processing."""
+    parser = argument_parser()
+    args = parser.parse_args()
+    validate_arguments(parser, args)
+
+    # Load the input file, either from raw data or from a suitable image or
+    # video file.
+    video: xr.DataArray
+    if args.raw_dtype:
+        dtype = np.dtype(args.raw_dtype)
+        # Derive the number of frames when it is not set
+        if args.frames == -1:
+            bytes_per_frame = dtype.itemsize * args.rows * args.columns
+            args.frames = os.path.getsize(args.input_file) // bytes_per_frame
+
+        # Load the raw video
+        shape = (args.frames, args.rows, args.columns)
+        bytes_per_frame = args.rows * args.columns * dtype.itemsize
+        offset = args.initial_frame * bytes_per_frame
+        mmap_array = np.memmap(
+            args.input_file, dtype=dtype, mode="r", shape=shape, offset=offset
+        )
+        dask_array = da.from_array(mmap_array)
+        video = xr.DataArray(dask_array, dims=("T", "Y", "X"))
+    else:
+        # Read video using bioio
+        img = bioio.BioImage(args.input_file, reader=bioio_bioformats.Reader)
+        T = slice(
+            args.initial_frame,
+            None if args.frames == -1 else args.initial_frame + args.frames,
+            1,
+        )
+        xarr = img.get_xarray_stack()
+        video = xarr.isel(I=0, T=T, C=args.channel, Z=args.zstack)
+    # Check that the video matches the prescribed parameters
+    assert video.dims == ("T", "Y", "X")
+    if args.frames == -1:
+        args.frames = video.shape[0]
+    if args.rows == -1:
+        args.rows = video.shape[1]
+    if args.columns == -1:
+        args.columns = video.shape[2]
+    assert video.shape == (args.frames, args.rows, args.columns)
+    # Normalize the video if desired.
+    if args.normalize:
+        minimum = np.min(video)
+        maximum = np.max(video)
+        video = (video - minimum) / (maximum - minimum)
+    # Start the iSCAT analysis
+    with Analysis(args, video) as analysis:
+        # Unless we have --no-gui, open a GUI for tuning the args
+        if args.gui:
+            # Compute the first batch of items before creating the GUI, so that we
+            # have sane bounds for each histogram.
+            while not analysis.loc_tasks[0].is_finished():
+                analysis.update_schedule()
+                time.sleep(0.01)
+            # Start the GUI
+            iscat_gui(analysis)
+
+
+def argument_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Analyze iSCAT recordings.")
 
     parser.add_argument(
@@ -980,19 +1041,19 @@ def main():
 
     parser.add_argument(
         "--dra-overwrite",
-        type=bool,
+        action=argparse.BooleanOptionalAction,
         default=False,
         help="Wheter to overwrite existing DRA file",
     )
     parser.add_argument(
         "--rvt-overwrite",
-        type=bool,
+        action=argparse.BooleanOptionalAction,
         default=False,
         help="Wheter to overwrite existing RVT file",
     )
     parser.add_argument(
         "--loc-overwrite",
-        type=bool,
+        action=argparse.BooleanOptionalAction,
         default=False,
         help="Wheter to overwrite existing LOC file",
     )
@@ -1159,11 +1220,13 @@ def main():
         help="The number of background processes to use for computing.",
     )
 
-    args = parser.parse_args()
+    return parser
 
+
+def validate_arguments(parser: argparse.ArgumentParser, args: argparse.Namespace):
     # Validate that input file exists
     if not os.path.isfile(args.input_file):
-        parser.error(f"Input file '{args.input_file}' doesn't exist.")
+        parser.error(f"Input file {args.input_file} doesn't exist.")
 
     # Validate the video parameters
     if args.initial_frame < 0:
@@ -1171,7 +1234,12 @@ def main():
     if args.frames < -1:
         parser.error("The --frames argument must be non-negative or -1.")
     if args.raw_dtype:
-        dtype = np.dtype(args.raw_dtype)
+        # Make sure the dtype can be parsed correctly
+        try:
+            np.dtype(args.raw_dtype)
+        except TypeError:
+            parser.error("The --raw-dtype must be a valid Numpy dtype specifier.")
+        # If there is a raw_dtype, make sure that rows and columns are supplied
         if not args.rows > 0:
             parser.error("The --rows argument must be given when reading raw files.")
         if not args.columns > 0:
@@ -1233,61 +1301,6 @@ def main():
     # Validate the localization parameters
     if not (0 <= args.circle_alpha <= 1):
         parser.error("The --circle-alpha must be between zero and one.")
-
-    # Load the input file, either from raw data or from a suitable image or
-    # video file.
-    video: xr.DataArray
-    if args.raw_dtype:
-        dtype = np.dtype(args.raw_dtype)
-        # Derive the number of frames when it is not set
-        if args.frames == -1:
-            bytes_per_frame = dtype.itemsize * args.rows * args.columns
-            args.frames = os.path.getsize(args.input_file) // bytes_per_frame
-
-        # Load the raw video
-        shape = (args.frames, args.rows, args.columns)
-        bytes_per_frame = args.rows * args.columns * dtype.itemsize
-        offset = args.initial_frame * bytes_per_frame
-        mmap_array = np.memmap(
-            args.input_file, dtype=dtype, mode="r", shape=shape, offset=offset
-        )
-        dask_array = da.from_array(mmap_array)
-        video = xr.DataArray(dask_array, dims=("T", "Y", "X"))
-    else:
-        # Read video using bioio
-        img = bioio.BioImage(args.input_file, reader=bioio_bioformats.Reader)
-        T = slice(
-            args.initial_frame,
-            None if args.frames == -1 else args.initial_frame + args.frames,
-            1,
-        )
-        xarr = img.get_xarray_stack()
-        video = xarr.isel(I=0, T=T, C=args.channel, Z=args.zstack)
-    # Check that the video matches the prescribed parameters
-    assert video.dims == ("T", "Y", "X")
-    if args.frames == -1:
-        args.frames = video.shape[0]
-    if args.rows == -1:
-        args.rows = video.shape[1]
-    if args.columns == -1:
-        args.columns = video.shape[2]
-    assert video.shape == (args.frames, args.rows, args.columns)
-    # Normalize the video if desired.
-    if args.normalize:
-        minimum = np.min(video)
-        maximum = np.max(video)
-        video = (video - minimum) / (maximum - minimum)
-    # Start the iSCAT analysis
-    with Analysis(args, video) as analysis:
-        # Unless we have --no-gui, open a GUI for tuning the args
-        if args.gui:
-            # Compute the first batch of items before creating the GUI, so that we
-            # have sane bounds for each histogram.
-            while not analysis.loc_tasks[0].is_finished():
-                analysis.update_schedule()
-                time.sleep(0.01)
-            # Start the GUI
-            iscat_gui(analysis)
 
 
 if __name__ == "__main__":

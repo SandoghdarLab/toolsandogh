@@ -68,7 +68,7 @@ _Dtype = TypeVar("_Dtype", bound=np.generic, covariant=True)
 
 ###############################################################################
 ###
-###  Utilities
+###  Shared Arrays
 
 
 class SharedArray(Generic[_Dtype]):
@@ -872,17 +872,17 @@ def iscat_gui(analysis: Analysis):
     iw = fpl.widgets.image_widget._widget.ImageWidget(
         data=[
             analysis.video._array,
-            analysis.fft_log_abs._array,
             analysis.corrected._array,
+            analysis.fft_log_abs._array,
             analysis.dra._array,
             analysis.rvt._array,
             analysis.rvt._array,
         ],
-        names=["original", "fft", "corrected", "dra", "rvt", "rvtcopy"],
+        names=["original", "corrected", "fft", "dra", "rvt", "rvtcopy"],
         cmap="plasma",
         figure_kwargs={
             "size": (analysis.args.gui_width, analysis.args.gui_height),
-            "controller_ids": None,
+            "controller_ids": [["original", "corrected", "dra", "rvt"], ["fft"]],
         },
     )
     # Hide the axes

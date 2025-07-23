@@ -854,6 +854,12 @@ class SideBar(EdgeWindow):
         ntasks = nfinished + nscheduled + nunscheduled
         imgui.text(f"Status: {nfinished}/{ntasks} computed ({nscheduled} scheduled)")
 
+        # Display the number of localized particles in the current frame
+        loc = self.analysis.loc
+        nframes, npoints, _ = loc.shape
+        nlocalizations = np.sum((loc[self.analysis.current_frame]).any(axis=1))
+        imgui.text(f"Localizations: {nlocalizations}")
+
         # Ensure RVT min and max radius are consistent with each other
         if rvt_mxr <= rvt_mnr:
             rvt_mxr = rvt_mnr + 1

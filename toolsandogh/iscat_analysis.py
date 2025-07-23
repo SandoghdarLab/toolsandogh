@@ -429,6 +429,7 @@ class Analysis:
         loc_tasks (list[ComputeLOC]): List of LOC tasks
     """
 
+    parser: argparse.ArgumentParser | None
     args: argparse.Namespace
     pool: multiprocessing.pool.Pool
     video: SharedArray[np.float32]
@@ -443,9 +444,15 @@ class Analysis:
     rvt_tasks: list[Task]
     loc_tasks: list[Task]
 
-    def __init__(self, args: argparse.Namespace, video: xr.DataArray):
+    def __init__(
+        self,
+        args: argparse.Namespace,
+        video: xr.DataArray,
+        parser: argparse.ArgumentParser | None = None,
+    ):
         assert video.dims == ("T", "Y", "X")
         self.args = args
+        self.parser = parser
         self.pool = multiprocessing.Pool(processes=args.processes)
         self.work = []
         self.current_frame = 0
@@ -671,7 +678,12 @@ class Analysis:
     def print_args(self):
         flags = []
         for key, value in vars(self.args).items():
+            # Skip arguments that have the default value
+            if self.parser and value == self.parser.get_default(key):
+                continue
+            # Reconstruct the long form of each argument
             arg = key.replace("_", "-")
+            # Suitably print the argument
             if isinstance(value, bool):
                 if value is True:
                     flags.append(f"--{arg}")
@@ -681,6 +693,7 @@ class Analysis:
                 flags.append(f"--{arg}='{value}'")
             else:
                 flags.append(f"--{arg}={value}")
+        # Reconstruct the command line arguments
         print(f"{os.path.basename(__file__)} {' '.join(flags)}")
 
 
@@ -1145,7 +1158,7 @@ def main():
         maximum = np.max(video)
         video = (video - minimum) / (maximum - minimum)
     # Start the iSCAT analysis
-    with Analysis(args, video) as analysis:
+    with Analysis(args, video, parser=parser) as analysis:
         # Unless we have --no-gui, open a GUI for tuning the args
         if args.gui:
             # Compute the first batch of items before creating the GUI, so that we
@@ -1157,211 +1170,116 @@ def main():
             iscat_gui(analysis)
 
 
+# fmt: off
+
+ARGUMENTS : list[tuple[list, dict]] = [
+    (["-i", "--input-file"],
+     {"required": True, "help": "Input file path"}),
+    (["--initial-frame"],
+     {"type": int, "default": 0, "help": "The first frame of the raw video to load"}),
+    (["--frames"],
+     {"type": int, "default": -1, "help": "The number of frames of the input video to load"}),
+    (["--dra-file"],
+     {"type": str, "default": "", "help": "DRA output file path"}),
+    (["--rvt-file"],
+     {"type": str, "default": "", "help": "RVT output file path"}),
+    (["--loc-file"],
+     {"type": str, "default": "", "help": "LOC output file path"}),
+    (["--raw-dtype"],
+     {"type": str, "default": "", "help": "The dtype of the RAW file to load"}),
+    (["--rows"],
+     {"type": int, "default": -1, "help": "The number of rows of the raw video to load"}),
+    (["--columns"],
+     {"type": int, "default": -1, "help": "The number of columns of the raw video to load"}),
+    (["--channel"],
+     {"type": int, "default": 0, "help": "What channel of the video to load"}),
+    (["--zstack"],
+     {"type": int, "default": 0, "help": "What slice of the Z stack to load."}),
+    (["--normalize"],
+     {"action": argparse.BooleanOptionalAction,
+      "default": True,
+      "help": "Whether to rescale the input video to the [0, 1] interval."}),
+    (["--gui"],
+     {"action": argparse.BooleanOptionalAction,
+      "default": True,
+      "help": "Whether to open a GUI to preview the parameters (default: True)."}),
+    (["--gui-width"],
+     {"type": int,
+      "default": 1920,
+      "help": "The width of the GUI window in Pixels."}),
+    (["--gui-height"],
+     {"type": int,
+      "default": 1080,
+      "help": "The height of the GUI window in Pixels."}),
+    (["--colormap"],
+     {"type": str,
+      "default": COLORMAPS[0],
+      "help": "The colormap used for visualization in the GUI."}),
+    (["--fft-inner-radius"],
+     {"type": float,
+      "default": 0.0,
+      "help": "The inner circle to cut out in FFT space to filter high-frequencies."}),
+    (["--fft-outer-radius"],
+     {"type": float,
+      "default": 1.0,
+      "help": "The outer circle to cut out in FFT space to filter low-frequencies."}),
+    (["--fft-row-noise-threshold"],
+     {"type": float,
+      "default": 0.0,
+      "help": "The percentage of row noise frequencies to cut out in FFT space."}),
+    (["--fft-column-noise-threshold"],
+     {"type": float,
+      "default": 0.0,
+      "help": "The percentage of column noise frequencies to cut out in FFT space."}),
+    (["--dra-window-size"],
+     {"type": int,
+      "default": 20,
+      "help": "The number of frames to compute the differential rolling average over."}),
+    (["--rvt-min-radius"],
+     {"type": int,
+      "default": 1,
+      "help": "The minimum radius (in pixels) to consider for radial variance transform."}),
+    (["--rvt-max-radius"],
+     {"type": int,
+      "default": 8,
+      "help": "The maximum radius (in pixels) to consider for radial variance transform."}),
+    (["--rvt-upsample"],
+     {"type": int,
+      "default": 1,
+      "help": "The degree of upsampling during radial variance transform."}),
+    (["--loc-radius"],
+     {"type": int,
+      "default": 4,
+      "help": "The radius (in pixels) of structures to locate in the RVT image."}),
+    (["--loc-min-mass"],
+     {"type": float,
+      "default": 0.0,
+      "help": "The minimum mass of structures to locate in the RVT image."}),
+    (["--loc-percentile"],
+     {"type": int,
+      "default": 80,
+      "help": "Features must be brighter than this percentile to be considered for localization."}),
+    (["--particles"],
+     {"type": int,
+      "default": 200,
+      "help": "A limit on how many particles to track in each frame."}),
+    (["--circle-alpha"],
+     {"type": float,
+      "default": 1.0,
+      "help": "Alpha channel of the circles drawn around each localized particle."}),
+    (["--processes"],
+     {"type": int,
+      "default": max(1, multiprocessing.cpu_count() // 2),
+      "help": "The number of background processes to use for computing."}),
+]
+# fmt: on
+
+
 def argument_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Analyze iSCAT recordings.")
 
-    parser.add_argument(
-        "-i", "--input-file", type=str, required=True, help="Input file path"
-    )
-
-    parser.add_argument(
-        "--initial-frame",
-        type=int,
-        default=0,
-        help="The first frame of the raw video to load.",
-    )
-
-    parser.add_argument(
-        "--frames",
-        type=int,
-        default=-1,
-        help="The number of frames of the input video to load.",
-    )
-
-    parser.add_argument("--dra-file", type=str, default="", help="DRA output file path")
-    parser.add_argument("--rvt-file", type=str, default="", help="RVT output file path")
-    parser.add_argument("--loc-file", type=str, default="", help="LOC output file path")
-
-    parser.add_argument(
-        "--dra-overwrite",
-        action=argparse.BooleanOptionalAction,
-        default=False,
-        help="Wheter to overwrite existing DRA file",
-    )
-    parser.add_argument(
-        "--rvt-overwrite",
-        action=argparse.BooleanOptionalAction,
-        default=False,
-        help="Wheter to overwrite existing RVT file",
-    )
-    parser.add_argument(
-        "--loc-overwrite",
-        action=argparse.BooleanOptionalAction,
-        default=False,
-        help="Wheter to overwrite existing LOC file",
-    )
-
-    parser.add_argument(
-        "--raw-dtype",
-        type=str,
-        default="",
-        help="The dtype of the RAW file to load, or an empty string.",
-    )
-
-    parser.add_argument(
-        "--rows",
-        type=int,
-        default=-1,
-        help="The number of rows of the raw video to load.",
-    )
-
-    parser.add_argument(
-        "--columns",
-        type=int,
-        default=-1,
-        help="The number of columns of the raw video to load.",
-    )
-
-    parser.add_argument(
-        "--channel", type=int, default=0, help="What channel of the video to load."
-    )
-
-    parser.add_argument(
-        "--zstack", type=int, default=0, help="What slice of the Z stack to load."
-    )
-
-    parser.add_argument(
-        "--normalize",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Whether to rescale the input video to the [0, 1] interval.",
-    )
-
-    parser.add_argument(
-        "--gui",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Whether to open a GUI to preview the parameters (default: True).",
-    )
-
-    parser.add_argument(
-        "--gui-width",
-        type=int,
-        default=1920,
-        help="The width of the GUI window in Pixels.",
-    )
-
-    parser.add_argument(
-        "--gui-height",
-        type=int,
-        default=1080,
-        help="The height of the GUI window in Pixels.",
-    )
-
-    parser.add_argument(
-        "--colormap",
-        type=str,
-        default=COLORMAPS[0],
-        help="The colormap used for visualization in the GUI.",
-    )
-
-    parser.add_argument(
-        "--fft-inner-radius",
-        type=float,
-        default=0.0,
-        help="The inner circle to cut out in FFT space to filter high-frequencies.",
-    )
-
-    parser.add_argument(
-        "--fft-outer-radius",
-        type=float,
-        default=1.0,
-        help="The outer circle to cut out in FFT space to filter low-frequencies.",
-    )
-
-    parser.add_argument(
-        "--fft-row-noise-threshold",
-        type=float,
-        default=0.00,
-        help="The percentage of row noise frequencies to cut out in FFT space.",
-    )
-
-    parser.add_argument(
-        "--fft-column-noise-threshold",
-        type=float,
-        default=0.00,
-        help="The percentage of column noise frequencies to cut out in FFT space.",
-    )
-
-    parser.add_argument(
-        "--dra-window-size",
-        type=int,
-        default=20,
-        help="The number of frames to compute the differential rolling average over.",
-    )
-
-    parser.add_argument(
-        "--rvt-min-radius",
-        type=int,
-        default=1,
-        help="The minimum radius (in pixels) to consider for radial variance transform.",
-    )
-
-    parser.add_argument(
-        "--rvt-max-radius",
-        type=int,
-        default=8,
-        help="The maximum radius (in pixels) to consider for radial variance transform.",
-    )
-
-    parser.add_argument(
-        "--rvt-upsample",
-        type=int,
-        default=1,
-        help="The degree of upsampling during radial variance transform.",
-    )
-
-    parser.add_argument(
-        "--loc-radius",
-        type=int,
-        default=4,
-        help="The radius (in pixels) of structures to locate in the RVT image.",
-    )
-
-    parser.add_argument(
-        "--loc-min-mass",
-        type=float,
-        default=0.0,
-        help="The minimum mass of structures to locate in the RVT image.",
-    )
-
-    parser.add_argument(
-        "--loc-percentile",
-        type=int,
-        default=80,
-        help="Features must be brighter than this percentile to be considered for localization.",
-    )
-
-    parser.add_argument(
-        "--particles",
-        type=int,
-        default=200,
-        help="Track only the specified number of brightest particles in each frame.",
-    )
-
-    parser.add_argument(
-        "--circle-alpha",
-        type=float,
-        default=1.0,
-        help="Alpha channel of the circles drawn around each localized particle.",
-    )
-
-    parser.add_argument(
-        "--processes",
-        type=int,
-        default=max(1, multiprocessing.cpu_count() // 2),
-        help="The number of background processes to use for computing.",
-    )
+    for args, kwargs in ARGUMENTS:
+        parser.add_argument(*args, **kwargs)
 
     return parser
 

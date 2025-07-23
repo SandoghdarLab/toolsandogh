@@ -55,6 +55,7 @@ from typing import Generic, Literal, Protocol, TypeVar, Union
 import bioio
 import bioio_bioformats
 import dask.array as da
+import imageio.v3 as iio
 import imgrvt
 import numpy as np
 import numpy.typing as npt
@@ -168,9 +169,18 @@ def write_video_as_tiff(video: ArrayLike, path: PathLike) -> None:
     writer.save(video, path, dim_order="TYX")
 
 
+def write_video_as_mp4(video: ArrayLike, path: PathLike) -> None:
+    data = np.array(video)
+    lo, hi = data.min(), data.max()
+    delta = hi - lo if hi < lo else 1.0
+    normalized = (data - lo) / delta
+    iio.imwrite(str(path), (normalized * 2**8).astype(np.uint8))
+
+
 VIDEO_WRITERS: dict[str, VideoWriter] = {
-    ".zarr": write_video_as_zarr,
     ".tiff": write_video_as_tiff,
+    ".zarr": write_video_as_zarr,
+    ".mp4": write_video_as_mp4,
 }
 
 

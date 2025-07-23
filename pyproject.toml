@@ -8,7 +8,7 @@ license = { text = "GPL-3.0-or-later" }
 requires-python = ">=3.12"
 dependencies = [
     "imgui[glfw,sdl2]",
-    "fastplotlib[imgui] @ git+https://github.com/fastplotlib/fastplotlib.git@a057faa#egg=fastplotlib[imgui]",
+    "fastplotlib[imgui]",
     "imageio[ffmpeg]",
     "numpy",
     "scipy",
@@ -18,12 +18,41 @@ dependencies = [
     "tqdm",
     "bioio",
     "bioio-bioformats",
+    "bioio-czi",
+    "scipy",
+    "scikit-image",
+    "trackpy",
+    "imgrvt",
+    "tqdm",
+    "imageio[ffmpeg]",
+    "bioio",
+    "bioio-bioformats",
+    "bioio-czi",
+    "bioio-dv",
+    "bioio-imageio",
+    "bioio-lif",
+    "bioio-nd2",
+    "bioio-ome-tiff",
+    "bioio-ome-zarr",
+    "bioio-sldy",
+    "bioio-tifffile",
+    "bioio-tiff-glob",
     "bioio-imageio>=1.2",
+    "xarray",
+    "dask",
 ]
 keywords = ["tools", "utilities", "python"]
 
 [dependency-groups]
-dev = ["ruff", "pre-commit", "pyright", "pytest", "setuptools", "coverage"]
+dev = [
+    "ruff",
+ "pre-commit",
+ "pyright",
+ "pytest",
+ "setuptools",
+ "coverage",
+ "ty>=0.0.1a15",
+]
 
 
 [build-system]

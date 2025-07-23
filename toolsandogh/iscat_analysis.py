@@ -2,9 +2,18 @@
 # /// script
 # requires-python = ">3.12,<3.13"
 # dependencies = [
-#     "imgui-bundle<1.92.0",
+#     "imgui[glfw,sdl2]",
 #     "fastplotlib[imgui]",
+#     "imageio[ffmpeg]",
 #     "numpy",
+#     "scipy",
+#     "scikit-image",
+#     "trackpy",
+#     "imgrvt",
+#     "tqdm",
+#     "bioio",
+#     "bioio-bioformats",
+#     "bioio-czi",
 #     "scipy",
 #     "scikit-image",
 #     "trackpy",
@@ -23,34 +32,37 @@
 #     "bioio-sldy",
 #     "bioio-tifffile",
 #     "bioio-tiff-glob",
+#     "bioio-imageio>=1.2",
 #     "xarray",
 #     "dask",
 # ]
 # ///
 
 import argparse
-import collections
 import itertools
 import math
 import multiprocessing
 import multiprocessing.pool
 import os
 import pathlib
+import re
 import time
 import warnings
 from dataclasses import dataclass
 from multiprocessing.shared_memory import SharedMemory
-from typing import Generic, Literal, TypeVar
+from typing import Generic, Literal, Protocol, TypeVar, Union
 
 import bioio
 import bioio_bioformats
 import dask.array as da
-import imageio.v3 as iio
 import imgrvt
 import numpy as np
 import numpy.typing as npt
+import pandas
 import trackpy
 import xarray as xr
+from bioio_ome_tiff.writers import OmeTiffWriter
+from bioio_ome_zarr.writers import OmeZarrWriterV3
 from imgui_bundle import imgui
 from imgui_bundle import portable_file_dialogs as pfd
 
@@ -64,6 +76,10 @@ else:
 
 
 _Dtype = TypeVar("_Dtype", bound=np.generic, covariant=True)
+
+PathLike = Union[str, pathlib.Path]
+
+ArrayLike = Union[np.ndarray, da.Array]
 
 
 ###############################################################################
@@ -124,6 +140,64 @@ class SharedArray(Generic[_Dtype]):
     @property
     def shape(self):
         return self._shape
+
+
+###############################################################################
+###
+### Writing Videos to Files
+
+
+class VideoWriter(Protocol):
+    """Protocol class for saving microscopy videos to disk"""
+
+    @staticmethod
+    def __call__(video: ArrayLike, path: PathLike) -> None: ...
+
+
+def write_video_as_zarr(video: ArrayLike, path: PathLike) -> None:
+    shape: tuple[int, ...] = video.shape  # type: ignore
+    writer = OmeZarrWriterV3(
+        path, shape, video.dtype, scale_factors=(1, 1, 1), axes_names=["T", "Y", "X"]
+    )
+    for t_index in range(shape[0]):
+        writer.write_timepoint(t_index, video[t_index])
+
+
+def write_video_as_tiff(video: ArrayLike, path: PathLike) -> None:
+    writer = OmeTiffWriter()
+    writer.save(video, path, dim_order="TYX")
+
+
+VIDEO_WRITERS: dict[str, VideoWriter] = {
+    ".zarr": write_video_as_zarr,
+    ".tiff": write_video_as_tiff,
+}
+
+
+###############################################################################
+###
+### Writing Localization to Files
+
+
+class LocalizationWriter(Protocol):
+    """Protocol class for saving Pandas data frames to disk"""
+
+    @staticmethod
+    def __call__(loc: pandas.DataFrame, path: PathLike) -> None: ...
+
+
+def write_loc_as_csv(loc: pandas.DataFrame, path: PathLike) -> None:
+    loc.to_csv(path)
+
+
+def write_loc_as_excel(loc: pandas.DataFrame, path: PathLike) -> None:
+    loc.to_excel(path, sheet_name="Localization")
+
+
+LOC_WRITERS: dict[str, LocalizationWriter] = {
+    ".csv": write_loc_as_csv,
+    ".xlsx": write_loc_as_excel,
+}
 
 
 ###############################################################################
@@ -300,6 +374,7 @@ class ComputeLOC(Task):
     end: int
 
     def run(self):
+        # Clear all previous localization data
         self.loc[self.start : self.end] = 0
         for frame in range(self.start, self.end):
             locs = trackpy.locate(
@@ -536,9 +611,6 @@ class Analysis:
         Returns a generator over tasks whose dependencies are satisfied.
         """
 
-        def task_distance(task) -> int:
-            return abs(self.current_frame - task.start)
-
         # Determine which tasks are ready
         for task in self.all_tasks():
             if task.is_unscheduled():
@@ -690,9 +762,12 @@ class SideBar(EdgeWindow):
         imgui.separator()
         imgui.text("Output Files")
 
-        args.dra_file, args.dra_overwrite = save_file_widget("DRA", args.dra_file)
-        args.rvt_file, args.rvt_overwrite = save_file_widget("RVT", args.rvt_file)
-        args.loc_file, args.loc_overwrite = save_file_widget("LOC", args.loc_file)
+        suffixes = list(VIDEO_WRITERS.keys())
+        args.dra_file = save_file_widget("dra", args.dra_file, suffixes)
+        args.rvt_file = save_file_widget("rvt", args.rvt_file, suffixes)
+
+        suffixes = list(LOC_WRITERS.keys())
+        args.loc_file = save_file_widget("loc", args.loc_file, suffixes)
 
         imgui.separator()
         imgui.begin_horizontal("save dialog")
@@ -702,19 +777,55 @@ class SideBar(EdgeWindow):
 
             # Write the DRA file
             if args.dra_file:
-                dst = prepare_path_for_saving(args.dra_file, args.dra_overwrite)
-                arr = np.array(self.analysis.dra)
-                iio.imwrite(dst, arr)
+                print("Writing DRA file...", end="")
+                path = pathlib.Path(args.dra_file)
+                suffix = path.suffix
+                array = np.array(self.analysis.dra)
+                VIDEO_WRITERS[suffix](array, path)
+                print("done.")
 
             # Write the RVT file
             if args.rvt_file:
-                dst = prepare_path_for_saving(args.rvt_file, args.rvt_overwrite)
-                arr = np.array(self.analysis.rvt)
-                iio.imwrite(dst, arr)
+                print("Writing RVT file...", end="")
+                path = pathlib.Path(args.rvt_file)
+                suffix = path.suffix
+                array = np.array(self.analysis.rvt)
+                VIDEO_WRITERS[suffix](array, path)
+                print("done.")
 
             # Write the LOC file
             if args.loc_file:
-                pass  # TODO
+                print("Writing LOC file...", end="")
+                path = pathlib.Path(args.loc_file)
+                suffix = path.suffix
+                # Reconstruct the localization DataFrame
+                loc = np.array(self.analysis.loc)
+                nframes, npoints, _ = loc.shape
+                # 1.  Flatten the last two axes -> shape: (nframes*NPOINTS, 6)
+                flat = loc.reshape(-1, 6)
+                # 2.  Build the extra “frame” and “point_number” columns
+                frames = np.repeat(np.arange(nframes), npoints)  # 0,0,…,0,1,1,…,1,…
+                points = np.tile(np.arange(npoints), nframes)  # 0,1,2,…,npoints-1,0,1,…
+                # 3.  Create the DataFrame and put the columns in the requested order
+                df = pandas.DataFrame(
+                    {
+                        "frame": frames.astype(np.int64),
+                        "point_number": points.astype(np.int64),
+                        "y": flat[:, 0],
+                        "x": flat[:, 1],
+                        "mass": flat[:, 3],
+                        "size": flat[:, 4],
+                        "signal": flat[:, 5],
+                    }
+                )
+                # 4. Clear uninitialized rows.
+                cols = ["x", "y", "mass", "size", "signal"]  # columns to test
+                mask = ~(df[cols] == 0.0).all(axis=1)  # True ⇒ keep
+                data = df[mask]
+                assert isinstance(data, pandas.DataFrame)
+                LOC_WRITERS[suffix](data, path)
+                print("done.")
+
         if imgui.button("Compute All & Save"):
             warnings.warn("Computing all frames is not implemented yet.")
         imgui.end_horizontal()
@@ -789,66 +900,73 @@ class SideBar(EdgeWindow):
             self.analysis.invalidate_loc()
 
 
-@dataclass
-class SaveFileState:
-    """The state involved in determining a file to save to."""
-
-    dialog: pfd.save_file | None = None
-    path: str | None = None
-    overwrite: bool = False
+save_file_dialog: dict[str, pfd.save_file] = {}
+save_file_suffix: dict[str, str] = {}
 
 
-save_file_state: dict[str, SaveFileState] = collections.defaultdict(
-    lambda: SaveFileState()
-)
-
-
-def save_file_widget(name: str, default: str, filters=None) -> tuple[str | None, bool]:
+def save_file_widget(name: str, default: str, suffixes: list[str]) -> str:
     label = f"Set {name} Save File"
     imgui.push_id(label)
-    state = save_file_state[label]
 
-    imgui.begin_horizontal("box & button")
+    # Initialize the save file suffix
+    if label not in save_file_suffix:
+        p = pathlib.Path(default)
+        if p.suffix and p.suffix in suffixes:
+            save_file_suffix[label] = p.suffix
+        else:
+            assert len(suffixes) > 0
+            save_file_suffix[label] = suffixes[0]
+
+    # Retrieve dialog and suffix
+    dialog = save_file_dialog.get(label)
+    suffix = save_file_suffix[label]
+
+    # Determine the current path
+    path: str
+    if dialog is None or not dialog.ready():
+        path = default
+    else:
+        path = dialog.result()
+        del save_file_dialog[label]
+
+    if path != "":
+        # Ensure the path has the correct suffix
+        path = str(pathlib.Path(path).with_suffix(suffix))
+
+        # Ensure the path doesn't point to any existing file
+        path = uniquify_filename(path)
+
     # Render a button that opens a dialog when pressed
-    if imgui.button(label):
-        state.dialog = pfd.save_file(label, default, filters)
-    # Render a button that toggles overwriting when pressed
-    _, state.overwrite = imgui.checkbox("overwrite", state.overwrite)
-    imgui.end_horizontal()
-
-    # Handle the result of a save file dialog
-    if state.dialog is not None and state.dialog.ready():
-        state.path = state.dialog.result()
-        state.dialog = None
+    if path == "":
+        text = "**None**"
     else:
-        state.path = default
+        text = path[: -len(suffix)]
+        maxlen = 40
+        if len(text) > maxlen:
+            text = "..." + text[-(maxlen - 3) :]
 
-    # Print the truncated pathname
-    text = "" if state.path is None else str(state.path)
-    maxlen = 50
-    if not text:
-        imgui.text("no file selected")
-    elif len(text) <= maxlen:
-        imgui.text(text)
-    else:
-        imgui.text("..." + text[-(maxlen - 3) :])
+    if imgui.button(text):
+        dialog = pfd.save_file(label, path or name, [suffix])
+        save_file_dialog[label] = dialog
+
+    imgui.same_line()
+
+    imgui.push_item_width(imgui.get_font_size() * len(suffix))
+    # Render a drop-down menu for selecting the suffix
+    if imgui.begin_combo("##file_suffix", suffix):
+        for option in suffixes:
+            is_selected = option == suffix
+            if imgui.selectable(option, is_selected)[0]:
+                save_file_suffix[label] = option
+        imgui.end_combo()
+    imgui.pop_item_width()
 
     imgui.spacing()
     imgui.pop_id()
-    return (state.path or default, state.overwrite)
+    return path
 
 
-def prepare_path_for_saving(filename: str, overwrite: bool = False) -> str:
-    path = pathlib.Path(filename)
-    # Return immediately if there is no file of the given name
-    if not path.is_file():
-        return filename
-    # If the override flag is set, delete any existing file
-    if overwrite:
-        path.unlink()
-        return filename
-    # Otherwise, uniquify the filename by appending an integer suffix
-    return uniquify_filename(filename)
+tail_index_regex = re.compile(r"^(.*)_(\d+)$")
 
 
 def uniquify_filename(filepath: str) -> str:
@@ -857,9 +975,18 @@ def uniquify_filename(filepath: str) -> str:
     stem = path.stem  # basename without extension
     suffix = path.suffix  # includes the dot, e.g., ".txt"
 
-    counter = 1
+    m = tail_index_regex.search(stem)
+    if m:
+        stem = m.group(1)
+        counter = int(m.group(2))
+    else:
+        counter = -1
+
     while True:
-        new_name = f"{stem}_{counter:04d}{suffix}"
+        if counter == -1:
+            new_name = f"{stem}{suffix}"
+        else:
+            new_name = f"{stem}_{counter:04d}{suffix}"
         new_path = parent / new_name
         if not new_path.exists():
             return str(new_path)

@@ -1117,16 +1117,40 @@ def main():
     # Load the input file, either from raw data or from a suitable image or
     # video file.
     video: xr.DataArray
-    if args.raw_dtype:
+    if args.raw_dtype == "uint12":
+        # Loading of packed 12bit files.
+        bits_per_frame = 12 * args.rows * args.columns
+        if args.frames == -1:
+            args.frames = (os.path.getsize(args.input_file) * 8) // bits_per_frame
+        # Ensure we are skipping an even number of frames, so that the offset
+        # (in bits) is both a multiple of 24
+        if (args.initial_frame % 2) != 0:
+            args.initial_frame -= 1
+        nbytes = (args.frames * bits_per_frame) // 8
+        offset = (args.initial_frame * bits_per_frame) // 8
+        mmap_array = np.memmap(
+            args.input_file, dtype=np.uint8, mode="r", shape=(nbytes,), offset=offset
+        )
+        dask_array = da.from_array(mmap_array)
+        a = dask_array[0::3].astype(np.uint16)
+        b = dask_array[1::3].astype(np.uint16)
+        c = dask_array[2::3].astype(np.uint16)
+        assert len(a) == len(b) == len(c)
+        evens = ((b & 0x0F) << 8) | a
+        odds = ((b & 0xF0) >> 4) | (c << 4)
+        flat = da.stack([evens, odds], axis=1).ravel()
+        shape = (args.frames, args.rows, args.columns)
+        video = xr.DataArray(flat.reshape(shape), dims=("T", "Y", "X"))
+    elif args.raw_dtype:
+        # Loading of RAW files.
         dtype = np.dtype(args.raw_dtype)
+        bytes_per_frame = dtype.itemsize * args.rows * args.columns
         # Derive the number of frames when it is not set
         if args.frames == -1:
-            bytes_per_frame = dtype.itemsize * args.rows * args.columns
             args.frames = os.path.getsize(args.input_file) // bytes_per_frame
 
         # Load the raw video
         shape = (args.frames, args.rows, args.columns)
-        bytes_per_frame = args.rows * args.columns * dtype.itemsize
         offset = args.initial_frame * bytes_per_frame
         mmap_array = np.memmap(
             args.input_file, dtype=dtype, mode="r", shape=shape, offset=offset
@@ -1294,7 +1318,9 @@ def validate_arguments(parser: argparse.ArgumentParser, args: argparse.Namespace
         parser.error("The --initial-frame argument must be non-negative.")
     if args.frames < -1:
         parser.error("The --frames argument must be non-negative or -1.")
-    if args.raw_dtype:
+    if args.raw_dtype == "uint12":
+        pass
+    elif args.raw_dtype:
         # Make sure the dtype can be parsed correctly
         try:
             np.dtype(args.raw_dtype)

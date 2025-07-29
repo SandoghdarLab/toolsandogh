@@ -1024,6 +1024,7 @@ def uniquify_filename(filepath: str) -> str:
 
 def iscat_gui(analysis: Analysis):
     import fastplotlib as fpl
+    from fastplotlib import ImageGraphic
 
     iw = fpl.widgets.image_widget._widget.ImageWidget(
         data=[
@@ -1045,16 +1046,29 @@ def iscat_gui(analysis: Analysis):
     for subplot in iw.figure:
         subplot.axes.visible = False
 
-    sidebar_width = min(0.3 * analysis.args.gui_width, 390)
+    # Add the sidebar
+    sidebar_width = min(0.3 * analysis.args.gui_width, 400)
     sidebar = SideBar(iw.figure, sidebar_width, "right", "Parameters", analysis)
     iw.figure.add_gui(sidebar)  # type: ignore
 
     # Draw circles around all localized particles
     localizations = analysis.loc[analysis.current_frame]
     data = circle_data(localizations)
+    # TODO compute circle color, too.
     color = np.array([1.0, 1.0, 0.0, analysis.args.circle_alpha])
-    ls10 = iw.figure[1, 0].add_line_collection(data, colors=color)
-    ls11 = iw.figure[1, 1].add_line_collection(data, colors=color)
+    ls10 = iw.figure["dra"].add_line_collection(data, colors=color)
+    ls11 = iw.figure["rvt"].add_line_collection(data, colors=color)
+
+    # Create a Rectangle Selector
+    image = next(x for x in iw.figure["dra"].objects if isinstance(x, ImageGraphic))
+    shape = image.data.value.shape
+    image.add_rectangle_selector(
+        selection=(0, shape[-2], 0, shape[-1]),
+        fill_color=(0, 0, 0, 0),
+        edge_thickness=2,
+        edge_color="white",
+        vertex_color="white",
+    )
 
     def index_changed(index):
         new_frame = index["t"]

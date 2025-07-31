@@ -382,13 +382,17 @@ class ComputeLOC(Task):
     maxlocs: int
     start: int
     end: int
+    xmin: int
+    xmax: int
+    ymin: int
+    ymax: int
 
     def run(self):
         # Clear all previous localization data
         self.loc[self.start : self.end] = 0
         for frame in range(self.start, self.end):
             locs = trackpy.locate(
-                self.video[frame],
+                self.video[frame, self.ymin : self.ymax, self.xmin : self.xmax],
                 diameter=2 * self.radius + 1,
                 minmass=self.min_mass,
                 percentile=self.percentile,
@@ -396,12 +400,12 @@ class ComputeLOC(Task):
                 preprocess=False,
             )
             index = -1
-            for x, y, mass, size, _, signal, _, _ in locs.itertuples(
+            for y, x, mass, size, _, signal, _, _ in locs.itertuples(
                 name=None, index=False
             ):
                 index += 1
-                self.loc[frame, index, 0] = np.float32(y)
-                self.loc[frame, index, 1] = np.float32(x)
+                self.loc[frame, index, 0] = np.float32(x) + self.xmin
+                self.loc[frame, index, 1] = np.float32(y) + self.ymin
                 self.loc[frame, index, 2] = np.float32(frame)
                 self.loc[frame, index, 3] = np.float32(mass)
                 self.loc[frame, index, 4] = np.float32(size)
@@ -456,6 +460,15 @@ class Analysis:
         self.pool = multiprocessing.Pool(processes=args.processes)
         self.work = []
         self.current_frame = 0
+        # Update the ROI
+        if not getattr(args, "roi_row_start", False):
+            args.roi_row_start = 0
+        if not getattr(args, "roi_row_stop", False):
+            args.roi_row_stop = video.shape[1]
+        if not getattr(args, "roi_column_start", False):
+            args.roi_column_start = 0
+        if not getattr(args, "roi_column_stop", False):
+            args.roi_column_stop = video.shape[2]
         # initialize all shared arrays
         self.video = SharedArray(video.shape, np.float32)
         self.video[...] = video.astype(np.float32)
@@ -493,10 +506,6 @@ class Analysis:
         self.loc._shm.unlink()
         self.pool.close()
         self.pool.terminate()
-
-    def change_current_frame(self, frame: int):
-        if self.current_frame != frame:
-            self.current_frame = frame
 
     def invalidate_fft(self):
         chunk_size = 16
@@ -602,6 +611,10 @@ class Analysis:
                 status="unscheduled",
                 start=start,
                 end=end,
+                ymin=self.args.roi_row_start,
+                ymax=self.args.roi_row_stop,
+                xmin=self.args.roi_column_start,
+                xmax=self.args.roi_column_stop,
                 video=self.rvt,
                 loc=self.loc,
                 radius=self.args.loc_radius,
@@ -867,6 +880,13 @@ class SideBar(EdgeWindow):
         ntasks = nfinished + nscheduled + nunscheduled
         imgui.text(f"Status: {nfinished}/{ntasks} computed ({nscheduled} scheduled)")
 
+        # Display the ROI
+        ymin = args.roi_row_start
+        ymax = args.roi_row_stop
+        xmin = args.roi_column_start
+        xmax = args.roi_column_stop
+        imgui.text(f"ROI: [{ymin}:{ymax}, {xmin}:{xmax}]")
+
         # Display the number of localized particles in the current frame
         loc = self.analysis.loc
         nframes, npoints, _ = loc.shape
@@ -1061,20 +1081,34 @@ def iscat_gui(analysis: Analysis):
 
     # Create a Rectangle Selector
     image = next(x for x in iw.figure["dra"].objects if isinstance(x, ImageGraphic))
-    shape = image.data.value.shape
-    image.add_rectangle_selector(
-        selection=(0, shape[-2], 0, shape[-1]),
+    xmin = analysis.args.roi_column_start
+    xmax = analysis.args.roi_column_stop
+    ymin = analysis.args.roi_row_start
+    ymax = analysis.args.roi_row_stop
+    selection = (xmin, xmax, ymin, ymax)
+    print(selection)
+    roi_selector = image.add_rectangle_selector(
+        selection=selection,
         fill_color=(0, 0, 0, 0),
         edge_thickness=2,
         edge_color="white",
         vertex_color="white",
     )
 
+    def update_roi(_):
+        (xmin, xmax, ymin, ymax) = roi_selector.selection
+        analysis.args.roi_row_start = round(ymin)
+        analysis.args.roi_row_stop = round(ymax)
+        analysis.args.roi_column_start = round(xmin)
+        analysis.args.roi_column_stop = round(xmax)
+        analysis.invalidate_loc()
+
+    roi_selector.add_event_handler(update_roi, "selection")
+
     def index_changed(index):
         new_frame = index["t"]
-        if analysis.current_frame == new_frame:
-            return
-        analysis.current_frame = new_frame
+        if analysis.current_frame != new_frame:
+            analysis.current_frame = new_frame
 
     iw.add_event_handler(index_changed, event="current_index")
 
@@ -1233,6 +1267,14 @@ ARGUMENTS : list[tuple[list, dict]] = [
      {"type": int, "default": 0, "help": "What channel of the video to load"}),
     (["--zstack"],
      {"type": int, "default": 0, "help": "What slice of the Z stack to load."}),
+    (["--roi-row-start"],
+     {"type": int, "default": 0, "help": "The first row of the region of interest (ROI)."}),
+    (["--roi-row-stop"],
+     {"type": int, "default": None, "help": "The last plus one row of the region of interest (ROI)."}),
+    (["--roi-column-start"],
+     {"type": int, "default": 0, "help": "The first column of the region of interest (ROI)."}),
+    (["--roi-column-stop"],
+     {"type": int, "default": None, "help": "The last plus one column of the region of interest (ROI)."}),
     (["--normalize"],
      {"action": argparse.BooleanOptionalAction,
       "default": True,

@@ -391,8 +391,15 @@ class ComputeLOC(Task):
         # Clear all previous localization data
         self.loc[self.start : self.end] = 0
         for frame in range(self.start, self.end):
+            # Convert to uint16, because otherwise Trackpy will internally
+            # convert it to uint8 and thereby discard a lot of information.
+            data = self.video[frame, self.ymin : self.ymax, self.xmin : self.xmax]
+            vmin = data.min()
+            vmax = data.max()
+            data = (data / (vmax - vmin)) + vmin
+            data = (data * 2**16).astype(np.uint16)
             locs = trackpy.locate(
-                self.video[frame, self.ymin : self.ymax, self.xmin : self.xmax],
+                data,
                 diameter=2 * self.radius + 1,
                 minmass=self.min_mass,
                 percentile=self.percentile,

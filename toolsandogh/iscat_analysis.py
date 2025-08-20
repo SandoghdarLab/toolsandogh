@@ -254,7 +254,10 @@ class Task:
 
 
 def run_task(task: Task):
-    task.run()
+    try:
+        task.run()
+    except Exception as e:
+        print(f"Caught exception: {e}")
     return task
 
 
@@ -354,13 +357,14 @@ class ComputeRVT(Task):
     rvt: SharedArray[np.float32]
     min_radius: int
     max_radius: int
+    rvt_limit: int
     upsample: int
     start: int
     end: int
 
     def run(self):
         for frame in range(self.start, self.end):
-            self.rvt[frame] = imgrvt.rvt(
+            rvt = imgrvt.rvt(
                 self.video[frame],
                 rmin=self.min_radius,
                 rmax=self.max_radius,
@@ -368,6 +372,7 @@ class ComputeRVT(Task):
                 pad_mode="edge",
                 kind="normalized",
             )
+            self.rvt[frame] = np.clip(rvt / self.rvt_limit, 0.0, 1.0)
 
 
 @dataclass
@@ -386,6 +391,7 @@ class ComputeLOC(Task):
     xmax: int
     ymin: int
     ymax: int
+    rvt_limit: float
 
     def run(self):
         # Clear all previous localization data
@@ -394,17 +400,13 @@ class ComputeLOC(Task):
             # Convert to uint16, because otherwise Trackpy will internally
             # convert it to uint8 and thereby discard a lot of information.
             data = self.video[frame, self.ymin : self.ymax, self.xmin : self.xmax]
-            vmin = data.min()
-            vmax = data.max()
-            data = (data / (vmax - vmin)) + vmin
-            data = (data * 2**16).astype(np.uint16)
             locs = trackpy.locate(
-                data,
+                (data * (2**16 - 1)).astype(np.uint16),
                 diameter=2 * self.radius + 1,
                 minmass=self.min_mass,
                 percentile=self.percentile,
                 topn=self.maxlocs,
-                preprocess=False,
+                preprocess=True,
             )
             index = -1
             for y, x, mass, size, _, signal, _, _ in locs.itertuples(
@@ -598,6 +600,7 @@ class Analysis:
                 rvt=self.rvt,
                 min_radius=self.args.rvt_min_radius,
                 max_radius=self.args.rvt_max_radius,
+                rvt_limit=self.args.rvt_limit,
                 upsample=self.args.rvt_upsample,
             )
             for start, end in bounds
@@ -628,6 +631,7 @@ class Analysis:
                 min_mass=self.args.loc_min_mass,
                 percentile=self.args.loc_percentile,
                 maxlocs=self.args.particles,
+                rvt_limit=self.args.rvt_limit,
             )
             for start, end in bounds
         ]
@@ -785,6 +789,10 @@ class SideBar(EdgeWindow):
             "rvt-max-radius", v=args.rvt_max_radius, v_min=0, v_max=50
         )
 
+        _, rvt_limit = imgui.slider_float(
+            "rvt-limit", v=args.rvt_limit, v_min=0.0001, v_max=200.0
+        )
+
         imgui.text("Localization Parameters")
         _, loc_radius = imgui.slider_int(
             "loc-radius", v=args.loc_radius, v_min=0, v_max=20
@@ -929,6 +937,9 @@ class SideBar(EdgeWindow):
             rvt_changes = True
         if rvt_mxr != args.rvt_max_radius:
             args.rvt_max_radius = rvt_mxr
+            rvt_changes = True
+        if rvt_limit != args.rvt_limit:
+            args.rvt_limit = rvt_limit
             rvt_changes = True
         if loc_radius != args.loc_radius:
             args.loc_radius = loc_radius
@@ -1141,20 +1152,14 @@ def iscat_gui(analysis: Analysis):
 def circle_data(localizations):
     """
     Turn a nparticles x (x, y, z, mass, size, signal) array into a
-    nparticles x CIRCLE_POINTS x 2 array of line segments."""
-    # determine circle centers and radii
-    xs = localizations[:, 0]
-    ys = localizations[:, 1]
-    rs = localizations[:, 4]
-    # determine the X and Y offsets
-    nparticles = len(localizations)
+    nparticles x CIRCLE_POINTS x 3 array of line segments."""
+    xs, ys, _, _, rs, _ = localizations.T
     theta = np.linspace(0, 2 * np.pi, CIRCLE_POINTS)
-    oxs = rs.reshape((nparticles, 1)) * np.sin(theta)
-    oys = rs.reshape((nparticles, 1)) * np.cos(theta)
-    # determine and return the line segments
-    lxs = xs.reshape((nparticles, 1)) + oxs
-    lys = ys.reshape((nparticles, 1)) + oys
-    lzs = np.zeros((nparticles, CIRCLE_POINTS))
+    oxs = rs[:, np.newaxis] * np.sin(theta)
+    oys = rs[:, np.newaxis] * np.cos(theta)
+    lxs = xs[:, np.newaxis] + oxs
+    lys = ys[:, np.newaxis] + oys
+    lzs = np.zeros((len(localizations), CIRCLE_POINTS))
     return np.stack([lxs, lys, lzs], axis=2)
 
 
@@ -1203,6 +1208,7 @@ def main():
         # Derive the number of frames when it is not set
         if args.frames == -1:
             args.frames = os.path.getsize(args.input_file) // bytes_per_frame
+        # TODO Error handling if there aren't enough frames
 
         # Load the raw video
         shape = (args.frames, args.rows, args.columns)
@@ -1326,6 +1332,10 @@ ARGUMENTS : list[tuple[list, dict]] = [
      {"type": int,
       "default": 1,
       "help": "The minimum radius (in pixels) to consider for radial variance transform."}),
+    (["--rvt-limit"],
+     {"type": float,
+      "default": 50.0,
+      "help": "The limit at which to clip RVT values."}),
     (["--rvt-max-radius"],
      {"type": int,
       "default": 8,

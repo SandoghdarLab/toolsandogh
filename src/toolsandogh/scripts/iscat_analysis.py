@@ -346,7 +346,7 @@ class ComputeDRA(Task):
         # Compute the differential rolling average
         left = ravg[0 : -self.window_size]
         right = ravg[self.window_size :]
-        self.dra[self.start : self.end] = left - right
+        self.dra[self.start : self.end] = right - left
 
 
 @dataclass

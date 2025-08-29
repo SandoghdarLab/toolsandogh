@@ -5,7 +5,7 @@ description = "A collection of Python scripts for iSCAT microscopy data analysis
 authors = [{ name = "Marco Heisig", email = "marco.heisig@mpl.mpg.de" }]
 readme = "README.md"
 license = { text = "GPL-3.0-or-later" }
-requires-python = ">=3.12,<=3.13"
+requires-python = ">=3.12,<3.13"
 dependencies = [
     "imgui[glfw,sdl2]",
     "fastplotlib[imgui]",
@@ -49,6 +49,7 @@ dev = [
     "pre-commit",
     "pyright",
     "pytest",
+    "python-lsp-server",
     "setuptools",
     "coverage",
     "jupyter",
@@ -60,9 +61,8 @@ dev = [
 requires = ["setuptools>=61.0"]
 build-backend = "setuptools.build_meta"
 
-[tool.setuptools]
-packages = ["toolsandogh"]
-
+[tool.setuptools.packages.find]
+where = ["src"]
 
 [tool.ruff]
 line-length = 88
@@ -92,13 +92,14 @@ pythonVersion = "3.12"
 reportMissingImports = true
 reportUnusedImports = true
 reportUnusedVariables = true
-include = ["toolsandogh"]
+include = ["src"]
 exclude = [".venv"]
 venvPath = "."
 venv = ".venv"
 
 [tool.pytest.ini_options]
-testpaths = ["toolsandogh/tests"]
+pythonpath = ["src"]
+testpaths = ["src/toolsandogh/tests"]
 
 [tool.coverage.paths]
-source = ["toolsandogh"]
+source = ["src"]

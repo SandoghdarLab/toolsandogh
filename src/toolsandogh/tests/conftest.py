@@ -1,5 +1,7 @@
 import multiprocessing
+
 import pytest
+
 
 @pytest.fixture(scope="session", autouse=True)
 def always_spawn():

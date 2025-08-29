@@ -10,7 +10,7 @@ from multiprocessing import Pool
 import numpy as np
 import xarray as xr
 
-import toolsandogh.iscat_analysis as iscat_analysis
+import toolsandogh.scripts.iscat_analysis as iscat_analysis
 
 
 def test_SharedArray():

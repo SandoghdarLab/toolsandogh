@@ -9,6 +9,7 @@ requires-python = ">=3.12,<3.13"
 dependencies = [
     "imgui[glfw,sdl2]",
     "fastplotlib[imgui]",
+    "fsspec[fuse]",
     "imageio[ffmpeg]",
     "numpy",
     "scipy",
@@ -45,6 +46,8 @@ keywords = ["tools", "utilities", "python"]
 
 [dependency-groups]
 dev = [
+    "ipython",
+    "ipywidgets",
     "ruff",
     "pre-commit",
     "pyright",
@@ -53,7 +56,11 @@ dev = [
     "setuptools",
     "coverage",
     "jupyter",
+    "jupyter_rfb",
+    "rendercanvas>=2.2",
+    "sidecar",
     "bokeh",
+    "fastplotlib[notebook]",
 ]
 
 

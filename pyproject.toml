@@ -53,6 +53,7 @@ dev = [
     "pyright",
     "pytest",
     "python-lsp-server",
+    "numpydoc",
     "setuptools",
     "coverage",
     "jupyter",
@@ -72,7 +73,7 @@ build-backend = "setuptools.build_meta"
 where = ["src"]
 
 [tool.ruff]
-line-length = 88
+line-length = 100
 fix = true
 
 [tool.ruff.lint]
@@ -81,8 +82,9 @@ select = [
     "W",   # pycodestyle warnings
     "F",   # pyflakes errors
     "I",   # isort
-    "C",   # Complexity
-    "RET", # Retweet (flake8-retweet)
+    "C",   # flake8-bugbear
+    #"B",   # flake8-bugbear
+    "RET", # flake8-return
     "YTT", # Truthiness
     "TRY", # Try block errors
 ]
@@ -93,6 +95,17 @@ ignore = [
     "TRY003", # Long message outside exception class
 ]
 unfixable = ["F821"] # Don't try to fix name definition
+
+[tool.numpydoc_validation]
+checks = [
+    "all",   # report on all checks, except the below
+    "EX01",
+    "SA01",
+    "ES01",
+]
+exclude_files = [
+    "^tests/.*",   # No need to document pytests
+]
 
 [tool.pyright]
 pythonVersion = "3.12"

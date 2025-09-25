@@ -1,3 +1,5 @@
+"""Define a function for loading videos from a wide range of sources."""
+
 import os
 import os.path
 import pathlib
@@ -7,11 +9,13 @@ import bioio
 import bioio_czi
 import bioio_nd2
 import dask.array as da
+import fsspec
 import numpy as np
 import numpy.typing as npt
 import xarray as xr
+from fsspec.utils import math
 
-from ._verify import verify_video
+from ._validate_video import validate_video
 
 
 def load_video(
@@ -27,7 +31,8 @@ def load_video(
     dx: float | None = None,
     dtype: npt.DTypeLike | None = None,
 ) -> xr.DataArray:
-    """Load a video from the given path.
+    """
+    Load a video from the given path.
 
     The resulting video is a 5D xarray with dimensions TCZYX.  If any keyword
     arguments are supplied, this function asserts that the resulting video
@@ -40,28 +45,40 @@ def load_video(
     remaining arguments default to Z=1, C=1, dz=1.0, dy=dx=1.0, dt=1.0, and
     dtype=uint8.
 
-    Args:
-        path (os.PathLike): The name of a file, a URI, or a path.
-        T (int): The expected T (time) extent of the video.
-        C (int): The expected C (channel) extent of the video.
-        Z (int): The expected Z (height) extent of the video.
-        Y (int): The expected Y (row) extent of the video.
-        X (int): The expected X (column) extent of the video.
-        dt (float): The expected T (time) step size of the video.
-        dz (float): The expected Z (height) step size of the video.
-        dy (float): The expected Y (row) step size of the video.
-        dx (float): The expected X (column) step size of the video.
-        dtype (npt.DtypeLike): The expected dtype of the video.
+    Parameters
+    ----------
+    path : os.PathLike
+        The name of a file, a URI, or a path.
+    T : int
+        The expected T (time) extent of the video.
+    C : int
+        The expected C (channel) extent of the video.
+    Z : int
+        The expected Z (height) extent of the video.
+    Y : int
+        The expected Y (row) extent of the video.
+    X : int
+        The expected X (column) extent of the video.
+    dt : float
+        The expected T (time) step size of the video.
+    dz : float
+        The expected Z (height) step size of the video.
+    dy : float
+        The expected Y (row) step size of the video.
+    dx : float
+        The expected X (column) step size of the video.
+    dtype : npt.DtypeLike
+        The expected dtype of the video.
 
-    Returns:
-        xarray.DataArray: A TCZYX DataArray
+    Returns
+    -------
+    xarray.DataArray
+        A canonical TCZYX array that matches the supplied parameters.
     """
     # Parse the supplied path.
     pathstr = str(path)
     url = urllib.parse.urlparse(pathstr)
     path = pathlib.Path(url.path)
-    scheme = url.scheme or "file"
-    suffix = path.suffix
 
     # Gather all keyword arguments for those load functions that require them.
     kwargs = {
@@ -78,27 +95,23 @@ def load_video(
     }
 
     # Load the video.
-    if scheme == "file":
-        if suffix == "":
-            raise RuntimeError(
-                f"Cannot infer the file type of {path} because it has no suffix."
-            )
-        if suffix in [".bin", ".raw"]:
+    protocols = fsspec.available_protocols()
+    match (url.scheme or "file", path.suffix):
+        case (scheme, ".bin" | ".raw") if scheme in protocols:
             video = load_raw_video(path, **kwargs)
-        elif suffix == ".czi":
+        case (_, ".czi"):
             img = bioio.BioImage(pathstr, reader=bioio_czi.Reader)
             video = img.xarray_dask_data
-        elif suffix == ".nd2":
+        case (_, ".nd2"):
             img = bioio.BioImage(pathstr, reader=bioio_nd2.Reader)
             video = img.xarray_dask_data
-        else:
+        case (_, _):
+            # Let bioio figure out the rest or raise an exception
             img = bioio.BioImage(pathstr)
             video = img.xarray_dask_data
-    else:
-        raise RuntimeError(f"Don't know how to load data via {scheme}.")
 
     # Assert that the video matches all expectations.
-    verify_video(video, **kwargs)
+    validate_video(video, **kwargs)
 
     # Success!  Return the video.
     return video
@@ -120,7 +133,35 @@ def load_raw_video(
     """
     Load a video from the specified raw file.
 
-    See load_video for a more detailed explanation.
+    Parameters
+    ----------
+    path : os.PathLike
+        The name of a file, a URI, or a path.
+    T : int
+        The expected T (time) extent of the video.
+    C : int
+        The expected C (channel) extent of the video.
+    Z : int
+        The expected Z (height) extent of the video.
+    Y : int
+        The expected Y (row) extent of the video.
+    X : int
+        The expected X (column) extent of the video.
+    dt : float
+        The expected T (time) step size of the video.
+    dz : float
+        The expected Z (height) step size of the video.
+    dy : float
+        The expected Y (row) step size of the video.
+    dx : float
+        The expected X (column) step size of the video.
+    dtype : npt.DtypeLike
+        The expected dtype of the video.
+
+    Returns
+    -------
+    xarray.DataArray
+        A canonical TCZYX array that matches the supplied parameters.
     """
     # The parameters X and Y are mandatory for loading raw files.
     if Y is None:
@@ -135,7 +176,7 @@ def load_raw_video(
     # The default dtype is np.uint8
     if dtype is None:
         dtype = np.uint8
-    # The number of frames T can be inferred from the file size.
+    # The number of frames T can be inferred from the file's size.
     bits_per_item = 12 if (dtype == "uint12") else (np.dtype(dtype).itemsize * 8)
     nbits = os.path.getsize(path) * 8
     nitems = nbits // bits_per_item
@@ -186,3 +227,40 @@ def load_raw_video(
             "X": dx * np.arange(X),
         },
     )
+
+
+def load_raw_chunk(
+    path: os.PathLike,
+    shape: tuple[int, ...],
+    dtype: npt.DTypeLike,
+    offset: int,
+) -> np.ndarray:
+    """
+    Load a portion of the supplied raw file as a Numpy array.
+
+    Parameters
+    ----------
+    path : os.PathLike
+        Path (local or remote) to the raw file.
+    shape : tuple[int, ...]
+        Desired shape of the returned array (e.g. ``(T, C, Z, Y, X)``).  The
+        product of the dimensions must match the number of items that will be
+        read.
+    dtype : npt.DTypeLike
+        Numpy data type of the stored items.
+    offset : int
+        Index of the first element to read **in items**, *not* in bytes.
+
+    Returns
+    -------
+    np.ndarray
+        A dense NumPy array with the requested shape and dtype.
+    """
+    count = math.prod(shape)
+    with fsspec.open(path, newline="") as f:
+        return np.fromfile(
+            f,  # type: ignore
+            dtype=dtype,
+            offset=offset,
+            count=count,
+        ).reshape(shape)

@@ -36,9 +36,7 @@ def test_SharedArray():
                 def initialize(array, index, value):
                     array[*index] = value
 
-                pool.starmap(
-                    initialize, [(sa, i, dtype(n)) for n, i in enumerate(indices)]
-                )
+                pool.starmap(initialize, [(sa, i, dtype(n)) for n, i in enumerate(indices)])
             for n, index in enumerate(indices):
                 value = dtype(n)
                 assert sa[*index] == value

@@ -18,7 +18,7 @@
 #     "bioio-tiff-glob",
 # ]
 # ///
-
+"""A simple script for converting between various microscopy file formats."""
 
 import argparse
 
@@ -27,39 +27,34 @@ from bioio import BioImage
 
 def parse_slice(slice_string: str) -> slice:
     """
-    Parses a string representing a slice (e.g., "2:5", ":5", "2:") into a slice object.
+    Parse a string representing a slice (e.g., "2:5", ":5", "2:") into a slice object.
 
-    Args:
-      slice_string: A string representing a slice.  Can be in the format "start:stop:step".
-                  If start, stop, or step are omitted, they are treated as None.
+    Parameters
+    ----------
+    slice_string : str
+        A string representing a slice.  Can be in the format "start:stop:step". If start, stop, or step are omitted, they are treated as None.
 
-    Returns:
-      A slice object.
-
-    Raises:
-      TypeError: if input is not a string
-      ValueError: if the string is malformed
+    Returns
+    -------
+    slice
+        A slice object.
     """
-
     parts = slice_string.split(":")
     try:
         start = int(parts[0]) if len(parts) > 0 and parts[0] else None
         stop = int(parts[1]) if len(parts) > 1 and parts[1] else None
         step = int(parts[2]) if len(parts) > 2 and parts[2] else None
-    except ValueError:
-        raise ValueError("Only numbers and ':' are allowed in slice string.")
+    except ValueError as err:
+        raise ValueError("Only numbers and ':' are allowed in slice string.") from err
 
     return slice(start, stop, step)
 
 
 def main():
+    """The main entry point for the convert.py script."""
     parser = argparse.ArgumentParser(description="Convert Microscopy Data")
-    parser.add_argument(
-        "-i", "--input", type=str, required=True, help="Input file or URI"
-    )
-    parser.add_argument(
-        "-o", "--output", type=str, required=True, help="Output file or URI"
-    )
+    parser.add_argument("-i", "--input", type=str, required=True, help="Input file or URI")
+    parser.add_argument("-o", "--output", type=str, required=True, help="Output file or URI")
     parser.add_argument("-T", type=str, help="Time Slice", default="")
     parser.add_argument("-C", type=str, help="Channel Slice", default="")
     parser.add_argument("-Z", type=str, help="Z Slice", default="")

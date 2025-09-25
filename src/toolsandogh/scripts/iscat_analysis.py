@@ -50,7 +50,7 @@ import time
 import warnings
 from dataclasses import dataclass
 from multiprocessing.shared_memory import SharedMemory
-from typing import Generic, Literal, Protocol, TypeVar, Union
+from typing import Generic, Literal, Protocol, Sequence, TypeVar, Union
 
 import bioio
 import bioio_bioformats
@@ -91,6 +91,13 @@ ArrayLike = Union[np.ndarray, da.Array]
 class SharedArray(Generic[_Dtype]):
     """
     A Numpy array wrapper to make it inter-process shareable via pickling.
+
+    Parameters
+    ----------
+    shape : tuple[int, ...]
+        The desired shape of the shared array.
+    dtype : numpy.typing.DTypeLike
+        The desired element type of the shared array.
     """
 
     _shape: tuple[int, ...]
@@ -149,7 +156,7 @@ class SharedArray(Generic[_Dtype]):
 
 
 class VideoWriter(Protocol):
-    """Protocol class for saving microscopy videos to disk"""
+    """Protocol class for saving microscopy videos to disk."""
 
     @staticmethod
     def __call__(video: ArrayLike, path: PathLike) -> None: ...
@@ -190,7 +197,7 @@ VIDEO_WRITERS: dict[str, VideoWriter] = {
 
 
 class LocalizationWriter(Protocol):
-    """Protocol class for saving Pandas data frames to disk"""
+    """Protocol class for saving Pandas data frames to disk."""
 
     @staticmethod
     def __call__(loc: pandas.DataFrame, path: PathLike) -> None: ...
@@ -248,9 +255,7 @@ class Task:
             print(f"Caught a {type(exc)}!")
             raise exc
 
-        pool.apply_async(
-            run_task, [self], callback=callback, error_callback=error_callback
-        )
+        pool.apply_async(run_task, [self], callback=callback, error_callback=error_callback)
 
 
 def run_task(task: Task):
@@ -409,9 +414,7 @@ class ComputeLOC(Task):
                 preprocess=True,
             )
             index = -1
-            for y, x, mass, size, _, signal, _, _ in locs.itertuples(
-                name=None, index=False
-            ):
+            for y, x, mass, size, _, signal, _, _ in locs.itertuples(name=None, index=False):
                 index += 1
                 self.loc[frame, index, 0] = np.float32(x) + self.xmin
                 self.loc[frame, index, 1] = np.float32(y) + self.ymin
@@ -422,24 +425,52 @@ class ComputeLOC(Task):
 
 
 class Analysis:
-    """All the data associated with one iSCAT Analysis run.
+    """
+    All the data associated with one iSCAT analysis run.
 
-    Attributes:
-        args (argparse.Namespace): The parsed command line arguments
-        video (SharedArray[np.float32]): The original video
-        pool (multiprocessing.pool.Pool): The worker pool
-        work (list[multiprocessing.pool.AsyncResult]): List of pending calculations
-        current_frame (int): The frame being viewed right now
-        fft (SharedArray[np.complex64]): FFT of the original video
-        fft_log_abs (SharedArray[np.float32]): log(abs(fft + 1))
-        corrected (SharedArray[np.float32]): The inverse FFT of fft_part
-        dra (SharedArray[np.float32]): Differential rolling average of corrected
-        rvt (SharedArray[np.float32]): Radial variance transform of dra
-        loc (SharedArray[np.float32]): nframes x particles x (x, y, z, mass, size, signal)
-        fft_tasks (list[ComputeFFT]): List of FFT tasks
-        dra_tasks (list[ComputeDRA]): List of DRA tasks
-        rvt_tasks (list[ComputeRVT]): List of RVT tasks
-        loc_tasks (list[ComputeLOC]): List of LOC tasks
+    Parameters
+    ----------
+    args : argparse.Namespace
+        The parsed command-line arguments describing the analysis.
+    video : xarray.DataArray
+        The video to analyze.
+    parser : argparse.ArgumentParser, optional
+        The argument parser that was used to construct the supplied args.
+        Can be supplied for better error handling.
+
+    Attributes
+    ----------
+    args : argparse.Namespace
+        The parsed command-line arguments.
+    video : SharedArray[np.float32]
+        The original video.
+    pool : multiprocessing.pool.Pool
+        The worker pool.
+    work : list[multiprocessing.pool.AsyncResult]
+        List of pending calculations.
+    current_frame : int
+        The frame being viewed right now.
+    fft : SharedArray[np.complex64]
+        FFT of the original video.
+    fft_log_abs : SharedArray[np.float32]
+        ``log(abs(fft + 1))``.
+    corrected : SharedArray[np.float32]
+        The inverse FFT of ``fft_part``.
+    dra : SharedArray[np.float32]
+        Differential rolling average of ``corrected``.
+    rvt : SharedArray[np.float32]
+        Radial variance transform of ``dra``.
+    loc : SharedArray[np.float32]
+        Array of shape ``(nframes, particles, 6)`` containing
+        ``(x, y, z, mass, size, signal)`` for each particle.
+    fft_tasks : list[ComputeFFT]
+        List of FFT tasks.
+    dra_tasks : list[ComputeDRA]
+        List of DRA tasks.
+    rvt_tasks : list[ComputeRVT]
+        List of RVT tasks.
+    loc_tasks : list[ComputeLOC]
+        List of LOC tasks.
     """
 
     parser: argparse.ArgumentParser | None
@@ -568,9 +599,7 @@ class Analysis:
         else:
             self.dra_tasks = [
                 ComputeDRA(
-                    dependencies=filter_tasks(
-                        self.fft_tasks, start, end + (2 * window_size) - 1
-                    ),
+                    dependencies=filter_tasks(self.fft_tasks, start, end + (2 * window_size) - 1),
                     status="unscheduled",
                     start=start,
                     end=end,
@@ -648,9 +677,7 @@ class Analysis:
         return itertools.chain(a, b, c, d)
 
     def available_tasks(self):
-        """
-        Returns a generator over tasks whose dependencies are satisfied.
-        """
+        """Return a generator over tasks whose dependencies are satisfied."""
 
         # Determine which tasks are ready
         for task in self.all_tasks():
@@ -658,9 +685,19 @@ class Analysis:
                 if all(dep.is_finished() for dep in task.dependencies):
                     yield task
 
-    def next_batch_of_tasks(self, maxlength: int):
+    def next_batch_of_tasks(self, maxlength: int) -> Sequence[Task]:
         """
-        Returns up to maxlength tasks whose dependencies are satisfied.
+        Return up to maxlength tasks whose dependencies are satisfied.
+
+        Parameters
+        ----------
+        maxlength : int
+            The maximum number of tasks being returned.
+
+        Returns
+        -------
+        Sequence[Task]
+            A sequence of tasks ready to be executed.
         """
         if maxlength == 0:
             return []
@@ -782,21 +819,13 @@ class SideBar(EdgeWindow):
         imgui.separator()
         imgui.text("RVT Parameters")
 
-        _, rvt_mnr = imgui.slider_int(
-            "rvt-min-radius", v=args.rvt_min_radius, v_min=0, v_max=20
-        )
-        _, rvt_mxr = imgui.slider_int(
-            "rvt-max-radius", v=args.rvt_max_radius, v_min=0, v_max=50
-        )
+        _, rvt_mnr = imgui.slider_int("rvt-min-radius", v=args.rvt_min_radius, v_min=0, v_max=20)
+        _, rvt_mxr = imgui.slider_int("rvt-max-radius", v=args.rvt_max_radius, v_min=0, v_max=50)
 
-        _, rvt_limit = imgui.slider_float(
-            "rvt-limit", v=args.rvt_limit, v_min=0.0001, v_max=200.0
-        )
+        _, rvt_limit = imgui.slider_float("rvt-limit", v=args.rvt_limit, v_min=0.0001, v_max=200.0)
 
         imgui.text("Localization Parameters")
-        _, loc_radius = imgui.slider_int(
-            "loc-radius", v=args.loc_radius, v_min=0, v_max=20
-        )
+        _, loc_radius = imgui.slider_int("loc-radius", v=args.loc_radius, v_min=0, v_max=20)
         _, loc_min_mass = imgui.slider_float(
             "loc-min-mass", v=args.loc_min_mass, v_min=0.0, v_max=5.0
         )
@@ -1149,10 +1178,21 @@ def iscat_gui(analysis: Analysis):
     fpl.loop.run()
 
 
-def circle_data(localizations):
+def circle_data(localizations: np.ndarray) -> np.ndarray:
     """
-    Turn a nparticles x (x, y, z, mass, size, signal) array into a
-    nparticles x CIRCLE_POINTS x 3 array of line segments."""
+    Turn an array of localizations into an array of line segments.
+
+    Parameters
+    ----------
+    localizations : np.ndarray[tuple[int, Literal[6]], np.float32]
+        An array of shape (nparticles, 6).
+        The elements of the second axis are x, y, z, mass, size, and signal.
+
+    Returns
+    -------
+    np.ndarray[tuple[int, int, Literal[3]], np.float32]
+        An array of shape (nparticles, CIRCLE_POINTS, 3).
+    """
     xs, ys, _, _, rs, _ = localizations.T
     theta = np.linspace(0, 2 * np.pi, CIRCLE_POINTS)
     oxs = rs[:, np.newaxis] * np.sin(theta)
@@ -1213,9 +1253,7 @@ def main():
         # Load the raw video
         shape = (args.frames, args.rows, args.columns)
         offset = args.initial_frame * bytes_per_frame
-        mmap_array = np.memmap(
-            args.input_file, dtype=dtype, mode="r", shape=shape, offset=offset
-        )
+        mmap_array = np.memmap(args.input_file, dtype=dtype, mode="r", shape=shape, offset=offset)
         dask_array = da.from_array(mmap_array)
         video = xr.DataArray(dask_array, dims=("T", "Y", "X"))
     else:
@@ -1406,13 +1444,9 @@ def validate_arguments(parser: argparse.ArgumentParser, args: argparse.Namespace
             parser.error("The --columns argument must be given when reading raw files.")
     else:
         if args.rows != -1:
-            parser.error(
-                "The --rows argument must only be given when reading raw files."
-            )
+            parser.error("The --rows argument must only be given when reading raw files.")
         if args.columns != -1:
-            parser.error(
-                "The --columns argument must only be given when reading raw files."
-            )
+            parser.error("The --columns argument must only be given when reading raw files.")
 
     # Validate the GUI parameters
     if args.gui_width < 1:
@@ -1422,13 +1456,9 @@ def validate_arguments(parser: argparse.ArgumentParser, args: argparse.Namespace
 
     # Validate the FFT parameters
     if not 0 <= args.fft_inner_radius <= 1:
-        parser.error(
-            f"The --fft-inner-radius must be between 0 and 1, got {args.fft_inner_radius}"
-        )
+        parser.error(f"The --fft-inner-radius must be between 0 and 1, got {args.fft_inner_radius}")
     if not 0 <= args.fft_outer_radius <= 1:
-        parser.error(
-            f"The --fft-outer-radius must be between 0 and 1, got {args.fft_outer_radius}"
-        )
+        parser.error(f"The --fft-outer-radius must be between 0 and 1, got {args.fft_outer_radius}")
     if not 0 <= args.fft_row_noise_threshold <= 1:
         parser.error(
             f"The --fft-row-noise-threshold must be between 0 and 1, got {args.fft_row_noise_threshold}"
@@ -1440,23 +1470,17 @@ def validate_arguments(parser: argparse.ArgumentParser, args: argparse.Namespace
 
     # Validate the DRA parameters
     if args.dra_window_size < 0:
-        parser.error(
-            f"The --dra-window-size must be non-negative, got {args.dra_window_size}"
-        )
+        parser.error(f"The --dra-window-size must be non-negative, got {args.dra_window_size}")
 
     # Validate the RVT parameters
     if args.rvt_min_radius < 0:
-        parser.error(
-            f"The --rvt-min-radius must be non-negative, got {args.rvt_min_radius}"
-        )
+        parser.error(f"The --rvt-min-radius must be non-negative, got {args.rvt_min_radius}")
     if not args.rvt_min_radius < args.rvt_max_radius:
         parser.error(
             f"The --rvt-max-radius must be larger than {args.rvt_min_radius}, got {args.rvt_max_radius}"
         )
     if not args.rvt_upsample > 0:
-        parser.error(
-            f"The --rvt-upsample must be non-negative, got {args.rvt_upsample}"
-        )
+        parser.error(f"The --rvt-upsample must be non-negative, got {args.rvt_upsample}")
 
     # Validate the localization parameters
     if not (0 <= args.circle_alpha <= 1):

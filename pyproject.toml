@@ -50,7 +50,7 @@ dev = [
     "ipywidgets",
     "ruff",
     "pre-commit",
-    "pyright",
+    "pyright[nodejs]",
     "pytest",
     "python-lsp-server",
     "numpydoc",
@@ -82,8 +82,7 @@ select = [
     "W",   # pycodestyle warnings
     "F",   # pyflakes errors
     "I",   # isort
-    "C",   # flake8-bugbear
-    #"B",   # flake8-bugbear
+    "C",   # complexity
     "RET", # flake8-return
     "YTT", # Truthiness
     "TRY", # Try block errors
@@ -99,12 +98,10 @@ unfixable = ["F821"] # Don't try to fix name definition
 [tool.numpydoc_validation]
 checks = [
     "all",   # report on all checks, except the below
-    "EX01",
-    "SA01",
-    "ES01",
-]
-exclude_files = [
-    "^tests/.*",   # No need to document pytests
+    "EX01",  # examples
+    "SA01",  # see also section
+    "ES01",  # extended summary
+    "GL08",  # module/class docstrings
 ]
 
 [tool.pyright]

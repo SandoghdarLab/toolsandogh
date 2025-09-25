@@ -6,8 +6,10 @@ Provided to you by the Sandoghdar Division of the Max Planck Institute for the P
 
 from ._generate_video import generate_video
 from ._load_video import load_video
+from ._rvt import radial_variance_transform
 
 __all__ = [
-    "load_video",
     "generate_video",
+    "load_video",
+    "radial_variance_transform",
 ]

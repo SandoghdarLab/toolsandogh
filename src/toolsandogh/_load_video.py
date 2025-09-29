@@ -7,6 +7,7 @@ import urllib.parse
 
 import bioio
 import bioio_czi
+import bioio_imageio
 import bioio_nd2
 import dask.array as da
 import fsspec
@@ -15,6 +16,7 @@ import numpy.typing as npt
 import xarray as xr
 from fsspec.utils import math
 
+from ._canonicalize_video import canonicalize_video
 from ._validate_video import validate_video
 
 
@@ -105,10 +107,15 @@ def load_video(
         case (_, ".nd2"):
             img = bioio.BioImage(pathstr, reader=bioio_nd2.Reader)
             video = img.xarray_dask_data
+        case (_, ".mp4"):
+            img = bioio.BioImage(pathstr, reader=bioio_imageio.Reader)
+            video = img.xarray_dask_data
         case (_, _):
             # Let bioio figure out the rest or raise an exception
             img = bioio.BioImage(pathstr)
             video = img.xarray_dask_data
+
+    video = canonicalize_video(video)
 
     # Assert that the video matches all expectations.
     validate_video(video, **kwargs)

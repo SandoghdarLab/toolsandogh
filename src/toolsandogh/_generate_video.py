@@ -7,11 +7,11 @@ from ._validate_video import validate_video
 
 
 def generate_video(
-    T: int = 10,
+    T: int = 1,
     C: int = 1,
     Z: int = 1,
-    Y: int = 128,
-    X: int = 128,
+    Y: int = 1,
+    X: int = 1,
     dt: float = 1.0,
     dz: float = 1.0,
     dy: float = 1.0,

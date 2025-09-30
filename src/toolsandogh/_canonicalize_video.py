@@ -1,8 +1,9 @@
 import numpy as np
+import numpy.typing as npt
 import xarray as xr
 
 
-def canonicalize_video(video: xr.DataArray):
+def canonicalize_video(video: npt.ArrayLike):
     """
     Turn the supplied data into its canonical TCZYX video representation.
 
@@ -16,6 +17,31 @@ def canonicalize_video(video: xr.DataArray):
     xarray.DataArray
         A TCZYX video with the supplied parameters.
     """
+    # Turn any non-xarray into an xarray.
+    if not isinstance(video, xr.DataArray):
+        video = xr.DataArray(video)
+
+        # Determine the appropriate dims
+        rank = len(video.shape)
+        match rank:
+            case 0:
+                dims = ()
+            case 1:
+                dims = ("X",)
+            case 2:
+                dims = ("Y", "X")
+            case 3:
+                dims = ("T", "Y", "X")
+            case 4:
+                dims = ("T", "Z", "Y", "X")
+            case 5:
+                dims = ("T", "C", "Z", "Y", "X")
+            case 6:
+                dims = ("T", "C", "Z", "Y", "X", "S")
+            case _:
+                raise RuntimeError(f"Cannot interpret {rank}-dimensional data as a video.")
+        video = xr.DataArray(video.data, dims=dims)
+
     # Ensure the TZYX axes exist and are continuous.
     for dim in ("T", "Z", "Y", "X"):
         if dim not in video.dims:

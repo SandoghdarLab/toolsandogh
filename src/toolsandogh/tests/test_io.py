@@ -6,7 +6,7 @@ import tempfile
 import imageio.v3 as iio
 import numpy as np
 
-from toolsandogh import generate_video, load_video, store_video
+from toolsandogh import canonicalize_video, generate_video, load_video, store_video
 
 
 def test_generate_video() -> None:
@@ -23,8 +23,35 @@ def test_generate_video() -> None:
     assert len(v2.X) == 1
 
 
+def test_tiff_io() -> None:
+    """Test conversion of videos to/from .tiff files."""
+    pass
+
+
+def test_zarr_io() -> None:
+    """Test conversion of videos to/from .zarr files."""
+    # Create arrays of varying dtypes.
+    shape = (11, 13, 17, 21, 23)
+    rng = np.random.default_rng()
+    arrays = [
+        rng.integers(0, 2**8, size=shape, dtype=np.uint8),
+        rng.integers(-(2**15), (2**15), size=shape, dtype=np.int16),
+        rng.random(size=shape, dtype=np.float32),
+    ]
+    videos = [canonicalize_video(array) for array in arrays]
+
+    # Create a temporary directory
+    with tempfile.TemporaryDirectory() as tmpdir:
+        for n, video in enumerate(videos):
+            path = pathlib.Path(tmpdir) / f"array{n}.zarr"
+            store_video(video, path)
+            other_video = load_video(path)
+            # With .zarr, the resulting video should be bitwise identical.
+            assert (video == other_video).all()
+
+
 def test_mp4_io() -> None:
-    """Test conversion of videos to/from mp4 files."""
+    """Test conversion of videos to/from .mp4 files."""
     # Create test data
     shape = (64, 32, 16, 3)
     data = np.random.randint(0, 256, size=shape, dtype=np.uint8)

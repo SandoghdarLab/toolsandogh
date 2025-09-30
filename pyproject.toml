@@ -12,6 +12,7 @@ dependencies = [
     "fsspec[fuse]",
     "imageio[ffmpeg]",
     "numpy",
+    "pyarrow",
     "scipy",
     "scikit-image",
     "trackpy",

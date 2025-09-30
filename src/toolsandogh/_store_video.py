@@ -2,10 +2,11 @@ import os
 import pathlib
 import urllib.parse
 
-import bioio_imageio.writers
 import xarray as xr
+from bioio_imageio.writers import TimeseriesWriter
+from bioio_ome_zarr.writers import OMEZarrWriter
 
-from ._validate_video import validate_video
+from ._canonicalize_video import canonicalize_video
 
 
 def store_video(video: xr.DataArray, path: os.PathLike) -> None:
@@ -24,7 +25,8 @@ def store_video(video: xr.DataArray, path: os.PathLike) -> None:
     os.PathLike
         The name of a file, a URI, or a path.
     """
-    validate_video(video)
+    video = canonicalize_video(video)
+
     # Decode the path
     pathstr = str(path)
     url = urllib.parse.urlparse(pathstr)
@@ -35,16 +37,14 @@ def store_video(video: xr.DataArray, path: os.PathLike) -> None:
             pass  # TODO
         case (scheme, ".mp4" | ".avi"):
             data = video.stack(F=("T", "C", "Z")).transpose("F", "Y", "X").data
-            bioio_imageio.writers.TimeseriesWriter.save(data, pathstr, dimorder="TYX")
-
-    scheme = url.scheme or "file"
-    suffix = path.suffix
-    if scheme == "file":
-        if suffix in [".bin", ".raw"]:
-            pass
-        elif suffix == ".czi":
-            pass
-        elif suffix == ".nd2":
-            pass
-    else:
-        raise RuntimeError(f"Don't know how to store data via {scheme}.")
+            TimeseriesWriter.save(data, pathstr, dimorder="TYX")
+        case (scheme, ".zarr"):
+            writer = OMEZarrWriter(
+                store=pathstr,
+                shape=video.shape,
+                dtype=video.dtype,
+                zarr_format=3,
+            )
+            writer.write_full_volume(video.data)
+        case (scheme, suffix):
+            raise RuntimeError(f"Don't know how to store {suffix} data via {scheme}.")

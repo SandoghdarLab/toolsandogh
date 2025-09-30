@@ -4,6 +4,7 @@ import urllib.parse
 
 import xarray as xr
 from bioio_imageio.writers import TimeseriesWriter
+from bioio_ome_tiff.writers import OmeTiffWriter
 from bioio_ome_zarr.writers import OMEZarrWriter
 
 from ._canonicalize_video import canonicalize_video
@@ -38,6 +39,8 @@ def store_video(video: xr.DataArray, path: os.PathLike) -> None:
         case (scheme, ".mp4" | ".avi"):
             data = video.stack(F=("T", "C", "Z")).transpose("F", "Y", "X").data
             TimeseriesWriter.save(data, pathstr, dimorder="TYX")
+        case (scheme, ".tiff"):
+            OmeTiffWriter.save(video.to_numpy(), pathstr)
         case (scheme, ".zarr"):
             writer = OMEZarrWriter(
                 store=pathstr,
@@ -46,5 +49,7 @@ def store_video(video: xr.DataArray, path: os.PathLike) -> None:
                 zarr_format=3,
             )
             writer.write_full_volume(video.data)
+        case ("file", suffix):
+            raise RuntimeError(f"Don't know how to store {suffix} data.")
         case (scheme, suffix):
             raise RuntimeError(f"Don't know how to store {suffix} data via {scheme}.")

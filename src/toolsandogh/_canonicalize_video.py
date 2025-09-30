@@ -2,6 +2,8 @@ import numpy as np
 import numpy.typing as npt
 import xarray as xr
 
+from ._validate_video import validate_video
+
 
 def canonicalize_video(video: npt.ArrayLike):
     """
@@ -54,5 +56,11 @@ def canonicalize_video(video: npt.ArrayLike):
     if "S" in video.dims:
         video = video.mean("S", dtype=np.float32).astype(video.dtype)
 
-    # Transpose and return.
-    return video.transpose("T", "C", "Z", "Y", "X")
+    # Ensure the correct ordering of axes.
+    video = video.transpose("T", "C", "Z", "Y", "X")
+
+    # Raise an exception if the video is still not in canonical form.
+    validate_video(video)
+
+    # Done.
+    return video

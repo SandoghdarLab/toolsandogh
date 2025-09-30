@@ -1,5 +1,6 @@
 """Define a helper function for ensuring that videos have a canonical representation."""
 
+import dask.array as da
 import numpy as np
 import numpy.typing as npt
 import xarray as xr
@@ -28,15 +29,17 @@ def validate_video(
 
     1. It is of type xarray.DataArray.
 
-    2. Its dims are ('T', 'C', 'Z', 'Y', 'X').
+    2. Its data is represented as dask.array.Array.
 
-    3. Any T, C, Z, Y, or X that is not None matches the size of the corresponding video axis.
+    3. Its dims are ('T', 'C', 'Z', 'Y', 'X').
 
-    4. Any T, Z, Y, or X coordinate with size larger than one is of type np.float64.
+    4. Any T, C, Z, Y, or X that is not None matches the size of the corresponding video axis.
 
-    5. Any dt, dz, dy, or dx argument that is not None describes the step size of the corresponding coordinate.
+    5. Any T, Z, Y, or X coordinate with size larger than one is of type np.float64.
 
-    6. If the dtype argument is not None, it matches the video's dtype.
+    6. Any dt, dz, dy, or dx argument that is not None describes the step size of the corresponding coordinate.
+
+    7. If the dtype argument is not None, it matches the video's dtype.
 
     Parameters
     ----------
@@ -67,6 +70,8 @@ def validate_video(
     """
     if not isinstance(video, xr.DataArray):
         raise TypeError(f"Not an xarray.DataArray: {video}")
+    if not isinstance(video.data, da.Array):
+        raise TypeError(f"Expected dask.Array data, got {type(video.data)}.")
     dims = ("T", "C", "Z", "Y", "X")
     sizes = (T, C, Z, Y, X)
     steps = (dt, None, dz, dy, dx)

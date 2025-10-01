@@ -13,14 +13,15 @@ def test_generate_video() -> None:
     """Unit test for :func:`toolsandogh.generate_video`."""
     # Create a video with default parameters.
     v1 = generate_video().load()
-    assert len(v1.to_numpy().shape) == 5
+    assert len(v1.shape) == 5
 
     # Create a video with custom parameters.
-    v2 = generate_video(T=5, Z=3, Y=2, X=1).load()
-    assert len(v2["T"]) == 5
-    assert len(v2.Z) == 3
-    assert len(v2.Y) == 2
-    assert len(v2.X) == 1
+    v2 = generate_video(T=5, C=1, Z=3, Y=2, X=1).load()
+    assert v2.shape == (5, 1, 3, 2, 1)
+
+    for video in [v1, v2]:
+        x = v1.to_numpy()
+        assert np.all((0.0 <= x) and (x <= 1.0))
 
 
 def test_tiff_io() -> None:

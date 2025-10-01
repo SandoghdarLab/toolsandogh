@@ -20,12 +20,22 @@ def test_generate_video() -> None:
     assert v2.shape == (5, 1, 3, 2, 1)
 
     for video in [v1, v2]:
-        x = v1.to_numpy()
-        assert np.all((0.0 <= x) and (x <= 1.0))
+        x = video.to_numpy()
+        assert np.all((0.0 <= x) & (x <= 1.0))
 
 
 def test_tiff_io() -> None:
     """Test conversion of videos to/from .tiff files."""
+    # Open a reference tiff file in various ways.
+    parent = pathlib.Path(__file__).resolve().parent
+    path = parent / "testfile.tiff"
+    v1 = load_video(path)
+    v2 = load_video(str(path))
+    v3 = load_video("file://" + str(path))
+    for video in [v1, v2, v3]:
+        x = video.to_numpy()
+        assert x.shape == (1, 1, 1, 167, 439)
+
     # Create arrays of varying dtypes.
     shape = (2, 3, 5, 7, 11)
     rng = np.random.default_rng()
@@ -91,17 +101,3 @@ def test_mp4_io() -> None:
             store_video(video, vidpath)
             video_data = iio.imread(vidpath)
             assert np.mean(np.abs(np.float32(video_data) - np.float32(expected))) < 10.0
-
-
-def test_load_video() -> None:
-    """Unit test for :func:`toolsandogh.load_video`."""
-    parent = pathlib.Path(__file__).resolve().parent
-    path = parent / "testfile.tiff"
-    load_video(path)
-    load_video(str(path))
-    load_video("file://" + str(path))
-
-
-def test_store_video() -> None:
-    """Unit test for :func:`toolsandogh.load_video`."""
-    pass

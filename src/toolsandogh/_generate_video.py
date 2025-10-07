@@ -3,7 +3,7 @@ import numpy as np
 import numpy.typing as npt
 import xarray as xr
 
-from ._validate_video import validate_video
+from ._canonicalize_video import canonicalize_video
 
 
 def generate_video(
@@ -49,17 +49,24 @@ def generate_video(
     xarray.DataArray
         A TCZYX video with the supplied parameters.
     """
-    shape = (T, C, Z, Y, X)
     rng = da.random.default_rng()
-    video = xr.DataArray(
-        rng.random(size=shape, dtype=dtype),  # type: ignore
-        coords={
-            "T": dt * np.arange(T),
-            "C": range(C),
-            "Z": dz * np.arange(Z),
-            "Y": dy * np.arange(Y),
-            "X": dx * np.arange(X),
-        },
+    video = canonicalize_video(
+        rng.random(
+            size=(T, C, Z, Y, X),
+            dtype=dtype,  # type: ignore
+        ),
     )
-    validate_video(video, T=T, C=C, Z=Z, Y=Y, X=X, dt=dt, dz=dz, dy=dy, dx=dx, dtype=dtype)
+
+    # Check that the video matches the supplied parameters.
+    for dim, size, step in zip("TCZYX", (T, C, Z, Y, X), (dt, None, dz, dy, dx)):
+        coord = video[dim]
+        assert len(coord) == size
+        if len(coord) > 1 and step is not None:
+            array = coord.values
+            delta = array[1] - array[0]
+            error = abs(delta - step)
+            assert (error / step) <= 1e-3
+    assert video.dtype == dtype
+
+    # Done.
     return video

@@ -1,10 +1,10 @@
 [project]
 name = "toolsandogh"
-version = "0.1.0"
+dynamic = ["version"]
 description = "A collection of Python scripts for iSCAT microscopy data analysis"
 authors = [{ name = "Marco Heisig", email = "marco.heisig@mpl.mpg.de" }]
 readme = "README.md"
-license = { text = "GPL-3.0-or-later" }
+license = "GPL-3.0-or-later"
 requires-python = ">=3.12,<3.13"
 dependencies = [
     "imgui[glfw,sdl2]",
@@ -48,6 +48,7 @@ keywords = ["tools", "utilities", "python"]
 
 [dependency-groups]
 dev = [
+    "build",
     "ipython",
     "ipywidgets",
     "ruff",
@@ -58,22 +59,26 @@ dev = [
     "python-lsp-server",
     "numpydoc",
     "setuptools",
+    "setuptools-scm",
     "coverage",
     "jupyter",
     "jupyter_rfb",
     "rendercanvas>=2.2",
     "sidecar",
+    "twine",
     "bokeh",
     "fastplotlib[notebook]",
 ]
 
 
 [build-system]
-requires = ["setuptools>=61.0"]
+requires = ["setuptools>80", "setuptools-scm>=8", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools_scm]
 
 [tool.ruff]
 line-length = 100

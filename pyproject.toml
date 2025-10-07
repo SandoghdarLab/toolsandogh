@@ -44,7 +44,11 @@ dependencies = [
     "xarray",
     "dask",
 ]
-keywords = ["tools", "utilities", "python"]
+keywords = ["tools", "utilities", "python", "microscopy"]
+
+[project.urls]
+Repository = "https://github.com/SandoghdarLab/toolsandogh"
+Issues = "https://github.com/SandoghdarLab/toolsandogh/issues"
 
 [dependency-groups]
 dev = [
@@ -69,7 +73,6 @@ dev = [
     "bokeh",
     "fastplotlib[notebook]",
 ]
-
 
 [build-system]
 requires = ["setuptools>80", "setuptools-scm>=8", "wheel"]

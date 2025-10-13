@@ -1,13 +1,13 @@
-"""Define a function for loading videos from a wide range of sources."""
-
 import os
 import os.path
 import pathlib
 import urllib.parse
+from typing import Literal
 
 import bioio
 import bioio_czi
 import bioio_nd2
+import dask
 import dask.array as da
 import fsspec
 import numpy as np
@@ -29,25 +29,25 @@ def load_video(
     dz: float | None = None,
     dy: float | None = None,
     dx: float | None = None,
-    dtype: npt.DTypeLike | None = None,
+    dtype: npt.DTypeLike | Literal["uint12"] | None = None,
 ) -> xr.DataArray:
     """
     Load a video from the given path.
 
-    The resulting video is a 5D xarray with dimensions TCZYX.  If any keyword
+    The resulting video is a 5D xarray with dimensions `TCZYX`.  If any keyword
     arguments are supplied, this function asserts that the resulting video
-    matches these arguments, e.g., Z=1 may be used assert that the result is a
-    2D video.
+    matches these arguments, e.g., `Z=1` may be used assert that the result is
+    a 2D video.
 
     The suffix of the supplied path determines the method that is used for
-    reading the file.  For .raw and .bin files, the X, Y arguments are
-    mandatory, the number of frames T is inferred automatically, and the
-    remaining arguments default to Z=1, C=1, dz=1.0, dy=dx=1.0, dt=1.0, and
-    dtype=uint8.
+    reading the file.  For ``.raw`` and ``.bin`` files, the `X`, `Y` arguments
+    are mandatory, the number of frames `T` is inferred automatically, and the
+    remaining arguments default to `Z=1`, `C=1`, `dz=1.0`, `dy=dx=1.0`,
+    `dt=1.0`, and `dtype=uint8`.
 
     Parameters
     ----------
-    path : os.PathLike
+    path : str or os.PathLike
         The name of a file, a URI, or a path.
     T : int
         The expected T (time) extent of the video.
@@ -68,7 +68,7 @@ def load_video(
     dx : float
         The expected X (column) step size of the video.
     dtype : npt.DtypeLike
-        The expected dtype of the video.
+        The expected dtype of the video, or the string `"uint12"`.
 
     Returns
     -------
@@ -98,7 +98,9 @@ def load_video(
     protocols = fsspec.available_protocols()
     match (url.scheme or "file", path.suffix):
         case (scheme, ".bin" | ".raw") if scheme in protocols:
-            video = load_raw_video(path, **kwargs)
+            return load_raw_video(path, **kwargs)
+        case (_, _) if dtype == "uint12":
+            raise RuntimeError("Packed 12-bit integers can only be loaded from raw files.")
         case (_, ".czi"):
             img = bioio.BioImage(pathstr, reader=bioio_czi.Reader)
             video = img.xarray_dask_data
@@ -111,11 +113,11 @@ def load_video(
             video = img.xarray_dask_data
 
     # Ensure the video is canonical and return.
-    return canonicalize_video(video)
+    return canonicalize_video(video, **kwargs)
 
 
 def load_raw_video(
-    path: os.PathLike,
+    path: str | os.PathLike,
     T: int | None = None,
     C: int | None = None,
     Z: int | None = None,
@@ -125,14 +127,14 @@ def load_raw_video(
     dz: float | None = None,
     dy: float | None = None,
     dx: float | None = None,
-    dtype: npt.DTypeLike | None = None,
+    dtype: npt.DTypeLike | Literal["uint12"] | None = None,
 ) -> xr.DataArray:
     """
     Load a video from the specified raw file.
 
     Parameters
     ----------
-    path : os.PathLike
+    path : str or os.PathLike
         The name of a file, a URI, or a path.
     T : int
         The expected T (time) extent of the video.
@@ -165,26 +167,35 @@ def load_raw_video(
         raise RuntimeError("The parameter Y is required for loading raw files.")
     if X is None:
         raise RuntimeError("The parameter X is required for loading raw files.")
+
     # Z and C default to one.
     if Z is None:
         Z = 1
     if C is None:
         C = 1
-    # The default dtype is np.uint8
+
+    # Determine size of one array item.
     if dtype is None:
-        dtype = np.uint8
+        bits_per_item = 8
+    elif dtype == "uint12":
+        bits_per_item = 12
+    else:
+        bits_per_item = np.dtype(dtype).itemsize * 8
+
     # The number of frames T can be inferred from the file's size.
-    bits_per_item = 12 if (dtype == "uint12") else (np.dtype(dtype).itemsize * 8)
-    nbits = os.path.getsize(path) * 8
-    nitems = nbits // bits_per_item
-    items_per_T = C * Z * Y * X
+    max_bytes = os.path.getsize(path)
+    max_items = (max_bytes * 8) // bits_per_item
+    items_per_frame = C * Z * Y * X
     if T is None:
-        T = nitems // items_per_T
-    nexpected = T * items_per_T
-    if nexpected > nitems:
+        T = max_items // items_per_frame
+        if T == 0:
+            raise RuntimeError("Video is empty.")
+    nitems = T * items_per_frame
+    if nitems > max_items:
         raise RuntimeError(
-            f"The file {path} has only {nitems} items, but {nexpected} were expected."
+            f"The file {path} has only {max_items} items, but {nitems} were expected."
         )
+
     # All step sizes default to 1.0.
     if dt is None:
         dt = 1.0
@@ -194,36 +205,107 @@ def load_raw_video(
         dy = dx or 1.0
     if dx is None:
         dx = dy or 1.0
-    # Load the file as a dask array.  Treat the uint12 case specially.
-    shape = (T, C, Z, Y, X)
-    chunks = ("auto", "auto", None, None, None)
-    if dtype == "uint12":
-        nbytes = (nexpected * 12) // 8
-        mmap_array = np.memmap(path, dtype=np.uint8, mode="r", shape=(nbytes,))
-        dask_array = da.from_array(mmap_array)
-        a = dask_array[0::3].astype(np.uint16)
-        b = dask_array[1::3].astype(np.uint16)
-        c = dask_array[2::3].astype(np.uint16)
+
+    # Determine a reasonable Dask chunk size.
+    bits_per_chunk = 128 * 1024 * 1024 * 8
+    bits_per_frame = items_per_frame * bits_per_item
+    frames_per_chunk = max(1, bits_per_chunk // bits_per_frame)
+
+    # Distinguish the packed 12-bit case from all others.
+    if bits_per_item == 12:
+        # Ensure chunks of packed 12-bit data are byte-aligned.
+        if ((frames_per_chunk * bits_per_chunk) % 8) != 0:
+            frames_per_chunk += 1
+        bits_per_chunk = frames_per_chunk * items_per_frame * bits_per_item
+        assert (bits_per_chunk % 8) == 0
+        bytes_per_chunk = bits_per_chunk // 8
+        nbytes = math.ceil((bits_per_item * nitems) / 8)
+        array = load_raw_array(path, shape=(nbytes,), dtype=np.uint8, chunk_size=bytes_per_chunk)
+        a = array[0::3].astype(np.uint16)
+        b = array[1::3].astype(np.uint16)
+        c = array[2::3].astype(np.uint16)
         assert len(a) == len(b) == len(c)
         evens = ((b & 0x0F) << 8) | a
         odds = ((b & 0xF0) >> 4) | (c << 4)
         flat = da.stack([evens, odds], axis=1).ravel()
-        dask_array = flat.reshape((T, C, Z, Y, X), chunks=chunks)
+        dask_array = flat.reshape((T, C, Z, Y, X))
     else:
-        dtype = np.dtype(dtype)
-        mmap_array = np.memmap(path, dtype=dtype, mode="r", shape=shape)
-        dask_array = da.from_array(mmap_array, chunks=chunks)  # type: ignore
+        shape = (T, C, Z, Y, X)
+        dask_array = load_raw_array(path, shape=shape, dtype=dtype, chunk_size=frames_per_chunk)
+
     # Wrap the dask array as a xarray.DataArray and return it.
-    return xr.DataArray(
-        dask_array,
-        coords={
-            "T": dt * np.arange(T),
-            "C": range(C),
-            "Z": dz * np.arange(Z),
-            "Y": dy * np.arange(Y),
-            "X": dx * np.arange(X),
-        },
-    )
+    return canonicalize_video(dask_array)  # type: ignore
+
+
+def load_raw_array(
+    path: str | os.PathLike,
+    shape: tuple[int, ...],
+    dtype: npt.DTypeLike,
+    *,
+    chunk_size: int = 1,
+) -> da.Array:
+    """
+    Lazily load a binary file as a Dask array.
+
+    The file is interpreted as a flat, C‑ordered array of `dtype` and
+    reshaped to `shape`.  The array is partitioned **only** along the
+    leading axis; each partition is read on‑demand via :func:`load_raw_chunk`
+    and then stacked back together.
+
+    Parameters
+    ----------
+    path : str
+        Path to the binary file.
+    shape : tuple[int, ...]
+        Desired shape of the resulting array.
+    dtype : str or np.dtype
+        Data type of the stored values.
+    chunk_size : int, optional
+        Size of the chunk along axis 0.  Defaults to 1.
+
+    Returns
+    -------
+    dask.array.Array
+        A Dask array whose blocks are produced by :func:`load_raw_chunk` and
+        concatenated along axis zero.
+
+    Notes
+    -----
+    * The function assumes the file is stored in C‑order (row‑major).
+    * The byte offset for a slice ``i`` is computed as::
+
+          offset_i = i * (product(shape[1:]) * dtype.itemsize)
+
+      because each slice along axis 0 occupies exactly that many bytes.
+    * ``chunks`` may be larger than the length of axis 0; in that case a
+      single block covering the whole axis is created.
+    """
+    # Normalize inputs.
+    dtype = np.dtype(dtype)
+    if len(shape) == 0:
+        raise ValueError("`shape` must contain at least one dimension")
+    n = shape[0]
+
+    # Create delayed objects for each block.
+    delayed_blocks = []
+    block_shapes = []
+    slice_bytes = math.prod(shape[1:]) * dtype.itemsize
+    for start, length in ((i, min(chunk_size, n - i)) for i in range(0, n, chunk_size)):
+        block_shape = (length,) + shape[1:]
+        block_shapes.append(block_shape)
+        offset = start * slice_bytes
+
+        # Wrap the low-level loader with dask.delayed:
+        delayed_block = dask.delayed(load_raw_chunk)(path, block_shape, dtype, offset)  # type: ignore
+        delayed_blocks.append(delayed_block)
+
+    # Turn delayed objects into Dask array blocks.
+    dask_blocks = [
+        da.from_delayed(block, shape=shape, dtype=dtype)
+        for block, shape in zip(delayed_blocks, block_shapes)
+    ]
+
+    return da.concatenate(dask_blocks, axis=0)
 
 
 def load_raw_chunk(
@@ -246,7 +328,7 @@ def load_raw_chunk(
     dtype : npt.DTypeLike
         Numpy data type of the stored items.
     offset : int
-        Index of the first element to read **in items**, *not* in bytes.
+        Index of the first byte to read.
 
     Returns
     -------
@@ -261,3 +343,7 @@ def load_raw_chunk(
             offset=offset,
             count=count,
         ).reshape(shape)
+
+
+def uint12_from_uint8(video: xr.DataArray):
+    pass

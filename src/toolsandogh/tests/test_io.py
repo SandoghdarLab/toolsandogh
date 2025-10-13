@@ -1,5 +1,6 @@
 """Tests input and output of videos."""
 
+import math
 import pathlib
 import tempfile
 
@@ -101,3 +102,49 @@ def test_mp4_io() -> None:
             store_video(video, vidpath)
             video_data = iio.imread(vidpath)
             assert np.mean(np.abs(np.float32(video_data) - np.float32(expected))) < 10.0
+
+
+def test_raw_io() -> None:
+    """Test conversion of videos to/from .raw files."""
+    # Create test data
+    shape = (2, 3, 5, 7, 11)
+    (T, C, Z, Y, X) = shape
+    count = math.prod(shape)
+    dtype = np.uint16
+    data = np.random.randint(0, 2**16, size=shape, dtype=dtype)
+    # Create a temporary directory
+    with tempfile.TemporaryDirectory() as tmpdir:
+        for suffix in [".raw", ".bin"]:
+            # Write data to disc.
+            path = pathlib.Path(tmpdir) / f"tofile{suffix}"
+            data.tofile(path)
+
+            # Ensure that load_video behaves the same as np.fromfile
+            expected = np.fromfile(path, dtype=dtype, count=count).reshape(shape)
+            assert expected.shape == data.shape
+            video = load_video(path, C=C, Z=Z, Y=Y, X=X, dtype=dtype)
+            assert np.all(video.to_numpy() == expected)
+
+            # Ensure that store_video behaves the same as np.tofile
+            vidpath = pathlib.Path(tmpdir) / f"store_video{suffix}"
+            store_video(video, vidpath)
+            video = np.fromfile(vidpath, dtype=dtype, count=count).reshape(shape)
+            assert np.all(video == expected)
+
+
+def test_raw_uint12_io() -> None:
+    """Test conversion of videos to/from .raw files."""
+    # Create a temporary directory
+    with tempfile.TemporaryDirectory() as tmpdir:
+        path1 = pathlib.Path(tmpdir) / "path1.bin"
+        path2 = pathlib.Path(tmpdir) / "path2.bin"
+        bytes1 = np.array([0, 255, 0], dtype=np.uint8)
+        bytes2 = np.ones(240 * 1024 * 1024, dtype=np.uint8)
+        bytes1.tofile(path1)
+        bytes2.tofile(path2)
+        video1 = load_video(path1, X=1, Y=2, dtype="uint12")
+        assert video1.shape == (1, 1, 1, 2, 1)
+        video2 = load_video(path2, C=2, X=1024, Y=1024, dtype="uint12")
+        assert video2.shape == (80, 2, 1, 1024, 1024)
+        assert np.all(video2.isel(X=slice(0, None, 2)) == 257)
+        assert np.all(video2.isel(X=slice(1, None, 2)) == 16)

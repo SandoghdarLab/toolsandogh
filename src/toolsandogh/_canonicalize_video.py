@@ -20,13 +20,20 @@ from ._validate_video import validate_video
 
 def canonicalize_video(
     video: npt.ArrayLike,
-    # optional metadata
-    acquisition_date: datetime | None = None,
-    creator: str | None = None,
+    # optional video properties
+    T: int | None = None,
+    C: int | None = None,
+    Z: int | None = None,
+    Y: int | None = None,
+    X: int | None = None,
     dt: float | None = None,
     dz: float | None = None,
     dy: float | None = None,
     dx: float | None = None,
+    dtype: npt.DTypeLike | None = None,
+    # optional video metadata
+    acquisition_date: datetime | None = None,
+    creator: str | None = None,
 ) -> xr.DataArray:
     """
     Turn the supplied data into its canonical TCZYX video representation.
@@ -35,10 +42,16 @@ def canonicalize_video(
     ----------
     video : xr.DataArray
         An xarray.
-    acquisition_date : datetime.datetime
-        A timestamp of when the video was created.  Defaults to datetime.now().
-    creator : str
-        A string describing who created the video.
+    T : int
+        The expected T (time) extent of the video.
+    C : int
+        The expected C (channel) extent of the video.
+    Z : int
+        The expected Z (height) extent of the video.
+    Y : int
+        The expected Y (row) extent of the video.
+    X : int
+        The expected X (column) extent of the video.
     dt : float
         The time interval in milliseconds between one video frame and the next.
         Defaults to 1/60 of a second.
@@ -51,11 +64,17 @@ def canonicalize_video(
     dx : float
         The spatial distance in micrometer between one column of pixels and the next.
         Defaults to 1 micrometer.
+    dtype : npt.DtypeLike
+        The expected dtype of the video.
+    acquisition_date : datetime.datetime
+        A timestamp of when the video was created.  Defaults to datetime.now().
+    creator : str
+        A string describing who created the video.
 
     Returns
     -------
     xarray.DataArray
-        A TCZYX video with the supplied parameters.
+        A TCZYX video with the supplied parameters that passes :py:func:`~toolsandogh.validate_video`.
     """
     # Turn video into an xarray.
     if not isinstance(video, xr.DataArray):
@@ -77,12 +96,29 @@ def canonicalize_video(
     if "C" not in video.dims:
         video = video.expand_dims({"C": 1})
 
+    # Derive the result dtype.
+    if dtype is None:
+        result_dtype = video.dtype
+    else:
+        result_dtype = np.dtype(dtype)
+
     # If there is a S axis, merge its entries.
     if "S" in video.dims:
-        video = video.mean("S", dtype=np.float32).astype(video.dtype)
+        video = video.mean("S", dtype=np.float32)
+
+    # Ensure the resulting video has the correct dtype.
+    if video.dtype != result_dtype:
+        video = video.astype(result_dtype)
 
     # Ensure the correct ordering of axes.
-    video = video.transpose("T", "C", "Z", "Y", "X")
+    axes = ("T", "C", "Z", "Y", "X")
+    video = video.transpose(*axes)
+
+    # Ensure each axis is as large as expected.
+    expected_shape = (T, C, Z, Y, X)
+    for axis, expected, actual in zip(axes, expected_shape, video.shape):
+        if not (expected is None or expected == actual):
+            raise RuntimeError(f"Expected {axis}-axis of size {expected}, but got {actual}")
 
     # Ensure there is metadata attached.
     if not hasattr(video, "processed"):

@@ -34,6 +34,9 @@ def radial_variance_transform(
     """
     Perform the Radial Variance Transform[1] across the video's XY-dimension.
 
+    The values of the resulting video are proportional to the level of circular
+    symmetry at each point of the original video.
+
     Parameters
     ----------
     video : xarray.DataArray

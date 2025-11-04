@@ -1,3 +1,5 @@
+import warnings
+
 import dask.array as da
 import numpy as np
 import ome_types.model as ome
@@ -57,13 +59,13 @@ def validate_video(video) -> None:
 def validate_video_metadata(video: xr.DataArray, metadata: ome.OME):
     # Ensure metadata has exactly one image entry.
     if len(metadata.images) == 0:
-        raise ValueError("Video has no image metadata.")
+        warnings.warn("Video has no image metadata.")
     if len(metadata.images) > 1:
         names = [image.name for image in metadata.images]
-        raise ValueError(f"Video has metadata for multiple images: {names}")
+        warnings.warn(f"Video has metadata for multiple images: {names}")
 
     image: ome.Image = metadata.images[0]
     pixels: ome.Pixels = image.pixels
     expected_shape = (pixels.size_t, pixels.size_c, pixels.size_z, pixels.size_y, pixels.size_x)
     if video.shape != expected_shape:
-        raise ValueError(f"Video has shape {video.shape}, but metadata shape {expected_shape}.")
+        warnings.warn(f"Video has shape {video.shape}, but metadata has shape {expected_shape}.")

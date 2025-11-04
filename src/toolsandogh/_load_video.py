@@ -1,7 +1,10 @@
+import ast
 import os
 import os.path
 import pathlib
+import re
 import urllib.parse
+import warnings
 from typing import Literal
 
 import bioio
@@ -20,6 +23,7 @@ from ._canonicalize_video import canonicalize_video
 
 def load_video(
     path: str | os.PathLike,
+    scene: str | int | None = None,
     T: int | None = None,
     C: int | None = None,
     Z: int | None = None,
@@ -30,6 +34,7 @@ def load_video(
     dy: float | None = None,
     dx: float | None = None,
     dtype: npt.DTypeLike | Literal["uint12"] | None = None,
+    pylablib_settings_file: str | os.PathLike | bool | None = None,
 ) -> xr.DataArray:
     """
     Load a video from the given path.
@@ -49,6 +54,11 @@ def load_video(
     ----------
     path : str or os.PathLike
         The name of a file, a URI, or a path.
+    scene : str or int
+        The name or index of a scene to load from the supplied path.  It is an
+        error to supply a name or index that doesn't exist.  When a path
+        contains multiple scenes and this argument is not supplied, warn and
+        select the first scene.
     T : int
         The expected T (time) extent of the video.
     C : int
@@ -69,6 +79,13 @@ def load_video(
         The expected X (column) step size of the video.
     dtype : npt.DtypeLike
         The expected dtype of the video, or the string `"uint12"`.
+    pylablib_settings_file : str or os.Pathlike
+        A configuration file as described in :url:`https://pylablib-cam-control.readthedocs.io/en/latest/settings_file.html#settings-file-general`.
+        This file is then used to infer `T`, `Y`, `X`, and `dtype` arguments
+        that have not been supplied explicitly.
+        A value of `True` means that the name of the settings file should be
+        derived from the name of the `path` argument by stripping the suffix
+        and possible trailing counter and appending `_settings.dat`.
 
     Returns
     -------
@@ -94,23 +111,54 @@ def load_video(
         "dtype": dtype,
     }
 
-    # Load the video.
+    # Handle the case where pylablib_settings_file is True.
+    if pylablib_settings_file is True:
+        pylablib_settings_file = find_pylablib_settings_file(path)
+
+    # Consult the pylablib_settings_file if it exists.
+    if pylablib_settings_file:
+        for k, v in parse_pylablib_settings_file(pylablib_settings_file).items():
+            if not kwargs.get(k):
+                kwargs[k] = v
+
+    print(kwargs)
+
+    # Load the path.
     protocols = fsspec.available_protocols()
     match (url.scheme or "file", path.suffix):
         case (scheme, ".bin" | ".raw") if scheme in protocols:
+            if scene is not None:
+                raise RuntimeError("Cannot select scenes from raw files.")
             return load_raw_video(path, **kwargs)
         case (_, _) if dtype == "uint12":
             raise RuntimeError("Packed 12-bit integers can only be loaded from raw files.")
         case (_, ".czi"):
-            img = bioio.BioImage(pathstr, reader=bioio_czi.Reader)
-            video = img.xarray_dask_data
+            image = bioio.BioImage(pathstr, reader=bioio_czi.Reader)
         case (_, ".nd2"):
-            img = bioio.BioImage(pathstr, reader=bioio_nd2.Reader)
-            video = img.xarray_dask_data
+            image = bioio.BioImage(pathstr, reader=bioio_nd2.Reader)
         case (_, _):
             # Let bioio figure out the rest or raise an exception
-            img = bioio.BioImage(pathstr)
-            video = img.xarray_dask_data
+            image = bioio.BioImage(pathstr)
+
+    # Select the right scene.
+    scenes = image.scenes
+    if len(scenes) == 0:
+        raise RuntimeError(f"Zero scenes found in {path}.")
+    if isinstance(scene, int) or isinstance(scene, str):
+        image.set_scene(scene)
+    elif scene is None:
+        first_scene = image.scenes[0]
+        if len(scenes) > 1:
+            warnings.warn(f"Multiple scenes found in {path}, selecting {first_scene}.")
+        image.set_scene(first_scene)
+    else:
+        raise TypeError(f"Invalid scene designator {scene}")
+
+    # Extract the video.
+    video = image.xarray_dask_data
+
+    # Ensure the video contains only metadata from the current scene.
+    pass  # TODO
 
     # Ensure the video is canonical and return.
     return canonicalize_video(video, **kwargs)
@@ -345,5 +393,65 @@ def load_raw_chunk(
         ).reshape(shape)
 
 
-def uint12_from_uint8(video: xr.DataArray):
-    pass
+def find_pylablib_settings_file(path: str | os.PathLike) -> os.PathLike | None:
+    path = pathlib.Path(path)
+    parent = path.parent
+    stem = path.stem
+
+    if (candidate := parent / f"{stem}_settings.dat").exists():
+        return candidate
+
+    pattern = r"_\d+$"
+    if re.search(pattern, stem):
+        new_stem = re.sub(pattern, "", stem)
+        print(new_stem)
+        if (candidate := parent / f"{new_stem}_settings.dat").exists():
+            return candidate
+
+    return None
+
+
+def parse_pylablib_settings_file(path: str | os.PathLike) -> dict:
+    path = pathlib.Path(path)
+    if not path.exists():
+        warnings.warn(f"Found no pylablib settings file at {path}.")
+        return {}
+
+    attrs = {}
+    with open(path, "r") as file:
+        for line in file:
+            line = line.strip()
+
+            # Skip comments
+            if line.startswith("#"):
+                continue
+
+            parts = line.split(None, 1)
+
+            # Skip empty lines and keys with no values
+            if len(parts) < 2:
+                continue
+
+            key, value = parts[0], parts[1]
+
+            attrs[key] = value
+
+    kwargs = {}
+
+    if value := attrs.get("cam/data_dimensions"):
+        kwargs["Y"], kwargs["X"] = ast.literal_eval(value)
+
+    if last := attrs.get("save/last_frame_index"):
+        first = attrs.get("save/first_frame_index", "0")
+        total = int(last) + 1 - int(first)
+        if value := attrs.get("save/chunk_size"):
+            chunk_size = ast.literal_eval(value)
+            if isinstance(chunk_size, int):
+                kwargs["T"] = chunk_size
+        else:
+            kwargs["T"] = total
+
+    if dtype := attrs.get("save/frame/dtype"):
+        kwargs["dtype"] = np.dtype(dtype)
+
+    return kwargs

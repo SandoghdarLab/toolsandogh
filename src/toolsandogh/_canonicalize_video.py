@@ -40,8 +40,12 @@ def canonicalize_video(
 
     Parameters
     ----------
-    video : xr.DataArray
-        An xarray.
+    video : npt.ArrayLike
+        An array-like entity with up to five axes.  If the axes are not labeled
+        already, a 1D array is treated as having an `X` axis only, a 2D array is
+        treated as having dimensions `XY`, a 3D array is treated as having
+        dimensions `TYX`, a 4D array is treated as having dimensions `TZYX`, and
+        a 5D array is treated as having dimensions `TCZYX`.
     T : int
         The expected T (time) extent of the video.
     C : int

@@ -10,31 +10,13 @@
 #     "scikit-image",
 #     "trackpy",
 #     "imgrvt",
-#     "tqdm",
-#     "bioio",
-#     "bioio-bioformats",
-#     "bioio-czi",
 #     "scipy",
 #     "scikit-image",
 #     "trackpy",
 #     "imgrvt",
-#     "tqdm",
-#     "imageio[ffmpeg]",
-#     "bioio",
-#     "bioio-bioformats",
-#     "bioio-czi",
-#     "bioio-dv",
-#     "bioio-imageio",
-#     "bioio-lif",
-#     "bioio-nd2",
-#     "bioio-ome-tiff>=1.4",
-#     "bioio-ome-zarr>=2.2",
-#     "bioio-sldy",
-#     "bioio-tifffile",
-#     "bioio-tiff-glob",
-#     "bioio-imageio>=1.2",
 #     "xarray",
 #     "dask",
+#     "toolsandogh",
 # ]
 # ///
 
@@ -52,20 +34,17 @@ from dataclasses import dataclass
 from multiprocessing.shared_memory import SharedMemory
 from typing import Generic, Literal, Protocol, Sequence, TypeVar, Union
 
-import bioio
-import bioio_bioformats
 import dask.array as da
-import imageio.v3 as iio
 import imgrvt
 import numpy as np
 import numpy.typing as npt
 import pandas
 import trackpy
 import xarray as xr
-from bioio_ome_tiff.writers import OmeTiffWriter
-from bioio_ome_zarr.writers import OmeZarrWriterV3
 from imgui_bundle import imgui
 from imgui_bundle import portable_file_dialogs as pfd
+
+import toolsandogh
 
 if __name__ == "__main__":
     from fastplotlib.ui import EdgeWindow  # type: ignore
@@ -155,40 +134,11 @@ class SharedArray(Generic[_Dtype]):
 ### Writing Videos to Files
 
 
-class VideoWriter(Protocol):
-    """Protocol class for saving microscopy videos to disk."""
-
-    @staticmethod
-    def __call__(video: ArrayLike, path: PathLike) -> None: ...
-
-
-def write_video_as_zarr(video: ArrayLike, path: PathLike) -> None:
-    shape: tuple[int, ...] = video.shape  # type: ignore
-    writer = OmeZarrWriterV3(
-        path, shape, video.dtype, scale_factors=(1, 1, 1), axes_names=["T", "Y", "X"]
-    )
-    for t_index in range(shape[0]):
-        writer.write_timepoint(t_index, video[t_index])
-
-
-def write_video_as_tiff(video: ArrayLike, path: PathLike) -> None:
-    writer = OmeTiffWriter()
-    writer.save(video, path, dim_order="TYX")
-
-
-def write_video_as_mp4(video: ArrayLike, path: PathLike) -> None:
-    data = np.array(video)
-    lo, hi = data.min(), data.max()
-    delta = hi - lo if hi < lo else 1.0
-    normalized = (data - lo) / delta
-    iio.imwrite(str(path), (normalized * 2**8).astype(np.uint8))
-
-
-VIDEO_WRITERS: dict[str, VideoWriter] = {
-    ".tiff": write_video_as_tiff,
-    ".zarr": write_video_as_zarr,
-    ".mp4": write_video_as_mp4,
-}
+VIDEO_FORMATS: list[str] = [
+    ".tiff",
+    ".zarr",
+    ".mp4",
+]
 
 
 ###############################################################################
@@ -842,9 +792,8 @@ class SideBar(EdgeWindow):
         imgui.separator()
         imgui.text("Output Files")
 
-        suffixes = list(VIDEO_WRITERS.keys())
-        args.dra_file = save_file_widget("dra", args.dra_file, suffixes)
-        args.rvt_file = save_file_widget("rvt", args.rvt_file, suffixes)
+        args.dra_file = save_file_widget("dra", args.dra_file, VIDEO_FORMATS)
+        args.rvt_file = save_file_widget("rvt", args.rvt_file, VIDEO_FORMATS)
 
         suffixes = list(LOC_WRITERS.keys())
         args.loc_file = save_file_widget("loc", args.loc_file, suffixes)
@@ -861,7 +810,7 @@ class SideBar(EdgeWindow):
                 path = pathlib.Path(args.dra_file)
                 suffix = path.suffix
                 array = np.array(self.analysis.dra)
-                VIDEO_WRITERS[suffix](array, path)
+                toolsandogh.store_video(array, path)
                 print("done.")
 
             # Write the RVT file
@@ -870,7 +819,7 @@ class SideBar(EdgeWindow):
                 path = pathlib.Path(args.rvt_file)
                 suffix = path.suffix
                 array = np.array(self.analysis.rvt)
-                VIDEO_WRITERS[suffix](array, path)
+                toolsandogh.store_video(array, path)
                 print("done.")
 
             # Write the LOC file
@@ -1031,6 +980,10 @@ def save_file_widget(name: str, default: str, suffixes: list[str]) -> str:
 
         # Ensure the path doesn't point to any existing file
         path = uniquify_filename(path)
+
+    # Display what is being saved.
+    imgui.text(f"{name}:")
+    imgui.same_line()
 
     # Render a button that opens a dialog when pressed
     if path == "":
@@ -1216,65 +1169,15 @@ def main():
 
     # Load the input file, either from raw data or from a suitable image or
     # video file.
-    video: xr.DataArray
-    if args.raw_dtype == "uint12":
-        # Loading of packed 12bit files.
-        bits_per_frame = 12 * args.rows * args.columns
-        if args.frames == -1:
-            args.frames = (os.path.getsize(args.input_file) * 8) // bits_per_frame
-        # Ensure we are skipping an even number of frames, so that the offset
-        # (in bits) is both a multiple of 24
-        if (args.initial_frame % 2) != 0:
-            args.initial_frame -= 1
-        nbytes = (args.frames * bits_per_frame) // 8
-        offset = (args.initial_frame * bits_per_frame) // 8
-        mmap_array = np.memmap(
-            args.input_file, dtype=np.uint8, mode="r", shape=(nbytes,), offset=offset
-        )
-        dask_array = da.from_array(mmap_array)
-        a = dask_array[0::3].astype(np.uint16)
-        b = dask_array[1::3].astype(np.uint16)
-        c = dask_array[2::3].astype(np.uint16)
-        assert len(a) == len(b) == len(c)
-        evens = ((b & 0x0F) << 8) | a
-        odds = ((b & 0xF0) >> 4) | (c << 4)
-        flat = da.stack([evens, odds], axis=1).ravel()
-        shape = (args.frames, args.rows, args.columns)
-        video = xr.DataArray(flat.reshape(shape), dims=("T", "Y", "X"))
-    elif args.raw_dtype:
-        # Loading of RAW files.
-        dtype = np.dtype(args.raw_dtype)
-        bytes_per_frame = dtype.itemsize * args.rows * args.columns
-        # Derive the number of frames when it is not set
-        if args.frames == -1:
-            args.frames = os.path.getsize(args.input_file) // bytes_per_frame
-        # TODO Error handling if there aren't enough frames
+    video = toolsandogh.load_video(
+        path=args.input_file,
+        T=None if (args.frames == -1) else args.frames,
+        Y=None if (args.rows == -1) else args.rows,
+        X=None if (args.columns == -1) else args.columns,
+        dtype=args.raw_dtype or None,
+    ).isel(C=args.channel, Z=args.zstack)
+    args.frames, args.rows, args.columns = video.shape
 
-        # Load the raw video
-        shape = (args.frames, args.rows, args.columns)
-        offset = args.initial_frame * bytes_per_frame
-        mmap_array = np.memmap(args.input_file, dtype=dtype, mode="r", shape=shape, offset=offset)
-        dask_array = da.from_array(mmap_array)
-        video = xr.DataArray(dask_array, dims=("T", "Y", "X"))
-    else:
-        # Read video using bioio
-        img = bioio.BioImage(args.input_file, reader=bioio_bioformats.Reader)
-        T = slice(
-            args.initial_frame,
-            None if args.frames == -1 else args.initial_frame + args.frames,
-            1,
-        )
-        xarr = img.get_xarray_stack()
-        video = xarr.isel(I=0, T=T, C=args.channel, Z=args.zstack)
-    # Check that the video matches the prescribed parameters
-    assert video.dims == ("T", "Y", "X")
-    if args.frames == -1:
-        args.frames = video.shape[0]
-    if args.rows == -1:
-        args.rows = video.shape[1]
-    if args.columns == -1:
-        args.columns = video.shape[2]
-    assert video.shape == (args.frames, args.rows, args.columns)
     # Normalize the video if desired.
     if args.normalize:
         minimum = np.min(video)

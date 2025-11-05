@@ -121,8 +121,6 @@ def load_video(
             if not kwargs.get(k):
                 kwargs[k] = v
 
-    print(kwargs)
-
     # Load the path.
     protocols = fsspec.available_protocols()
     match (url.scheme or "file", path.suffix):

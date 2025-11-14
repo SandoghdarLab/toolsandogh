@@ -6,7 +6,6 @@
 #     "numpy",
 #     "xarray",
 #     "bioio",
-#     "bioio-czi",
 #     "bioio-dv",
 #     "bioio-imageio",
 #     "bioio-lif",

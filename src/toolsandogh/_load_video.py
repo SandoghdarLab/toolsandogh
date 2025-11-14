@@ -8,7 +8,6 @@ import warnings
 from typing import Literal
 
 import bioio
-import bioio_czi
 import bioio_nd2
 import dask
 import dask.array as da
@@ -130,8 +129,6 @@ def load_video(
             return load_raw_video(path, **kwargs)
         case (_, _) if dtype == "uint12":
             raise RuntimeError("Packed 12-bit integers can only be loaded from raw files.")
-        case (_, ".czi"):
-            image = bioio.BioImage(pathstr, reader=bioio_czi.Reader)
         case (_, ".nd2"):
             image = bioio.BioImage(pathstr, reader=bioio_nd2.Reader)
         case (_, _):

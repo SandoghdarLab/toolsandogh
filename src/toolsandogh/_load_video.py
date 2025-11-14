@@ -402,7 +402,6 @@ def find_pylablib_settings_file(path: str | os.PathLike) -> os.PathLike | None:
     pattern = r"_\d+$"
     if re.search(pattern, stem):
         new_stem = re.sub(pattern, "", stem)
-        print(new_stem)
         if (candidate := parent / f"{new_stem}_settings.dat").exists():
             return candidate
 

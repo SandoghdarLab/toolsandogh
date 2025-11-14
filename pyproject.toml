@@ -20,7 +20,6 @@ dependencies = [
     "tqdm",
     "bioio",
     "bioio-bioformats",
-    "bioio-czi",
     "scipy",
     "scikit-image",
     "trackpy",
@@ -29,7 +28,6 @@ dependencies = [
     "imageio[ffmpeg]",
     "bioio",
     "bioio-bioformats",
-    "bioio-czi",
     "bioio-dv",
     "bioio-imageio",
     "bioio-lif",
@@ -86,6 +84,7 @@ where = ["src"]
 [tool.ruff]
 line-length = 100
 fix = true
+exclude = ["notebooks"]
 
 [tool.ruff.lint]
 select = [

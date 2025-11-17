@@ -34,7 +34,6 @@ dependencies = [
     "bioio-nd2",
     "bioio-ome-tiff>=1.4",
     "bioio-ome-zarr>=2.2",
-    "bioio-sldy",
     "bioio-tifffile",
     "bioio-tiff-glob",
     "bioio-imageio>=1.2",

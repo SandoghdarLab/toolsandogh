@@ -12,7 +12,6 @@
 #     "bioio-nd2",
 #     "bioio-ome-tiff",
 #     "bioio-ome-zarr",
-#     "bioio-sldy",
 #     "bioio-tifffile",
 #     "bioio-tiff-glob",
 # ]

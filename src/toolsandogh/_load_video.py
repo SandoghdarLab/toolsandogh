@@ -91,10 +91,14 @@ def load_video(
     xarray.DataArray
         A canonical TCZYX array that matches the supplied parameters.
     """
-    # Parse the supplied path.
-    pathstr = str(path)
-    url = urllib.parse.urlparse(pathstr)
-    path = pathlib.Path(url.path)
+    # Determine scheme and suffix
+    if isinstance(path, str) and is_url(path):
+        url_info = urllib.parse.urlparse(path)
+        scheme = url_info.scheme or "file"
+        suffix = pathlib.Path(url_info.path).suffix
+    else:
+        scheme = "file"
+        suffix = pathlib.Path(path).suffix
 
     # Gather all keyword arguments for those load functions that require them.
     kwargs = {
@@ -122,7 +126,7 @@ def load_video(
 
     # Load the path.
     protocols = fsspec.available_protocols()
-    match (url.scheme or "file", path.suffix):
+    match (scheme or "file", suffix):
         case (scheme, ".bin" | ".raw") if scheme in protocols:
             if scene is not None:
                 raise RuntimeError("Cannot select scenes from raw files.")
@@ -130,10 +134,10 @@ def load_video(
         case (_, _) if dtype == "uint12":
             raise RuntimeError("Packed 12-bit integers can only be loaded from raw files.")
         case (_, ".nd2"):
-            image = bioio.BioImage(pathstr, reader=bioio_nd2.Reader)
+            image = bioio.BioImage(path, reader=bioio_nd2.Reader)
         case (_, _):
             # Let bioio figure out the rest or raise an exception
-            image = bioio.BioImage(pathstr)
+            image = bioio.BioImage(path)
 
     # Select the right scene.
     scenes = image.scenes
@@ -157,6 +161,13 @@ def load_video(
 
     # Ensure the video is canonical and return.
     return canonicalize_video(video, **kwargs)
+
+
+def is_url(path: str | os.PathLike) -> bool:
+    if not isinstance(path, str):
+        return False
+    url = urllib.parse.urlparse(path)
+    return bool(url.scheme and url.netloc)
 
 
 def load_raw_video(

@@ -7,8 +7,6 @@ readme = "README.md"
 license = "GPL-3.0-or-later"
 requires-python = ">=3.12,<3.13"
 dependencies = [
-    "imgui[glfw,sdl2]",
-    "fastplotlib[imgui]",
     "fsspec[fuse]",
     "imageio[ffmpeg]",
     "numpy",
@@ -18,16 +16,12 @@ dependencies = [
     "trackpy",
     "imgrvt",
     "tqdm",
-    "bioio",
-    "bioio-bioformats",
     "scipy",
     "scikit-image",
-    "trackpy",
     "imgrvt",
     "tqdm",
     "imageio[ffmpeg]",
     "bioio",
-    "bioio-bioformats",
     "bioio-dv",
     "bioio-imageio",
     "bioio-lif",
@@ -68,7 +62,6 @@ dev = [
     "sidecar",
     "twine",
     "bokeh",
-    "fastplotlib[notebook]",
 ]
 
 [build-system]

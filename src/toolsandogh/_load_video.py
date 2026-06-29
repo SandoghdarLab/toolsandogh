@@ -228,13 +228,16 @@ def load_raw_video(
     if C is None:
         C = 1
 
-    # Determine size of one array item.
+    # Canonicalize dtype and determine bits per item.
     if dtype is None:
+        dtype = np.uint8
         bits_per_item = 8
     elif dtype == "uint12":
+        dtype = np.uint8
         bits_per_item = 12
     else:
-        bits_per_item = np.dtype(dtype).itemsize * 8
+        dtype = np.dtype(dtype)
+        bits_per_item = dtype.itemsize * 8
 
     # The number of frames T can be inferred from the file's size.
     max_bytes = os.path.getsize(path)

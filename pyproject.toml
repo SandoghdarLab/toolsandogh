@@ -20,6 +20,8 @@ dependencies = [
     "fsspec[fuse]",
     "imageio[ffmpeg]",
     "imgrvt",
+    "jax[cpu]",
+    "jaxtyping",
     "numpy",
     "ome-types",
     "pyarrow",
@@ -87,6 +89,8 @@ ignore = [
     "C901",   # Function too complex
     "E501",   # Line too long (handled by line-length)
     "E402",   # Module level import not at top of file (isort handles this)
+    "F722",   # Jaxtyping errors
+    "RET504", # Unnecessary assignment before return
     "TRY003", # Long message outside exception class
 ]
 unfixable = ["F821"] # Don't try to fix name definition
@@ -102,9 +106,6 @@ checks = [
 
 [tool.pyright]
 pythonVersion = "3.12"
-reportMissingImports = true
-reportUnusedImports = true
-reportUnusedVariables = true
 include = ["src"]
 exclude = [".venv"]
 venvPath = "."

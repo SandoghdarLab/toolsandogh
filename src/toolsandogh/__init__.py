@@ -6,9 +6,12 @@ Provided to you by the Sandoghdar Division of the Max Planck Institute for the P
 
 from ._canonicalize_video import canonicalize_video
 from ._generate_video import generate_video
+from ._link import link
 from ._load_video import load_video
+from ._locate import locate, locate_in_chunk
 from ._rolling import differential_rolling_average, rolling_average, rolling_sum
 from ._rvt import radial_variance_transform
+from ._simulate_particles import simulate_particles
 from ._simulate_psf import (
     Beam,
     Camera,
@@ -46,6 +49,9 @@ __all__: list[str] = [
     "dipole_lattice_ellipsoid",
     "dipole_lattice_sphere",
     "differential_rolling_average",
+    "link",
+    "locate",
+    "locate_in_chunk",
     "focused_incident_field",
     "generate_video",
     "image_field_from_pupil",
@@ -57,6 +63,7 @@ __all__: list[str] = [
     "rolling_average",
     "rolling_sum",
     "scattered_field",
+    "simulate_particles",
     "simulate_iscat",
     "simulate_iscat_stack",
     "store_video",

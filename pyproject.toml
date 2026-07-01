@@ -24,11 +24,11 @@ dependencies = [
     "jaxtyping",
     "numpy",
     "ome-types",
+    "polars>=1.0",
     "pyarrow",
     "scikit-image",
     "scipy",
     "tqdm",
-    "trackpy",
     "xarray",
 ]
 keywords = ["tools", "utilities", "python", "microscopy"]

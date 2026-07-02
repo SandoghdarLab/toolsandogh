@@ -61,11 +61,50 @@ toolsandogh/
 
 ## Coding Conventions
 
-### 1. Documentation -- numpydoc
+### 1. Coding Guidelines
+
+The following guidelines apply to all code in the toolsandogh package. They are intended to keep the codebase consistent, readable, and easy to maintain for both human contributors and AI assistants. Where a guideline and a deadline conflict, correctness always wins.
+
+#### 1.1 Naming and module layout
+
+* Use ``snake_case`` for functions and variables, ``PascalCase`` for classes, and ``UPPER_CASE`` for module-level constants.
+* Every module file name starts with an underscore (e.g. ``_locate.py``). Modules are private by default; only objects explicitly re-exported from ``toolsandogh/__init__.py`` form the public API. Importing from a private module directly is unsupported and may break without notice.
+* New code should live in a new module when it addresses a distinct concern; otherwise it belongs in the existing module that covers the same concern. As a guideline rather than a hard rule, prefer one file per feature or workflow stage.
+
+#### 1.2 Type hints
+
+* All public functions, methods, and class attributes carry full type hints. Private helpers may omit them only when the annotation would be redundant with the surrounding context.
+* Hints should be as specific as possible without becoming brittle: prefer ``Literal["r", "w"]`` over ``str`` for closed sets of options; prefer concrete container types over bare ``Any``; avoid ``Optional`` where ``X | None`` reads more clearly.
+* Document variance explicitly when it matters (e.g., on protocols or abstract base classes).
+
+#### 1.3 Inputs and outputs
+
+* Publicly visible functions should be liberal in what they accept and conservative in what they emit.
+* Accept the widest reasonable input: file paths, raw arrays, tuples, or plain lists where convenient, and let the function coerce them into the canonical representation.
+* Always emit stable, well-typed values (typically ``xarray.DataArray`` or ``polars.DataFrame``). Do not leak implementation types such as NumPy arrays or pandas DataFrames through the public API.
+
+#### 1.4 Data structures
+
+* Array data is encoded as ``xarray.DataArray``, ideally lazily backed by Dask so that operations stay parallel and out-of-core.
+* Tabular data is encoded as ``polars.DataFrame``.
+
+#### 1.5 Simplicity
+
+* Prefer free functions over classes. Functionality should be provided mainly through free functions, with classes reserved for genuine stateful objects.
+* Each function should have one clear purpose that can be summed up in a single-line docstring. If a function's purpose resists a one-line summary, it is probably doing too much.
+* Keep classes small and focused. Prefer composition over inheritance.
+
+#### 1.6 Error handling
+
+* Raise specific, informative exceptions that explain what went wrong and why. Include the offending value where helpful.
+* Never silently coerce types or swallow exceptions. A bare ``except`` or an unchecked type coercion hides bugs and should be avoided.
+* Validate inputs at the boundary of the public API; prefer explicit checks over defensive programming scattered through the internals.
+
+### 2. Documentation -- numpydoc
 
 All public objects (functions, classes, methods) must be documented using the **numpydoc** style. This format is machine-parsable (e.g., for Sphinx) and familiar to scientific Python users.
 
-#### 1.1 Required and optional sections
+#### 2.1 Required and optional sections
 
 Every public docstring must contain the following sections **in this exact order**. Optional sections may be omitted when they carry no content, but if present they must appear at the position shown:
 
@@ -82,7 +121,7 @@ Every public docstring must contain the following sections **in this exact order
 
 Do **not** invent sections outside this list (no *Todo*, no *Author*, no *Version*). Use the project changelog and metadata for that information.
 
-#### 1.2 Section headers
+#### 2.2 Section headers
 
 Each section header is a single line of the form
 
@@ -93,7 +132,7 @@ Parameters
 
 i.e. the title (capitalised as shown above, with the exact spelling and singular/plural form from the numpydoc spec) followed by a line of hyphens of matching length. Section titles are not underlined with ``=`` or ``~``. There is exactly one blank line before and after each header.
 
-#### 1.3 Parameters section
+#### 2.3 Parameters section
 
 * One entry per parameter, in the same order as the function signature.
 * Each entry begins with ``name`` followed by `` : `` and a type description, then a newline and an indented description.
@@ -102,33 +141,33 @@ i.e. the title (capitalised as shown above, with the exact spelling and singular
 * The description states the **default** in prose, e.g. "The default is ``3``." For boolean defaults, write the behaviour out: "If ``True`` (default), ...".
 * Parameters that accept ``*args`` / ``**kwargs`` are documented with the names ``*args`` and ``**kwargs`` respectively.
 
-#### 1.4 Returns section
+#### 2.4 Returns section
 
 * For a single return value: a type line, then an indented description. Do not invent a name.
 * For multiple named return values (e.g. a ``NamedTuple``), document each component with its name, type, and description, mirroring the Parameters layout.
 * If the function returns `None` as a meaningful sentinel, document it. If it returns nothing, the **Returns** section is omitted entirely.
 
-#### 1.5 Types and type hints
+#### 2.5 Types and type hints
 
 * Type hints live in the signature and should be as specific as possible. The docstring repeats the type in prose for the benefit of readers and Sphinx, but does not introduce new type information.
 * Use `Literal` types for closed sets of string options (e.g. ``Literal["r", "w"]``) and document the accepted values explicitly in the parameter description.
 * Write collection types out in prose (``list of str``) rather than ``list[str]`` in the docstring.
 
-#### 1.6 Cross-references and formatting
+#### 2.6 Cross-references and formatting
 
 * Use reST roles for cross-references: ``:func:`package.module.func``` for functions, ``:class:`package.module.Class``` for classes, ``:meth:`` for methods, ``:attr:`` for attributes, ``:mod:`` for modules. Always give the fully qualified path.
 * Inline code is written as double backticks (```` ``code`` ````), not single backticks.
 * Math may be written with ``:math:`expr``` inline or the ``.. math::`` directive for display equations.
 * Keep paragraphs wrapped at a reasonable column (around 79 characters) and separated by a single blank line.
 
-#### 1.7 Examples section
+#### 2.7 Examples section
 
 * Examples use the doctest ``>>>`` prompt and must be **runnable** in isolation (all imports shown, no reliance on prior cells).
 * Prefer showing the expected output as a comment or repr block, so the example doubles as a regression test when run with ``pytest --doctest-modules``.
 * Avoid side effects that modify global state or the filesystem. Where unavoidable, clean up within the example.
 * Each example should illustrate one feature; do not bundle unrelated demonstrations.
 
-#### 1.8 Comprehensive example
+#### 2.8 Comprehensive example
 
 ```python
 def median_filter(
@@ -190,26 +229,27 @@ def median_filter(
     # implementation follows ...
 ```
 
-### 2. Linting
+### 3. Testing
 
-Code must obey the following formatting rules (which are enforced by **ruff**):
+Tests live in ``src/toolsandogh/tests/`` and use **pytest** as the sole test runner. The project keeps the testing story simple: plain pytest tests, no property-based testing frameworks, no separate test harnesses.
 
-- No pycodestyle errors and warnings, i.e., full compliance with PEP-8
+#### 3.1 Test files and naming
 
-- No pyflakes errors
+* One test file per feature or workflow stage under test (e.g. ``test_locate.py``, ``test_link.py``, ``test_io.py``), mirroring the module layout.
+* Test functions are named ``test_<unit>_<scenario>`` so that names describe what is being verified and under which conditions (e.g. ``test_locate_empty_image_returns_empty_dataframe``).
+* Shared fixtures live in ``conftest.py``; keep fixtures small, focused, and reusable across files.
 
-- Imports must be sorted as with **isort**
+#### 3.2 Writing tests
 
-### 3. Coding Conventions
+* Write tests that exercise correctness, not coverage numbers. Coverage is a useful signal but never a goal in itself: a passing test that proves the right behaviour is worth more than a percentage point.
+* Cover edge cases explicitly: empty arrays, single-element arrays, NaN inputs, mismatched shapes, and boundary conditions.
+* Prefer deterministic inputs. Where randomness is unavoidable, set a fixed seed within the test so that runs are reproducible.
+* Exercise both lazy and computed paths where relevant: assert that an operation returns a lazy result and that calling ``.compute()`` produces the expected values.
 
-The following coding conventions apply to the toolsandogh code base:
+#### 3.3 Doctests
 
-- All functions, methods, and class attributes must have full type hints.  These type hints should be as specific as possible (e.g., `Literal["r", "w"]` instead of `str`)
+* Docstring examples (see section 2.7) double as regression tests when run with ``pytest --doctest-modules``. Keep them runnable in isolation and free of side effects that could break the suite.
 
-- Publicly visible functions should liberal in what inputs they accept, and conservative in what they emit.
+### 4. Linting
 
-- Simplicity is king.  Functionality should be provided mainly via free functions.  Each function should have a clear purpose that can be summed up in a one-line docstring.
-
-- Array data should be encoded as `xarray.DataArray`.  Tabular data should be encoded as `polars.DataFrame`.
-
-- Error handling should be rigorous.  Exceptions should provide a clear explanation of what went wrong and why.
+Formatting and import style are enforced by **ruff**, configured in ``pyproject.toml``. In short: code must be free of pycodestyle and pyflakes errors and follow PEP-8, with imports sorted as with **isort**. Refer to the ruff configuration for the authoritative list of rules.

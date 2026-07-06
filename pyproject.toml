@@ -5,7 +5,7 @@ description = "A collection of Python scripts for iSCAT microscopy data analysis
 authors = [{ name = "Marco Heisig", email = "marco.heisig@mpl.mpg.de" }]
 readme = "README.md"
 license = "GPL-3.0-or-later"
-requires-python = ">=3.11"
+requires-python = ">=3.12"
 dependencies = [
     "bioio>=3.4",
     "bioio-dv>=1.2",
@@ -25,9 +25,10 @@ dependencies = [
     "numpy>=2.0",
     "ome-types>=0.6",
     "polars>=1.0",
-    "pyarrow>=15.0",
+    "pyarrow>=16.0",
     "scikit-image>=0.23",
     "scipy>=1.13",
+    "tifffile>=2026.5",
     "tqdm>=4.66",
     "xarray>=2025.1",
 ]

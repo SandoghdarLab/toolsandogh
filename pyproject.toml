@@ -17,7 +17,7 @@ dependencies = [
     "bioio-tifffile>=1.3",
     "bioio-tiff-glob>=1.2",
     "dask>=2025.1",
-    "fsspec[fuse]>=2025.1",
+    "fsspec>=2025.1",
     "imageio[ffmpeg]>=2.37",
     "imgrvt>=1.0",
     "jax>=0.5.0",
@@ -40,7 +40,7 @@ Issues = "https://github.com/SandoghdarLab/toolsandogh/issues"
 [dependency-groups]
 dev = [
     "build>=1.2",
-    "ruff>=0.2",
+    "ruff>=0.15",
     "pre-commit>=3.7",
     "pyright[nodejs]>=1.1.400",
     "ty>=0.0.50",
@@ -101,7 +101,7 @@ checks = [
 ]
 
 [tool.pyright]
-pythonVersion = "3.12"
+pythonVersion = "3.11"
 include = ["src"]
 exclude = [".venv"]
 venvPath = "."

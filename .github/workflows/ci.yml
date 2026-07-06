@@ -1,0 +1,44 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # Run the full pre-commit suite (ruff, pyright, validate-pyproject, uv-lock,
+  # and the local pytest hook) exactly as developers do locally. Uses the
+  # committed uv.lock via --frozen, so any lockfile drift fails loudly.
+  pre-commit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+          python-version: "3.12"
+      - run: uv run --frozen pre-commit run --all-files --show-diff-on-failure
+
+  # Portability matrix: prove the declared floors and the latest versions both
+  # work across the supported Python versions and operating systems. Each cell
+  # re-resolves dependencies directly from pyproject.toml (--no-project bypasses
+  # uv.lock), so the lowest-direct cell exercises the real lower bounds.
+  test:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        python: ["3.11", "3.12", "3.13"]
+        resolution: [highest, lowest-direct]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+          python-version: ${{ matrix.python }}
+      - run: uv run --no-project --with-editable . --with "pytest>=8.0" --python ${{ matrix.python }} --resolution ${{ matrix.resolution }} pytest

@@ -3847,8 +3847,8 @@ dev = [
     { name = "python-lsp-server", specifier = ">=1.10" },
     { name = "rendercanvas", specifier = ">=2.2" },
     { name = "ruff", specifier = ">=0.15" },
-    { name = "setuptools", specifier = ">=69.1" },
-    { name = "setuptools-scm", specifier = ">=8.1" },
+    { name = "setuptools", specifier = ">=80" },
+    { name = "setuptools-scm", specifier = ">=8" },
     { name = "twine", specifier = ">=5.0" },
     { name = "ty", specifier = ">=0.0.50" },
 ]

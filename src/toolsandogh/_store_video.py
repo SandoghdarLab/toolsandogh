@@ -1,10 +1,10 @@
 import os
 import pathlib
-import shutil
 import subprocess
 import tempfile
 import urllib.parse
 
+import imageio_ffmpeg
 import numpy as np
 import numpy.typing as npt
 import xarray as xr
@@ -14,14 +14,10 @@ from bioio_ome_zarr.writers import OMEZarrWriter
 
 from ._canonicalize_video import canonicalize_video
 
-
-def _check_ffmpeg_installed() -> None:
-    """Ensure ffmpeg is installed and accessible."""
-    if shutil.which("ffmpeg") is None:
-        raise RuntimeError(
-            "ffmpeg is not installed or not found in PATH. "
-            "Please install ffmpeg to use video encoding features."
-        )
+# ffmpeg binary shipped by the `imageio-ffmpeg` wheel. Using this (rather than
+# shelling out to a bare `ffmpeg` on PATH) means users get a working ffmpeg on
+# every supported platform without a separate system install.
+_FFMPEG_EXE = imageio_ffmpeg.get_ffmpeg_exe()
 
 
 def store_video(video: npt.ArrayLike, path: str | os.PathLike, **kwargs) -> None:
@@ -117,9 +113,6 @@ def store_video_as_mp4(video: xr.DataArray, path: str | os.PathLike, fps: int = 
     fps : int
         The number of frames per second of the resulting mp4 video.
     """
-    # Check for ffmpeg availability
-    _check_ffmpeg_installed()
-
     # Stack T, C, and Z into a single Frame dimension
     data = video.stack(F=("T", "C", "Z")).transpose("F", "Y", "X")
 
@@ -158,7 +151,7 @@ def store_video_as_mp4(video: xr.DataArray, path: str | os.PathLike, fps: int = 
 
             # Run ffmpeg to concatenate
             concat_cmd = [
-                "ffmpeg",
+                _FFMPEG_EXE,
                 "-y",
                 "-f",
                 "concat",
@@ -219,7 +212,7 @@ def chunk_to_mp4(chunk: np.ndarray, path: str | os.PathLike, fps: int = 30) -> N
     pix_fmt = "gray8"
 
     ffmpeg_cmd = [
-        "ffmpeg",
+        _FFMPEG_EXE,
         "-y",
         "-f",
         "rawvideo",

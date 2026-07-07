@@ -3207,7 +3207,7 @@ requires-dist = [
     { name = "bioio-ome-zarr", specifier = ">=3.5" },
     { name = "bioio-tiff-glob", specifier = ">=1.2" },
     { name = "bioio-tifffile", specifier = ">=1.3" },
-    { name = "dask", specifier = ">=2025.1" },
+    { name = "dask", specifier = ">=2026.1" },
     { name = "fsspec", specifier = ">=2025.1" },
     { name = "imageio", extras = ["ffmpeg"], specifier = ">=2.37" },
     { name = "imgrvt", specifier = ">=1.0" },

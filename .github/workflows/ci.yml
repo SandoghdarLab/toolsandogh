@@ -70,4 +70,4 @@ jobs:
           restore-keys: |
             jax-cc-${{ runner.os }}-py${{ matrix.python }}-${{ matrix.resolution }}-
             jax-cc-${{ runner.os }}-py${{ matrix.python }}-
-      - run: uv run --no-project --with-editable . --with "pytest>=8.0" --with "pytest-timeout>=2.0" --python ${{ matrix.python }} --resolution ${{ matrix.resolution }} pytest --timeout=180 --timeout-method=thread -v --durations=20
+      - run: uv run --no-project --with-editable . --with "pytest>=8.0" --with "pytest-timeout>=2.4" --python ${{ matrix.python }} --resolution ${{ matrix.resolution }} pytest --timeout=180 --timeout-method=thread -v --durations=20

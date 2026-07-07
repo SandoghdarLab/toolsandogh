@@ -45,6 +45,11 @@ jobs:
     timeout-minutes: 8
     env:
       JAX_COMPILATION_CACHE_DIR: ~/.cache/jax-compilation-cache
+      # Self-diagnosing safety net for hangs: dump all thread stacks on
+      # SIGABRT/crash, and log every JAX JIT compilation with its timing so a
+      # stuck job shows exactly which compile/test was in flight.
+      PYTHONFAULTHANDLER: "1"
+      JAX_LOG_COMPILES: "1"
     strategy:
       fail-fast: false
       matrix:
@@ -65,4 +70,4 @@ jobs:
           restore-keys: |
             jax-cc-${{ runner.os }}-py${{ matrix.python }}-${{ matrix.resolution }}-
             jax-cc-${{ runner.os }}-py${{ matrix.python }}-
-      - run: uv run --no-project --with-editable . --with "pytest>=8.0" --python ${{ matrix.python }} --resolution ${{ matrix.resolution }} pytest
+      - run: uv run --no-project --with-editable . --with "pytest>=8.0" --with "pytest-timeout>=2.0" --python ${{ matrix.python }} --resolution ${{ matrix.resolution }} pytest --timeout=180 --timeout-method=thread -v --durations=20

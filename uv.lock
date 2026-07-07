@@ -3198,7 +3198,7 @@ requires-dist = [
     { name = "fsspec", specifier = ">=2025.1" },
     { name = "imageio", extras = ["ffmpeg"], specifier = ">=2.37" },
     { name = "imgrvt", specifier = ">=1.0" },
-    { name = "jax", specifier = ">=0.5.0" },
+    { name = "jax", specifier = ">=0.8.0" },
     { name = "jaxtyping", specifier = ">=0.3" },
     { name = "numpy", specifier = ">=2.0" },
     { name = "ome-types", specifier = ">=0.6" },

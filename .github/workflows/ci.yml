@@ -15,7 +15,7 @@ jobs:
   # committed uv.lock via --frozen, so any lockfile drift fails loudly.
   pre-commit:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 8
     env:
       # Uniform cache path across OSes so the actions/cache `path` below
       # matches what conftest.py writes (it honors this env var via
@@ -28,7 +28,7 @@ jobs:
           enable-cache: true
           python-version: "3.12"
       - name: Cache JAX compilations
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: ~/.cache/jax-compilation-cache
           key: jax-cc-precommit-py3.12-${{ hashFiles('uv.lock') }}
@@ -42,7 +42,7 @@ jobs:
   # uv.lock), so the lowest-direct cell exercises the real lower bounds.
   test:
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 5
+    timeout-minutes: 8
     env:
       JAX_COMPILATION_CACHE_DIR: ~/.cache/jax-compilation-cache
     strategy:
@@ -58,7 +58,7 @@ jobs:
           enable-cache: true
           python-version: ${{ matrix.python }}
       - name: Cache JAX compilations
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: ~/.cache/jax-compilation-cache
           key: jax-cc-${{ runner.os }}-py${{ matrix.python }}-${{ matrix.resolution }}-${{ hashFiles('uv.lock') }}

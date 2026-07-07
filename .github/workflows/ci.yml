@@ -15,12 +15,25 @@ jobs:
   # committed uv.lock via --frozen, so any lockfile drift fails loudly.
   pre-commit:
     runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      # Uniform cache path across OSes so the actions/cache `path` below
+      # matches what conftest.py writes (it honors this env var via
+      # expanduser). Local dev uses the platform-canonical default instead.
+      JAX_COMPILATION_CACHE_DIR: ~/.cache/jax-compilation-cache
     steps:
       - uses: actions/checkout@main
       - uses: astral-sh/setup-uv@d31148d669074a8d0a63714ba94f3201e7020bc3
         with:
           enable-cache: true
           python-version: "3.12"
+      - name: Cache JAX compilations
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/jax-compilation-cache
+          key: jax-cc-precommit-py3.12-${{ hashFiles('uv.lock') }}
+          restore-keys: |
+            jax-cc-precommit-py3.12-
       - run: uv run --frozen pre-commit run --all-files --show-diff-on-failure
 
   # Portability matrix: prove the declared floors and the latest versions both
@@ -29,6 +42,9 @@ jobs:
   # uv.lock), so the lowest-direct cell exercises the real lower bounds.
   test:
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 5
+    env:
+      JAX_COMPILATION_CACHE_DIR: ~/.cache/jax-compilation-cache
     strategy:
       fail-fast: false
       matrix:
@@ -41,4 +57,12 @@ jobs:
         with:
           enable-cache: true
           python-version: ${{ matrix.python }}
+      - name: Cache JAX compilations
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/jax-compilation-cache
+          key: jax-cc-${{ runner.os }}-py${{ matrix.python }}-${{ matrix.resolution }}-${{ hashFiles('uv.lock') }}
+          restore-keys: |
+            jax-cc-${{ runner.os }}-py${{ matrix.python }}-${{ matrix.resolution }}-
+            jax-cc-${{ runner.os }}-py${{ matrix.python }}-
       - run: uv run --no-project --with-editable . --with "pytest>=8.0" --python ${{ matrix.python }} --resolution ${{ matrix.resolution }} pytest

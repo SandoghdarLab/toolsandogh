@@ -50,6 +50,22 @@ jobs:
       # stuck job shows exactly which compile/test was in flight.
       PYTHONFAULTHANDLER: "1"
       JAX_LOG_COMPILES: "1"
+      # H1 experiment: pin BLAS/LAPACK thread pools to 1 for the CPU test
+      # cells. The (ubuntu, 3.13, lowest-direct) cell deadlocks inside
+      # np.asarray(p) after a jax.scipy.linalg.solve on a complex matrix,
+      # with every other thread idle. Hypothesis: the cp313 jaxlib 0.10.2
+      # wheel's bundled OpenBLAS deadlocks when its worker pool coexists
+      # with the leftover dask/asyncio thread pools from the io tests.
+      # Pinning the BLAS pools to 1 removes the reentrant-pool path; the
+      # hot op is a 2715^2 LU so the single-threaded cost is negligible.
+      # NOTE: XLA_FLAGS=--xla_cpu_multi_threaded=false was tried and
+      # rejected -- it crashes this jaxlib build locally (hard abort at
+      # the first jax-using test, exit 1, no traceback), so it is not
+      # included here. The deadlock does not reproduce on a 32- or 2-core
+      # dev box, so CI is the only place this can be judged.
+      OMP_NUM_THREADS: "1"
+      OPENBLAS_NUM_THREADS: "1"
+      MKL_NUM_THREADS: "1"
     strategy:
       fail-fast: false
       matrix:

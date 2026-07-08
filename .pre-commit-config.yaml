@@ -16,35 +16,37 @@ repos:
   hooks:
     - id: uv-lock
 
-- repo: https://github.com/astral-sh/ruff-pre-commit
-  rev: v0.15.20
-  hooks:
-    - id: ruff-check
-      args: [ --fix ]
-    - id: ruff-format
-
-# - repo: https://github.com/numpy/numpydoc
-#   rev: v1.10.0
-#   hooks:
-#     - id: numpydoc-validation
-
 - repo: https://github.com/abravalheri/validate-pyproject
   rev: v0.25
   hooks:
     - id: validate-pyproject
       additional_dependencies: ["validate-pyproject-schema-store[all]"]
 
-- repo: https://github.com/RobertCraigie/pyright-python
-  rev: v1.1.411
-  hooks:
-    - id: pyright
-
 - repo: local
   hooks:
-  - id: pytest
-    name: pytest
-    entry: uv run ./.venv/bin/pytest
-    language: system
-    types: [python]
-    pass_filenames: false
-    always_run: true
+    - id: ruff-check
+      name: ruff check
+      entry: uv run ruff check --fix --exit-non-zero-on-fix
+      language: system
+      types: [python]
+      require_serial: true
+    - id: ruff-format
+      name: ruff format
+      entry: uv run ruff format
+      language: system
+      types: [python]
+      require_serial: true
+    - id: pyright
+      name: pyright
+      entry: uv run pyright
+      language: system
+      types: [python]
+      pass_filenames: false
+      always_run: true
+    - id: pytest
+      name: pytest
+      entry: uv run pytest
+      language: system
+      types: [python]
+      pass_filenames: false
+      always_run: true

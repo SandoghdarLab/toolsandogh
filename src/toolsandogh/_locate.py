@@ -9,7 +9,6 @@ contrasts, and per-emitter statistics.  The auxiliary function
 Y, X)``.
 """
 
-import functools
 from typing import Callable, Literal
 
 import jax
@@ -360,7 +359,7 @@ def _detect_peaks_one_frame(
             (1, 1, 1),
             "same",
         )
-        is_peak = (score == local_ext) & (score > float(min_contrast))
+        is_peak = (score == local_ext) & (score > min_contrast)
     elif sign == "negative":
         local_ext = jax.lax.reduce_window(
             score,
@@ -370,7 +369,7 @@ def _detect_peaks_one_frame(
             (1, 1, 1),
             "same",
         )
-        is_peak = (score == local_ext) & (score < -float(min_contrast))
+        is_peak = (score == local_ext) & (score < -min_contrast)
     else:  # "both"
         local_max = jax.lax.reduce_window(
             score,
@@ -388,8 +387,8 @@ def _detect_peaks_one_frame(
             (1, 1, 1),
             "same",
         )
-        is_pos = (score == local_max) & (score > float(min_contrast))
-        is_neg = (score == local_min) & (score < -float(min_contrast))
+        is_pos = (score == local_max) & (score > min_contrast)
+        is_neg = (score == local_min) & (score < -min_contrast)
         is_peak = is_pos | is_neg
 
     coords = jnp.argwhere(is_peak)  # (n, 3)
@@ -444,6 +443,7 @@ def _extract_stamp(
 # ---------------------------------------------------------------------------
 
 
+@jax.jit(static_argnames=["iterations"])
 def _fit_emitters_batch(
     stamps: Float[Array, "n Pz Py Px"],
     psf: Float[Array, "Pz Py Px"],
@@ -529,7 +529,6 @@ def _make_shifted_psf_2d(
     return shifted_psf, 2
 
 
-@functools.partial(jax.jit, static_argnames=("iterations", "is_3d"))
 def _fit_one_emitter(
     stamp: Float[Array, "Pz Py Px"],
     psf: Float[Array, "Pz Py Px"],

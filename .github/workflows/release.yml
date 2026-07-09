@@ -28,7 +28,7 @@ jobs:
           enable-cache: true
           python-version: "3.12"
       - run: uv build -o dist
-      - uses: actions/upload-artifact@v6
+      - uses: actions/upload-artifact@v7
         with:
           name: dist
           path: dist/
@@ -46,7 +46,7 @@ jobs:
       id-token: write   # PyPI Trusted Publishing (OIDC)
       contents: write   # create GitHub Release
     steps:
-      - uses: actions/download-artifact@v6
+      - uses: actions/download-artifact@v8
         with:
           name: dist
           path: dist/

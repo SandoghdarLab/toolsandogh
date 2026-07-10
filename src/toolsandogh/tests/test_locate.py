@@ -547,3 +547,95 @@ def test_locate_anisotropic_psf() -> None:
     # Sign of the contrasts must be preserved.
     assert a0 > 0
     assert a1 < 0
+
+
+def test_locate_auto_chunk_is_default() -> None:
+    """The default ``chunk_size`` must be ``"auto"``."""
+    import inspect
+
+    sig = inspect.signature(tog.locate)
+    assert sig.parameters["chunk_size"].default == "auto"
+
+
+def test_locate_auto_chunk_matches_explicit() -> None:
+    """``chunk_size="auto"`` must produce the same result as an explicit size.
+
+    Detection and fitting are per-frame and per-emitter, so the result is
+    independent of the chunking; the driver streams each chunk through the
+    same code path.  Agreement holds to float32 precision (batched-FFT
+    reduction order differs slightly from per-frame).
+    """
+    psf = _gaussian_psf(1.5, 9).reshape(1, 9, 9)
+    n_frames = 24
+    cy, cx = 8.5, 8.5
+    radius = 2.5
+    t = np.arange(n_frames)
+    theta = 2.0 * np.pi * t / n_frames
+    trajectories = polars.DataFrame(
+        {
+            "t": t.tolist(),
+            "c": [0] * n_frames,
+            "z": [0.0] * n_frames,
+            "y": (cy + radius * np.cos(theta)).tolist(),
+            "x": (cx + radius * np.sin(theta)).tolist(),
+            "contrast": [2.0] * n_frames,
+            "particle_id": [0] * n_frames,
+        }
+    )
+    video = tog.simulate_particles(
+        trajectories,
+        psf,
+        shape=(n_frames, 1, 1, 18, 18),
+        noise_sigma=0.02,
+        seed=0,
+        dtype=np.float32,
+    )
+    common = {
+        "min_distance": 4,
+        "min_contrast": 0.2,
+        "iterations": 10,
+        "atol": 1e-3,
+    }
+    auto = tog.locate(video, psf, chunk_size="auto", **common).sort("t", "y", "x")
+    explicit = tog.locate(video, psf, chunk_size=1, **common).sort("t", "y", "x")
+    explicit4 = tog.locate(video, psf, chunk_size=4, **common).sort("t", "y", "x")
+    # Same number of detections and identical coordinates and fits.
+    assert auto.shape[0] == explicit.shape[0] == explicit4.shape[0] == n_frames
+    np.testing.assert_allclose(auto["y"].to_numpy(), explicit["y"].to_numpy(), rtol=1e-4)
+    np.testing.assert_allclose(auto["x"].to_numpy(), explicit["x"].to_numpy(), rtol=1e-4)
+    np.testing.assert_allclose(
+        auto["contrast"].to_numpy(), explicit["contrast"].to_numpy(), rtol=1e-4
+    )
+    np.testing.assert_allclose(auto["y"].to_numpy(), explicit4["y"].to_numpy(), rtol=1e-4)
+
+
+def test_resolve_chunk_size_auto() -> None:
+    """``"auto"`` derives a memory-bounded chunk size from the frame shape."""
+    from toolsandogh._locate import _MAX_CHUNK_BYTES, _resolve_chunk_size
+
+    itemsize = np.dtype(np.float32).itemsize
+    # Tiny frame: the budget admits more frames than exist, so use them all.
+    assert _resolve_chunk_size("auto", 24, (1, 18, 18), itemsize) == 24
+    # Huge 3D frame (200 x 2048 x 2048): a single frame already exceeds the
+    # budget, so floor at one frame per chunk.
+    big = _resolve_chunk_size("auto", 50, (200, 2048, 2048), itemsize)
+    assert big == 1
+    # The budget term matches the documented 3x working-set approximation.
+    frame_bytes = 128 * 128 * itemsize
+    expected = _MAX_CHUNK_BYTES // (3 * frame_bytes)
+    assert _resolve_chunk_size("auto", 10**9, (1, 128, 128), itemsize) == expected
+
+
+def test_resolve_chunk_size_explicit_and_invalid() -> None:
+    """Explicit sizes are capped at ``n_frames``; bad values raise."""
+    from toolsandogh._locate import _resolve_chunk_size
+
+    itemsize = np.dtype(np.float32).itemsize
+    assert _resolve_chunk_size(8, 5, (1, 10, 10), itemsize) == 5
+    assert _resolve_chunk_size(4, 20, (1, 10, 10), itemsize) == 4
+    with pytest.raises(ValueError, match="chunk_size"):
+        _resolve_chunk_size(0, 20, (1, 10, 10), itemsize)
+    with pytest.raises(ValueError, match="chunk_size"):
+        _resolve_chunk_size(-2, 20, (1, 10, 10), itemsize)
+    with pytest.raises(ValueError, match="chunk_size"):
+        _resolve_chunk_size("weird", 20, (1, 10, 10), itemsize)  # type: ignore

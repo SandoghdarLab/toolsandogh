@@ -80,8 +80,8 @@ The following guidelines apply to all code in the toolsandogh package. They are 
 #### 1.3 Inputs and outputs
 
 * Publicly visible functions should be liberal in what they accept and conservative in what they emit.
-* Accept the widest reasonable input: file paths, raw arrays, tuples, or plain lists where convenient, and let the function coerce them into the canonical representation.
-* Always emit stable, well-typed values (typically ``xarray.DataArray`` or ``polars.DataFrame``). Do not leak implementation types such as NumPy arrays or pandas DataFrames through the public API.
+* Accept the widest reasonable input: file paths, raw arrays, tuples, or plain lists where convenient, and let the function coerce them into the canonical representation.  We achieve this by defining, for each concept or data structure ``foo``, a function ``canonicalize_foo`` that turns a wide range of ``foo``-like objects into canonical ``foo`` objects.
+* Always emit stable, well-typed values (typically ``xarray.DataArray`` or ``polars.DataFrame``).
 
 #### 1.4 Data structures
 
@@ -98,6 +98,7 @@ The following guidelines apply to all code in the toolsandogh package. They are 
 
 * Raise specific, informative exceptions that explain what went wrong and why. Include the offending value where helpful.
 * Never silently coerce types or swallow exceptions. A bare ``except`` or an unchecked type coercion hides bugs and should be avoided.
+* Explicitly check invariants whenever sensible.  In particular, whenever an object is expected to have some non-trivial property ``foo``, define a function ``validate_foo`` that raises appropriate errors unless its argument has that property.
 * Validate inputs at the boundary of the public API; prefer explicit checks over defensive programming scattered through the internals.
 
 ### 2. Documentation -- numpydoc

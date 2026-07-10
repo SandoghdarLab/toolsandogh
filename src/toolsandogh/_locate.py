@@ -27,6 +27,14 @@ from ._canonicalize_video import canonicalize_video
 # Public API
 # ---------------------------------------------------------------------------
 
+# Fixed, reproducible device-memory budget for a single chunk when
+# ``chunk_size="auto"``.  The per-chunk working set is approximated as three
+# times the frame size (data plus matched-filter scores plus the boolean
+# peak mask); the auto chunk size is ``budget // (3 * frame_bytes)``.  The
+# value is hard-coded (not probed from the device) so that runs are
+# reproducible across machines.
+_MAX_CHUNK_BYTES = 1 << 30  # 1 GiB
+
 
 def locate(
     video: xr.DataArray,
@@ -34,7 +42,7 @@ def locate(
     *,
     channel: int | str | float | None = None,
     starting_frame: int = 0,
-    chunk_size: int = 1,
+    chunk_size: int | Literal["auto"] = "auto",
     min_distance: int = 3,
     min_contrast: float = 0.0,
     sign: Literal["both", "positive", "negative"] = "both",
@@ -67,8 +75,13 @@ def locate(
         Frame index of the first frame of the video.  Used to populate
         the ``t`` column when concatenating results from multiple
         videos.
-    chunk_size : int
-        Number of frames per Dask block.
+    chunk_size : int or {"auto"}, optional
+        Number of frames processed per chunk.  Larger chunks reduce
+        dispatch and synchronization overhead; smaller chunks bound peak
+        device memory.  If ``"auto"`` (the default), the size is derived
+        from a fixed, reproducible device-memory budget so that the
+        per-chunk working set (data plus matched-filter scores and the
+        boolean peak mask) stays under roughly 1 GiB.
     min_distance : int
         Minimum separation (in pixels) between two detected peaks.
         Pixels closer than ``min_distance`` to a stronger peak are
@@ -126,13 +139,21 @@ def locate(
 
     # Restrict to the chosen channel and chunk along the time axis.
     n_frames = int(video.sizes["T"])
-    video = video.chunk({"T": min(chunk_size, n_frames)})
+    frame_shape = (
+        int(video.sizes["Z"]),
+        int(video.sizes["Y"]),
+        int(video.sizes["X"]),
+    )
+    chunk_axis = _resolve_chunk_size(chunk_size, n_frames, frame_shape, np.dtype(dtype).itemsize)
+    video = video.chunk({"T": chunk_axis})
 
-    # Walk the blocks and accumulate the per-chunk results.
+    # Walk the blocks and accumulate the per-chunk results.  Each chunk is
+    # computed independently from the Dask array, so only one chunk's data
+    # is held in memory at a time.
     psf_jax = jnp.asarray(psf_arr, dtype=dtype)
     results: list[polars.DataFrame] = []
-    for start in range(0, n_frames, chunk_size):
-        end = min(start + chunk_size, n_frames)
+    for start in range(0, n_frames, chunk_axis):
+        end = min(start + chunk_axis, n_frames)
         block: xr.DataArray = video.isel(T=slice(start, end))
         chunk = jnp.asarray(block.data.compute(), dtype=dtype)
         results.append(
@@ -219,40 +240,37 @@ def locate_in_chunk(
     if Pz > Z and Z > 1:
         raise ValueError(f"PSF Z size {Pz} must not exceed data Z size {Z}.")
 
-    # 1. Matched-filter score for every frame.
-    scores = _matched_filter_batch(psf, chunk)  # (B, Z, Y, X)
+    # 1+2. Fused matched-filter score and non-maximum-suppression peak
+    #      mask.  A single JIT kernel produces the boolean (B, Z, Y, X) peak
+    #      mask for the whole chunk; one eager ``argwhere`` then yields the
+    #      integer coordinates of every detection -- a single host sync per
+    #      chunk instead of one per frame.
+    is_peak = _peak_mask_batch(
+        chunk,
+        psf,
+        min_distance=min_distance,
+        min_contrast=min_contrast,
+        sign=sign,
+    )  # (B, Z, Y, X)
 
-    # 2. Per-frame peak detection (eager Python loop over frames).
-    rows_t: list[int] = []
-    rows_z: list[int] = []
-    rows_y: list[int] = []
-    rows_x: list[int] = []
-    rows_score: list[float] = []
-    for b in range(B):
-        coords, peak_scores = _detect_peaks_one_frame(
-            scores[b],
-            min_distance=min_distance,
-            min_contrast=min_contrast,
-            sign=sign,
-        )
-        for (zi, yi, xi), score in zip(coords, peak_scores):
-            rows_t.append(b)
-            rows_z.append(int(zi))
-            rows_y.append(int(yi))
-            rows_x.append(int(xi))
-            rows_score.append(float(score))
-
-    if not rows_t:
+    coords = jnp.argwhere(is_peak)  # (n, 4) -> [b, z, y, x]
+    # ``argwhere``'s output size is data-dependent, so reading the
+    # shape forces one host sync.  Materialize the whole array at once
+    # and slice in NumPy from here on -- no further device round-trips.
+    coords_np = np.asarray(coords)
+    n_emitters = int(coords_np.shape[0])
+    if n_emitters == 0:
         return _empty_result(channel=channel)
 
-    # 3. Fit each emitter.
-    n_emitters = len(rows_t)
-    stamps = jnp.stack(
-        [
-            _extract_stamp(chunk[b], rows_z[i], rows_y[i], rows_x[i], (Pz, Py, Px))
-            for i, b in enumerate(rows_t)
-        ]
-    )
+    b_idx = np.ascontiguousarray(coords_np[:, 0], dtype=np.int32)
+    rows_z = np.ascontiguousarray(coords_np[:, 1], dtype=np.int32)
+    rows_y = np.ascontiguousarray(coords_np[:, 2], dtype=np.int32)
+    rows_x = np.ascontiguousarray(coords_np[:, 3], dtype=np.int32)
+
+    # 3. Batched stamp extraction: pad the whole chunk once, then read every
+    #    stamp with a single advanced-indexing gather (one device dispatch for
+    #    all emitters, instead of one eager pad+slice per emitter).
+    stamps = _extract_stamps_batch(chunk, b_idx, rows_z, rows_y, rows_x, (Pz, Py, Px))
 
     fit = _fit_emitters_batch(
         stamps,
@@ -262,22 +280,33 @@ def locate_in_chunk(
     )
 
     # 4. Compose the output table.
-    t_col = np.asarray(rows_t, dtype=np.int32) + np.int32(starting_frame)
+    t_col = b_idx + np.int32(starting_frame)
     c_scalar, c_dtype = _channel_scalar_and_dtype(channel)
 
-    # Subpixel-refined positions: integer peak + subpixel offset.
-    z_offsets = np.asarray(fit["z_offset"], dtype=np.float32)
-    y_offsets = np.asarray(fit["y_offset"], dtype=np.float32)
-    x_offsets = np.asarray(fit["x_offset"], dtype=np.float32)
-    z_col = (np.asarray(rows_z, dtype=np.float32) + z_offsets).astype(np.float32)
-    y_col = (np.asarray(rows_y, dtype=np.float32) + y_offsets).astype(np.float32)
-    x_col = (np.asarray(rows_x, dtype=np.float32) + x_offsets).astype(np.float32)
-
-    contrast_col = np.asarray(fit["contrast"], dtype=np.float32)
-    mass_col = np.asarray(fit["mass"], dtype=np.float32)
-    chi2_col = np.asarray(fit["chi2"], dtype=np.float32)
+    # Pull every fitted scalar off the device in a single sync: stack the
+    # per-emitter float outputs into one (k, n) array and read it back once.
+    fit_stack = jnp.stack(
+        [
+            fit["z_offset"],
+            fit["y_offset"],
+            fit["x_offset"],
+            fit["contrast"],
+            fit["mass"],
+            fit["chi2"],
+        ]
+    )  # (6, n)
+    fit_np = np.asarray(fit_stack, dtype=np.float32)
+    z_offsets, y_offsets, x_offsets = fit_np[0], fit_np[1], fit_np[2]
+    contrast_col = np.ascontiguousarray(fit_np[3])
+    mass_col = np.ascontiguousarray(fit_np[4])
+    chi2_col = np.ascontiguousarray(fit_np[5])
     n_iter_col = np.full(n_emitters, np.int32(iterations), dtype=np.int32)
     converged_col = np.asarray(fit["converged"], dtype=bool)
+
+    # Subpixel-refined positions: integer peak + subpixel offset.
+    z_col = (rows_z.astype(np.float32) + z_offsets).astype(np.float32)
+    y_col = (rows_y.astype(np.float32) + y_offsets).astype(np.float32)
+    x_col = (rows_x.astype(np.float32) + x_offsets).astype(np.float32)
 
     snr_col: list[float | None] = [None] * n_emitters
 
@@ -312,130 +341,102 @@ def locate_in_chunk(
 
 
 # ---------------------------------------------------------------------------
-# Matched filter
+# Matched filter + non-maximum suppression (fused, batched over frames)
 # ---------------------------------------------------------------------------
 
 
-@jax.jit
-def _matched_filter_batch(
-    psf: Float[Array, "Z Y X"],
+@jax.jit(static_argnames=["min_distance", "sign"])
+def _peak_mask_batch(
     chunk: Float[Array, "B Z Y X"],
-) -> Float[Array, "B Z Y X"]:
-    """Compute the matched-filter score for every frame in ``chunk``."""
-    return jax.vmap(lambda frame: jsignal.correlate(frame, psf, mode="same", method="fft"))(chunk)
-
-
-# ---------------------------------------------------------------------------
-# Peak detection (non-maximum suppression)
-# ---------------------------------------------------------------------------
-
-
-def _detect_peaks_one_frame(
-    score: Float[Array, "Z Y X"],
+    psf: Float[Array, "Pz Py Px"],
     *,
     min_distance: int,
     min_contrast: float,
     sign: Literal["both", "positive", "negative"],
-) -> tuple[Float[Array, "n 3"], Float[Array, " n"]]:
+) -> Float[Array, "B Z Y X"]:
     """
-    Find local extrema in a single score map.
+    Compute the matched-filter score and the boolean peak mask for every
+    frame in ``chunk`` in a single JIT kernel.
 
-    Returns the integer coordinates of each peak and the corresponding
-    matched-filter score at that pixel.
-
-    This function is eager: ``jnp.argwhere`` returns a variable-size
-    output that is incompatible with tracing, and the per-frame work
-    is dominated by the matched filter and the Levenberg--Marquardt
-    fit.
+    The non-maximum-suppression window has extent ``1`` along the frame
+    axis so that detections never bleed across frames; the spatial window
+    is ``(2*min_distance+1)**3``, matching the previous per-frame logic.
     """
-    window = 2 * int(min_distance) + 1
+    scores = jax.vmap(lambda frame: jsignal.correlate(frame, psf, mode="same", method="fft"))(chunk)
+
+    window = (1, 2 * min_distance + 1, 2 * min_distance + 1, 2 * min_distance + 1)
+    strides = (1, 1, 1, 1)
 
     if sign == "positive":
-        local_ext = jax.lax.reduce_window(
-            score,
-            -jnp.inf,
-            jax.lax.max,
-            (window, window, window),
-            (1, 1, 1),
-            "same",
-        )
-        is_peak = (score == local_ext) & (score > min_contrast)
+        local_ext = jax.lax.reduce_window(scores, -jnp.inf, jax.lax.max, window, strides, "same")
+        is_peak = (scores == local_ext) & (scores > min_contrast)
     elif sign == "negative":
-        local_ext = jax.lax.reduce_window(
-            score,
-            jnp.inf,
-            jax.lax.min,
-            (window, window, window),
-            (1, 1, 1),
-            "same",
-        )
-        is_peak = (score == local_ext) & (score < -min_contrast)
+        local_ext = jax.lax.reduce_window(scores, jnp.inf, jax.lax.min, window, strides, "same")
+        is_peak = (scores == local_ext) & (scores < -min_contrast)
     else:  # "both"
-        local_max = jax.lax.reduce_window(
-            score,
-            -jnp.inf,
-            jax.lax.max,
-            (window, window, window),
-            (1, 1, 1),
-            "same",
-        )
-        local_min = jax.lax.reduce_window(
-            score,
-            jnp.inf,
-            jax.lax.min,
-            (window, window, window),
-            (1, 1, 1),
-            "same",
-        )
-        is_pos = (score == local_max) & (score > min_contrast)
-        is_neg = (score == local_min) & (score < -min_contrast)
+        local_max = jax.lax.reduce_window(scores, -jnp.inf, jax.lax.max, window, strides, "same")
+        local_min = jax.lax.reduce_window(scores, jnp.inf, jax.lax.min, window, strides, "same")
+        is_pos = (scores == local_max) & (scores > min_contrast)
+        is_neg = (scores == local_min) & (scores < -min_contrast)
         is_peak = is_pos | is_neg
 
-    coords = jnp.argwhere(is_peak)  # (n, 3)
-    scores = score[coords[:, 0], coords[:, 1], coords[:, 2]]
-    return coords, scores
+    return is_peak
 
 
 # ---------------------------------------------------------------------------
-# Stamp extraction
+# Stamp extraction (batched)
 # ---------------------------------------------------------------------------
 
 
-def _extract_stamp(
-    frame: Float[Array, "Z Y X"],
-    z: int,
-    y: int,
-    x: int,
+def _extract_stamps_batch(
+    chunk: Float[Array, "B Z Y X"],
+    b_idx: npt.NDArray[np.int32],
+    z_idx: npt.NDArray[np.int32],
+    y_idx: npt.NDArray[np.int32],
+    x_idx: npt.NDArray[np.int32],
     shape: tuple[int, int, int],
-) -> Float[Array, "Pz Py Px"]:
+) -> Float[Array, "n Pz Py Px"]:
     """
-    Extract a stamp of ``shape`` centered on ``(z, y, x)`` from ``frame``.
+    Extract every emitter stamp in a single batched gather.
 
-    Out-of-bounds positions are filled with the edge value of the
-    frame.  The stamp's index ``(Pz//2, Py//2, Px//2)`` corresponds
-    to the frame position ``(z, y, x)``.
+    The whole ``chunk`` is edge-padded once along the spatial axes; each
+    stamp of ``shape`` centered on ``(z, y, x)`` is then read out with a
+    single advanced-indexing gather.  This replaces the previous Python
+    loop that re-padded a full frame per emitter.
+
+    The stamp's index ``(Pz//2, Py//2, Px//2)`` corresponds to the frame
+    position ``(z, y, x)``; out-of-bounds positions are filled with the
+    edge value of the frame.
     """
     Pz, Py, Px = shape
     half_z, half_y, half_x = Pz // 2, Py // 2, Px // 2
+    n = b_idx.shape[0]
 
-    # Pad the frame with edge values.
+    # Pad the spatial axes of the whole chunk once.  Because
+    # ``half_z == Pz // 2`` (etc.), a stamp centred on frame position
+    # ``(z, y, x)`` starts at padded position ``(z, y, x)``.
     padded = jnp.pad(
-        frame,
-        ((half_z, Pz - half_z - 1), (half_y, Py - half_y - 1), (half_x, Px - half_x - 1)),
+        chunk,
+        (
+            (0, 0),
+            (half_z, Pz - half_z - 1),
+            (half_y, Py - half_y - 1),
+            (half_x, Px - half_x - 1),
+        ),
         mode="edge",
     )
 
-    # The stamp's centre (at index (Pz//2, Py//2, Px//2)) should land
-    # on the padded position that corresponds to the frame position
-    # (z, y, x).  Since the frame starts at padded position
-    # (half_z, half_y, half_x), the frame position (z, y, x) sits at
-    # padded (z + half_z, y + half_y, x + half_x).  The stamp's centre
-    # is Pz//2 and Py//2 in from the top-left of the stamp, so the
-    # top-left of the stamp is at:
-    z_p = z + half_z - Pz // 2
-    y_p = y + half_y - Py // 2
-    x_p = x + half_x - Px // 2
-    return jax.lax.dynamic_slice(padded, (z_p, y_p, x_p), (Pz, Py, Px))
+    # Read every stamp with a single advanced-indexing gather.  The index
+    # arrays are built in NumPy (cheap) so the only JAX dispatch here is the
+    # gather itself -- no ``vmap`` tracing, which matters when a chunk holds
+    # only a handful of emitters.  All indices stay in range because the
+    # padding above guarantees ``padded`` is large enough along every axis.
+    oz, oy, ox = np.mgrid[:Pz, :Py, :Px]
+    b_g = np.broadcast_to(b_idx[:, None, None, None], (n, Pz, Py, Px))
+    z_g = z_idx[:, None, None, None] + oz[None]
+    y_g = y_idx[:, None, None, None] + oy[None]
+    x_g = x_idx[:, None, None, None] + ox[None]
+    return padded[jnp.asarray(b_g), jnp.asarray(z_g), jnp.asarray(y_g), jnp.asarray(x_g)]
 
 
 # ---------------------------------------------------------------------------
@@ -583,23 +584,34 @@ def _fit_one_emitter(
     shift0 = jnp.zeros(n_shift, dtype=stamp.dtype)
     params0 = jnp.concatenate([jnp.array([amp0, bg0], dtype=stamp.dtype), shift0])
 
+    def residual(params: Float[Array, " n_params"]) -> Float[Array, " m"]:
+        return (stamp - model(params)).ravel()
+
     def cost(params: Float[Array, " n_params"]) -> Float[Array, ""]:
-        r = (stamp - model(params)).ravel()
+        r = residual(params)
         return 0.5 * jnp.sum(r * r)
 
     # Fixed-length Levenberg--Marquardt scan.  Every emitter runs the
     # same number of iterations, which keeps the ``vmap`` over
     # emitters happy.
+    #
+    # The normal equations use the Gauss--Newton approximation
+    # ``J^T J`` of the Hessian, with ``J = jacfwd(residual)``.  For only
+    # 4--5 parameters, forward-mode AD over the residual is far cheaper
+    # than ``jax.hessian``'s reverse-over-reverse pass, and Gauss--Newton
+    # is the standard model for least-squares refinement of a PSF.
     lambda0 = jnp.array(1e-3, dtype=stamp.dtype)
 
     def lm_step(carry, _):
         params, lambda_, prev_cost, _prev_delta_max = carry
 
-        _, grad = jax.value_and_grad(cost)(params)
-        hess = jax.hessian(cost)(params)
+        r = residual(params)
+        jac = jax.jacfwd(residual)(params)  # (m, n_params)
+        jtj = jac.T @ jac  # (n_params, n_params)
+        grad = jac.T @ r  # gradient of 0.5 * ||r||^2
 
-        diag_h = jnp.diag(hess)
-        damped = hess + lambda_ * jnp.diag(diag_h)
+        diag_h = jnp.diag(jtj)
+        damped = jtj + lambda_ * jnp.diag(diag_h)
         delta = jnp.linalg.solve(damped, -grad)
         new_params = params + delta
         new_cost = cost(new_params)
@@ -721,3 +733,34 @@ def _empty_result(channel: int | str | float = 0) -> polars.DataFrame:
             "converged": polars.Boolean,
         },
     ).with_columns(polars.lit(c_scalar).alias("c"))
+
+
+def _resolve_chunk_size(
+    chunk_size: int | Literal["auto"],
+    n_frames: int,
+    frame_shape: tuple[int, int, int],
+    itemsize: int,
+) -> int:
+    """
+    Resolve ``chunk_size`` into a concrete number of frames per chunk.
+
+    For ``"auto"`` the size is derived from the fixed, reproducible
+    device-memory budget :data:`_MAX_CHUNK_BYTES`: the per-chunk working
+    set is approximated as three times the frame size (data plus
+    matched-filter scores plus the boolean peak mask), and the budget is
+    divided by that cost.  The result is floored at ``1`` (a single frame
+    is the smallest unit; ``Z`` is never split) and capped at
+    ``n_frames``.
+
+    Raises
+    ------
+    ValueError
+        If ``chunk_size`` is neither a positive integer nor ``"auto"``.
+    """
+    if chunk_size == "auto":
+        frame_bytes = int(np.prod(frame_shape)) * itemsize
+        per_frame_working = 3 * frame_bytes
+        return max(1, min(n_frames, _MAX_CHUNK_BYTES // per_frame_working))
+    if not isinstance(chunk_size, (int, np.integer)) or chunk_size < 1:
+        raise ValueError(f"`chunk_size` must be a positive int or 'auto', got {chunk_size!r}.")
+    return min(int(chunk_size), n_frames)

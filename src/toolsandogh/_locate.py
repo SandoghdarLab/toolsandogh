@@ -489,7 +489,7 @@ def _make_shifted_psf_3d(
     the shifted PSF (contrast and bg ignored), and ``n_shift = 3``.
     """
     Pz, Py, Px = psf.shape
-    psf_padded = _edge_pad_3d(psf, pad)
+    psf_padded = jnp.pad(psf, pad, mode="edge")
     kz = jnp.fft.fftfreq(Pz + 2 * pad)[:, None, None]
     ky = jnp.fft.fftfreq(Py + 2 * pad)[None, :, None]
     kx = jnp.fft.fftfreq(Px + 2 * pad)[None, None, :]
@@ -516,7 +516,7 @@ def _make_shifted_psf_2d(
     shifted PSF, and ``n_shift = 2``.
     """
     Py, Px = psf.shape[1], psf.shape[2]
-    psf_padded = _edge_pad_2d(psf[0], pad)
+    psf_padded = jnp.pad(psf[0], pad, mode="edge")
     ky = jnp.fft.fftfreq(Py + 2 * pad)[:, None]
     kx = jnp.fft.fftfreq(Px + 2 * pad)[None, :]
     psf_fft = jnp.fft.fftn(psf_padded)
@@ -667,41 +667,9 @@ def _fit_one_emitter(
     }
 
 
-def _edge_pad_2d(
-    arr: Float[Array, "Y X"],
-    pad: int,
-) -> Float[Array, "Y2 X2"]:
-    """Pad a 2D array with its edge values along every axis."""
-    Y, X = arr.shape
-    padded = jnp.zeros((Y + 2 * pad, X + 2 * pad), dtype=arr.dtype)
-    padded = padded.at[pad : pad + Y, pad : pad + X].set(arr)
-    padded = padded.at[:pad, pad : pad + X].set(arr[0:1, :])
-    padded = padded.at[Y + pad :, pad : pad + X].set(arr[-1:, :])
-    padded = padded.at[pad : pad + Y, :pad].set(arr[:, 0:1])
-    padded = padded.at[pad : pad + Y, X + pad :].set(arr[:, -1:])
-    return padded
-
-
 # ---------------------------------------------------------------------------
 # Small helpers
 # ---------------------------------------------------------------------------
-
-
-def _edge_pad_3d(
-    arr: Float[Array, "Z Y X"],
-    pad: int,
-) -> Float[Array, "Z2 Y2 X2"]:
-    """Pad a 3D array with its edge values along every axis."""
-    Z, Y, X = arr.shape
-    padded = jnp.zeros((Z + 2 * pad, Y + 2 * pad, X + 2 * pad), dtype=arr.dtype)
-    padded = padded.at[pad : pad + Z, pad : pad + Y, pad : pad + X].set(arr)
-    padded = padded.at[:pad, pad : pad + Y, pad : pad + X].set(arr[0:1, :, :])
-    padded = padded.at[Z + pad :, pad : pad + Y, pad : pad + X].set(arr[-1:, :, :])
-    padded = padded.at[pad : pad + Z, :pad, pad : pad + X].set(arr[:, 0:1, :])
-    padded = padded.at[pad : pad + Z, Y + pad :, pad : pad + X].set(arr[:, -1:, :])
-    padded = padded.at[pad : pad + Z, pad : pad + Y, :pad].set(arr[:, :, 0:1])
-    padded = padded.at[pad : pad + Z, pad : pad + Y, X + pad :].set(arr[:, :, -1:])
-    return padded
 
 
 def _channel_scalar_and_dtype(

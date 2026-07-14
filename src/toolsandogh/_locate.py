@@ -469,57 +469,57 @@ def _fit_emitters_batch(
     ``x_offset``, ``converged``, ``chi2``, ``mass``, ``snr``.
     """
     is_3d = psf.shape[0] > 1
+    shifted_psf, n_shift, pad = _make_shifted_psf(psf, is_3d)
     fit_one = jax.vmap(
         lambda stamp: _fit_one_emitter(
             stamp,
-            psf,
+            shifted_psf=shifted_psf,
+            n_shift=n_shift,
+            pad=pad,
             iterations=iterations,
             atol=atol,
-            is_3d=is_3d,
         )
     )
     return fit_one(stamps)
 
 
-def _make_shifted_psf_3d(
+def _make_shifted_psf(
     psf: Float[Array, "Pz Py Px"],
-    pad: int,
-) -> tuple[Callable, int]:
+    is_3d: bool,
+) -> tuple[Callable, int, int]:
     """
-    Build the closure that shifts a 3D PSF by ``(dz, dy, dx)``.
+    Precompute the PSF's padded FFT and frequency grid.
 
-    Returns ``(shifted_psf, n_shift)`` where ``shifted_psf`` takes a
-    full parameter vector ``[contrast, bg, dz, dy, dx]`` and returns
-    the shifted PSF (contrast and bg ignored), and ``n_shift = 3``.
+    Returns ``(shifted_psf, n_shift, pad)`` where ``shifted_psf`` is a
+    closure that takes the full parameter vector
+    ``[contrast, bg, *shifts]`` and returns the subpixel-shifted PSF
+    (contrast and bg are ignored by the closure), ``n_shift`` is the
+    number of shift parameters (3 for 3D, 2 for 2D), and ``pad`` is the
+    edge-pad width.
+
+    Building the FFT and frequency grids here -- once, outside the
+    per-emitter ``vmap`` -- avoids recomputing them for every emitter
+    in the batch.  Only the per-emitter phase ramp ``exp(...)`` and the
+    inverse FFT run inside the batched loop.
     """
     Pz, Py, Px = psf.shape
-    psf_padded = jnp.pad(psf, pad, mode="edge")
-    kz = jnp.fft.fftfreq(Pz + 2 * pad)[:, None, None]
-    ky = jnp.fft.fftfreq(Py + 2 * pad)[None, :, None]
-    kx = jnp.fft.fftfreq(Px + 2 * pad)[None, None, :]
-    psf_fft = jnp.fft.fftn(psf_padded)
+    pad = max(Pz, Py, Px)
+    if is_3d:
+        psf_padded = jnp.pad(psf, pad, mode="edge")
+        kz = jnp.fft.fftfreq(Pz + 2 * pad)[:, None, None]
+        ky = jnp.fft.fftfreq(Py + 2 * pad)[None, :, None]
+        kx = jnp.fft.fftfreq(Px + 2 * pad)[None, None, :]
+        psf_fft = jnp.fft.fftn(psf_padded)
 
-    def shifted_psf(params: Float[Array, "5"]) -> Float[Array, "Pz Py Px"]:
-        _, _, dz, dy, dx = params
-        phase = jnp.exp(-2j * jnp.pi * (kz * dz + ky * dy + kx * dx))
-        full = jnp.fft.ifftn(psf_fft * phase).real
-        return full[pad : pad + Pz, pad : pad + Py, pad : pad + Px]
+        def shifted_psf(params: Float[Array, "5"]) -> Float[Array, "Pz Py Px"]:
+            _, _, dz, dy, dx = params
+            phase = jnp.exp(-2j * jnp.pi * (kz * dz + ky * dy + kx * dx))
+            full = jnp.fft.ifftn(psf_fft * phase).real
+            return full[pad : pad + Pz, pad : pad + Py, pad : pad + Px]
 
-    return shifted_psf, 3
+        return shifted_psf, 3, pad
 
-
-def _make_shifted_psf_2d(
-    psf: Float[Array, "Pz Py Px"],
-    pad: int,
-) -> tuple[Callable, int]:
-    """
-    Build the closure that shifts a 2D (``Pz = 1``) PSF by ``(dy, dx)``.
-
-    Returns ``(shifted_psf, n_shift)`` where ``shifted_psf`` takes a
-    full parameter vector ``[contrast, bg, dy, dx]`` and returns the
-    shifted PSF, and ``n_shift = 2``.
-    """
-    Py, Px = psf.shape[1], psf.shape[2]
+    # 2D: the PSF is constant along z (Pz == 1); only (dy, dx) are fitted.
     psf_padded = jnp.pad(psf[0], pad, mode="edge")
     ky = jnp.fft.fftfreq(Py + 2 * pad)[:, None]
     kx = jnp.fft.fftfreq(Px + 2 * pad)[None, :]
@@ -531,16 +531,17 @@ def _make_shifted_psf_2d(
         full = jnp.fft.ifftn(psf_fft * phase).real
         return full[pad : pad + Py, pad : pad + Px]
 
-    return shifted_psf, 2
+    return shifted_psf, 2, pad
 
 
 def _fit_one_emitter(
     stamp: Float[Array, "Pz Py Px"],
-    psf: Float[Array, "Pz Py Px"],
     *,
+    shifted_psf: Callable,
+    n_shift: int,
+    pad: int,
     iterations: int,
     atol: float,
-    is_3d: bool,
 ) -> dict[str, jax.Array]:
     """
     Refine a single emitter with Levenberg--Marquardt.
@@ -551,11 +552,14 @@ def _fit_one_emitter(
     ``converged`` flag is set when the final parameter update is
     smaller than ``atol``.
 
-    Two parameterizations are supported via the static ``is_3d``
-    flag (so the JIT can fold the branching):
+    The shifted-PSF closure and its supporting precomputed data
+    (padded FFT, frequency grid, pad width) are supplied by the
+    caller so they are built once per batch rather than once per
+    emitter.  Two parameterizations are supported, selected by
+    ``n_shift`` (a Python int, so the branching folds into JIT):
 
-    - ``is_3d=True``: 5 parameters ``(contrast, background, dz, dy, dx)``.
-    - ``is_3d=False``: 4 parameters ``(contrast, background, dy, dx)``.
+    - ``n_shift == 3``: 5 parameters ``(contrast, background, dz, dy, dx)``.
+    - ``n_shift == 2``: 4 parameters ``(contrast, background, dy, dx)``.
 
     The 2D case avoids a spurious unconstrained ``dz`` direction
     (the PSF is constant along ``z`` when ``Pz = 1``, so the
@@ -568,13 +572,7 @@ def _fit_one_emitter(
     This lets the cost function, the Levenberg--Marquardt step,
     and the scan be shared between the 2D and 3D code paths.
     """
-    Pz, Py, Px = psf.shape
-    pad = max(Pz, Py, Px)
-
-    if is_3d:
-        shifted_psf, n_shift = _make_shifted_psf_3d(psf, pad)
-    else:
-        shifted_psf, n_shift = _make_shifted_psf_2d(psf, pad)
+    Pz, Py, Px = stamp.shape
 
     # Unified model: ``contrast * shifted_psf(params) + bg``.  The
     # closure knows how to unpack the shift parameters from ``params``.
@@ -640,7 +638,7 @@ def _fit_one_emitter(
 
     contrast = final_params[0]
     bg_fit = final_params[1]
-    if is_3d:
+    if n_shift == 3:
         dz, dy, dx = final_params[2], final_params[3], final_params[4]
     else:
         dy, dx = final_params[2], final_params[3]

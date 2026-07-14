@@ -332,6 +332,7 @@ def locate_in_chunk(
     ]
     fit_stacks: list[jax.Array] = []
     converged_stacks: list[jax.Array] = []
+    n_iter_stacks: list[jax.Array] = []
     for i in range(0, n_emitters, batch_size):
         sub_stamps = stamps[i : i + batch_size]
         n_sub = sub_stamps.shape[0]
@@ -350,6 +351,7 @@ def locate_in_chunk(
         sub_stack = jnp.stack([sub_fit[k] for k in fit_keys])  # (8, batch)
         fit_stacks.append(sub_stack[:, :n_sub])
         converged_stacks.append(sub_fit["converged"][:n_sub])
+        n_iter_stacks.append(sub_fit["n_iter"][:n_sub])
 
     # 5. Compose the output table.
     t_col = b_idx + np.int32(starting_frame)
@@ -364,7 +366,7 @@ def locate_in_chunk(
     mass_col = np.ascontiguousarray(fit_np[5])
     chi2_col = np.ascontiguousarray(fit_np[6])
     snr_col = np.ascontiguousarray(fit_np[7])
-    n_iter_col = np.full(n_emitters, np.int32(iterations), dtype=np.int32)
+    n_iter_col = np.asarray(jnp.concatenate(n_iter_stacks), dtype=np.int32)
     converged_col = np.asarray(jnp.concatenate(converged_stacks), dtype=bool)
 
     # Subpixel-refined positions: integer peak + subpixel offset.
@@ -526,7 +528,8 @@ def _fit_emitters_batch(
 
     Returns a dictionary of per-emitter outputs:
     ``contrast``, ``background``, ``z_offset``, ``y_offset``,
-    ``x_offset``, ``converged``, ``chi2``, ``mass``, ``snr``.
+    ``x_offset``, ``converged``, ``n_iter``, ``chi2``, ``mass``,
+    ``snr``.
     """
     is_3d = psf.shape[0] > 1
     shifted_psf, n_shift, pad = _make_shifted_psf(psf, is_3d)
@@ -608,9 +611,14 @@ def _fit_one_emitter(
 
     Runs exactly ``iterations`` damped Gauss-Newton steps.  The
     damping factor ``lambda`` is updated each iteration: divided by
-    two on accept, multiplied by two on reject.  The returned
-    ``converged`` flag is set when the final parameter update is
-    smaller than ``atol``.
+    two on accept, multiplied by two on reject.
+
+    Once an emitter's parameter update falls below ``atol`` it is
+    marked converged and **frozen** -- its parameters, damping, and
+    cost are held fixed for the remainder of the scan so that later
+    iterations cannot perturb a converged result.  The ``n_iter``
+    output records the (1-indexed) iteration at which each emitter
+    first converged, or ``iterations`` if it never converged.
 
     The shifted-PSF closure and its supporting precomputed data
     (padded FFT, frequency grid, pad width) are supplied by the
@@ -665,7 +673,7 @@ def _fit_one_emitter(
     lambda0 = jnp.array(1e-3, dtype=stamp.dtype)
 
     def lm_step(carry, _):
-        params, lambda_, prev_cost, _prev_delta_max = carry
+        params, lambda_, prev_cost, converged, n_iter = carry
 
         r = residual(params)
         jac = jax.jacfwd(residual)(params)  # (m, n_params)
@@ -675,24 +683,37 @@ def _fit_one_emitter(
         diag_h = jnp.diag(jtj)
         damped = jtj + lambda_ * jnp.diag(diag_h)
         delta = jnp.linalg.solve(damped, -grad)
-        new_params = params + delta
-        new_cost = cost(new_params)
+        candidate_params = params + delta
+        candidate_cost = cost(candidate_params)
 
-        accept = new_cost < prev_cost
-        new_lambda = jnp.where(accept, lambda_ * 0.5, lambda_ * 2.0)
-        new_params = jnp.where(accept, new_params, params)
-        new_cost = jnp.where(accept, new_cost, prev_cost)
-
+        accept = candidate_cost < prev_cost
+        step_params = jnp.where(accept, candidate_params, params)
+        step_lambda = jnp.where(accept, lambda_ * 0.5, lambda_ * 2.0)
+        step_cost = jnp.where(accept, candidate_cost, prev_cost)
         delta_max = jnp.max(jnp.abs(delta))
-        return (new_params, new_lambda, new_cost, delta_max), None
+
+        # Freeze already-converged emitters: keep their state unchanged
+        # so later iterations cannot perturb a converged result.
+        new_params = jnp.where(converged, params, step_params)
+        new_lambda = jnp.where(converged, lambda_, step_lambda)
+        new_cost = jnp.where(converged, prev_cost, step_cost)
+
+        # An emitter converges when its step satisfies delta_max < atol.
+        # Once converged it stays frozen for the remainder of the scan.
+        newly_converged = (delta_max < atol) & ~converged
+        new_converged = converged | newly_converged
+        new_n_iter = jnp.where(converged, n_iter, n_iter + 1)
+
+        return (new_params, new_lambda, new_cost, new_converged, new_n_iter), None
 
     init_carry = (
         params0,
         lambda0,
         cost(params0),
-        jnp.array(jnp.inf, dtype=stamp.dtype),
+        jnp.array(False),
+        jnp.array(0, dtype=jnp.int32),
     )
-    (final_params, _, final_cost, final_delta_max), _ = jax.lax.scan(
+    (final_params, _, final_cost, final_converged, final_n_iter), _ = jax.lax.scan(
         lm_step, init_carry, None, length=iterations
     )
 
@@ -705,7 +726,7 @@ def _fit_one_emitter(
         dz = jnp.array(0.0, dtype=stamp.dtype)
 
     mass = jnp.sum(stamp)
-    converged = final_delta_max < atol
+    converged = final_converged
 
     # Signal-to-noise ratio: fitted contrast over the standard
     # deviation of the per-pixel residuals.  The residual floor guards
@@ -723,6 +744,7 @@ def _fit_one_emitter(
         "y_offset": dy,
         "x_offset": dx,
         "converged": converged,
+        "n_iter": final_n_iter,
         "chi2": 2.0 * final_cost,
         "mass": mass,
         "snr": snr,

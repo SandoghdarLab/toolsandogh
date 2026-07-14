@@ -774,6 +774,81 @@ def test_locate_n_active_frames_validation() -> None:
         tog.locate_in_chunk(chunk, psf, n_active_frames=-1)
 
 
+def test_locate_n_iter_is_reported_correctly() -> None:
+    """``n_iter`` must reflect the iteration at which each emitter converged."""
+    psf = _gaussian_psf(1.5, 7).reshape(1, 7, 7)
+    # Noise-free data: the fit should converge quickly (few iterations).
+    trajectories = polars.DataFrame(
+        {
+            "t": [0],
+            "c": [0],
+            "z": [0.0],
+            "y": [5.0],
+            "x": [5.0],
+            "contrast": [1.0],
+            "particle_id": [0],
+        }
+    )
+    video = tog.simulate_particles(
+        trajectories,
+        psf,
+        shape=(1, 1, 1, 10, 10),
+        noise_sigma=0.0,
+        dtype=np.float32,
+    )
+    locs = tog.locate_in_chunk(
+        jnp.asarray(video.values[0]),
+        psf,
+        min_distance=3,
+        min_contrast=0.0,
+        iterations=50,
+        atol=1e-4,
+    )
+    assert locs.shape[0] == 1
+    n_iter = locs["n_iter"][0]
+    # With clean data the fit converges well before the 50-iteration cap.
+    assert n_iter < 50
+    assert n_iter >= 1
+    # The emitter must be marked converged.
+    assert locs["converged"][0]
+
+
+def test_locate_n_iter_capped_at_max_iterations() -> None:
+    """``n_iter`` for a non-converged emitter equals ``iterations``."""
+    psf = _gaussian_psf(1.5, 7).reshape(1, 7, 7)
+    # Very tight convergence threshold + few iterations: likely non-converged.
+    trajectories = polars.DataFrame(
+        {
+            "t": [0],
+            "c": [0],
+            "z": [0.0],
+            "y": [5.0],
+            "x": [5.0],
+            "contrast": [1.0],
+            "particle_id": [0],
+        }
+    )
+    video = tog.simulate_particles(
+        trajectories,
+        psf,
+        shape=(1, 1, 1, 10, 10),
+        noise_sigma=0.5,
+        seed=99,
+        dtype=np.float32,
+    )
+    locs = tog.locate_in_chunk(
+        jnp.asarray(video.values[0]),
+        psf,
+        min_distance=3,
+        min_contrast=0.0,
+        iterations=2,
+        atol=1e-12,  # impossibly tight: should not converge
+    )
+    if locs.shape[0] > 0:
+        # All emitters should report n_iter == iterations (the cap).
+        assert all(n == 2 for n in locs["n_iter"].to_list())
+
+
 def test_resolve_chunk_size_explicit_and_invalid() -> None:
     """Explicit sizes are capped at ``n_frames``; bad values raise."""
     from toolsandogh._locate import _resolve_chunk_size

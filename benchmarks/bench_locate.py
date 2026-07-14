@@ -61,8 +61,15 @@ def bench(
     psf = make_psf()
     video = make_video(n_frames, hw, psf)
 
-    # Warmup (JIT compilation, etc.).
-    for _ in range(warmup):
+    # First call includes JIT compilation; record it as the cold-start time.
+    t0 = time.perf_counter()
+    tog.locate(
+        video, psf, chunk_size=chunk_size, min_contrast=min_contrast, iterations=10, atol=1e-3
+    )
+    cold = time.perf_counter() - t0
+
+    # Remaining warmup.
+    for _ in range(warmup - 1):
         tog.locate(
             video, psf, chunk_size=chunk_size, min_contrast=min_contrast, iterations=10, atol=1e-3
         )
@@ -80,7 +87,8 @@ def bench(
     fps = n_frames / best
     print(
         f"  n_frames={n_frames:4d} hw={hw:3d} chunk={str(chunk_size):>3} mc={min_contrast:.2f}  "
-        f"best={best * 1e3:8.2f} ms  fps={fps:8.2f}  n_locs={locs.height}"
+        f"cold={cold * 1e3:8.1f} ms  warm={best * 1e3:8.2f} ms  "
+        f"fps={fps:8.2f}  n_locs={locs.height}"
     )
     return fps
 
@@ -88,7 +96,7 @@ def bench(
 def main() -> None:
     jax.config.update("jax_enable_x64", False)
     print(f"jax devices: {jax.devices()}  backend: {jax.default_backend()}")
-    print("Baseline locate() benchmark")
+    print("locate() benchmark (cold = first call incl. JIT compile, warm = best of repeats)")
     for hw in (64, 128):
         for cs in (1, 8):
             bench(64, hw, cs, min_contrast=0.2)

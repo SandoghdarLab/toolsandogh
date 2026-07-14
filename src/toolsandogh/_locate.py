@@ -35,6 +35,15 @@ from ._canonicalize_video import canonicalize_video
 # reproducible across machines.
 _MAX_CHUNK_BYTES = 1 << 30  # 1 GiB
 
+# Fixed emitter-batch size for the Levenberg--Marquardt kernel.  Emitter
+# batches are padded to the next power of two (capped at this value) so
+# that the JIT-compiled fitting kernel specialises on a small set of
+# shapes rather than one per distinct emitter count.  This bounds the
+# number of JIT compilations to O(log max_emitters) per video
+# configuration while keeping per-batch waste under 2x.  The cap also
+# bounds the Jacobian memory (``batch * m * n_params * itemsize``).
+_MAX_EMITTERS_PER_BATCH = 256
+
 
 def locate(
     video: xr.DataArray,
@@ -149,17 +158,32 @@ def locate(
 
     # Walk the blocks and accumulate the per-chunk results.  Each chunk is
     # computed independently from the Dask array, so only one chunk's data
-    # is held in memory at a time.
+    # is held in memory at a time.  The tail chunk is zero-padded to the
+    # full ``chunk_axis`` size so that every chunk has the same shape; this
+    # keeps the peak-detection and fitting kernels on a single JIT
+    # specialization.  Padded frames are zero and cannot produce detections
+    # (their matched-filter score is zero, which never exceeds
+    # ``min_contrast >= 0``), and ``n_active_frames`` tells
+    # ``locate_in_chunk`` how many frames are real.
     psf_jax = jnp.asarray(psf_arr, dtype=dtype)
     results: list[polars.DataFrame] = []
     for start in range(0, n_frames, chunk_axis):
         end = min(start + chunk_axis, n_frames)
+        n_active = end - start
         block: xr.DataArray = video.isel(T=slice(start, end))
-        chunk = jnp.asarray(block.data.compute(), dtype=dtype)
+        chunk_np = np.asarray(block.data.compute(), dtype=dtype)
+        if n_active < chunk_axis:
+            chunk_np = np.pad(
+                chunk_np,
+                ((0, chunk_axis - n_active), (0, 0), (0, 0), (0, 0)),
+                mode="constant",
+            )
+        chunk = jnp.asarray(chunk_np)
         results.append(
             locate_in_chunk(
                 chunk=chunk,
                 psf=psf_jax,
+                n_active_frames=n_active,
                 starting_frame=starting_frame + start,
                 channel=c_label,
                 min_distance=min_distance,
@@ -182,6 +206,7 @@ def locate_in_chunk(
     *,
     starting_frame: int = 0,
     channel: int | str | float = 0,
+    n_active_frames: int | None = None,
     min_distance: int = 3,
     min_contrast: float = 0.0,
     sign: Literal["both", "positive", "negative"] = "both",
@@ -204,6 +229,13 @@ def locate_in_chunk(
     channel : int or str or float
         Channel label written to the ``c`` column of the output.  The
         column's dtype mirrors the type of this argument.
+    n_active_frames : int, optional
+        Number of frames at the start of ``chunk`` that contain real
+        data.  When ``None`` (the default), all ``B`` frames are
+        processed.  When the chunk has been zero-padded to a fixed size
+        (as :func:`locate` does for the tail chunk), supply the original
+        frame count here so that detections from padded frames are
+        discarded.
     min_distance : int
         Minimum separation (in pixels) between two detected peaks.
     min_contrast : float
@@ -239,6 +271,10 @@ def locate_in_chunk(
         raise ValueError(f"PSF Y/X shape ({Py}, {Px}) must not exceed data Y/X shape ({Y}, {X}).")
     if Pz > Z and Z > 1:
         raise ValueError(f"PSF Z size {Pz} must not exceed data Z size {Z}.")
+    if n_active_frames is None:
+        n_active_frames = B
+    elif not (0 <= n_active_frames <= B):
+        raise ValueError(f"`n_active_frames` must be in [0, {B}], got {n_active_frames}.")
 
     # 1+2. Fused matched-filter score and non-maximum-suppression peak
     #      mask.  A single JIT kernel produces the boolean (B, Z, Y, X) peak
@@ -258,6 +294,9 @@ def locate_in_chunk(
     # shape forces one host sync.  Materialize the whole array at once
     # and slice in NumPy from here on -- no further device round-trips.
     coords_np = np.asarray(coords)
+    # Discard any detections that fall in zero-padded tail frames.
+    if n_active_frames < B:
+        coords_np = coords_np[coords_np[:, 0] < n_active_frames]
     n_emitters = int(coords_np.shape[0])
     if n_emitters == 0:
         return _empty_result(channel=channel)
@@ -272,32 +311,53 @@ def locate_in_chunk(
     #    all emitters, instead of one eager pad+slice per emitter).
     stamps = _extract_stamps_batch(chunk, b_idx, rows_z, rows_y, rows_x, (Pz, Py, Px))
 
-    fit = _fit_emitters_batch(
-        stamps,
-        psf,
-        iterations=iterations,
-        atol=atol,
-    )
+    # 4. Batched Levenberg--Marquardt refinement.  Stamps are processed in
+    #    sub-batches whose size is the next power of two (capped at
+    #    ``_MAX_EMITTERS_PER_BATCH``) so that the JIT-compiled fitting kernel
+    #    specialises on a small set of shapes rather than one per distinct
+    #    emitter count.  All sub-batch dispatches are queued asynchronously;
+    #    a single host sync at the end materialises every fitted scalar
+    #    (plus a second sync for the convergence flags).
+    batch_size = 1 << (n_emitters - 1).bit_length()  # next power of two
+    batch_size = min(batch_size, _MAX_EMITTERS_PER_BATCH)
+    fit_keys = [
+        "z_offset",
+        "y_offset",
+        "x_offset",
+        "contrast",
+        "background",
+        "mass",
+        "chi2",
+        "snr",
+    ]
+    fit_stacks: list[jax.Array] = []
+    converged_stacks: list[jax.Array] = []
+    for i in range(0, n_emitters, batch_size):
+        sub_stamps = stamps[i : i + batch_size]
+        n_sub = sub_stamps.shape[0]
+        if n_sub < batch_size:
+            sub_stamps = jnp.pad(
+                sub_stamps,
+                ((0, batch_size - n_sub), (0, 0), (0, 0), (0, 0)),
+                mode="constant",
+            )
+        sub_fit = _fit_emitters_batch(
+            sub_stamps,
+            psf,
+            iterations=iterations,
+            atol=atol,
+        )
+        sub_stack = jnp.stack([sub_fit[k] for k in fit_keys])  # (8, batch)
+        fit_stacks.append(sub_stack[:, :n_sub])
+        converged_stacks.append(sub_fit["converged"][:n_sub])
 
-    # 4. Compose the output table.
+    # 5. Compose the output table.
     t_col = b_idx + np.int32(starting_frame)
     c_scalar, c_dtype = _channel_scalar_and_dtype(channel)
 
-    # Pull every fitted scalar off the device in a single sync: stack the
-    # per-emitter float outputs into one (k, n) array and read it back once.
-    fit_stack = jnp.stack(
-        [
-            fit["z_offset"],
-            fit["y_offset"],
-            fit["x_offset"],
-            fit["contrast"],
-            fit["background"],
-            fit["mass"],
-            fit["chi2"],
-            fit["snr"],
-        ]
-    )  # (8, n)
-    fit_np = np.asarray(fit_stack, dtype=np.float32)
+    # Pull every fitted scalar off the device in a single sync: concatenate
+    # all sub-batch results and read back once.
+    fit_np = np.asarray(jnp.concatenate(fit_stacks, axis=1), dtype=np.float32)
     z_offsets, y_offsets, x_offsets = fit_np[0], fit_np[1], fit_np[2]
     contrast_col = np.ascontiguousarray(fit_np[3])
     background_col = np.ascontiguousarray(fit_np[4])
@@ -305,7 +365,7 @@ def locate_in_chunk(
     chi2_col = np.ascontiguousarray(fit_np[6])
     snr_col = np.ascontiguousarray(fit_np[7])
     n_iter_col = np.full(n_emitters, np.int32(iterations), dtype=np.int32)
-    converged_col = np.asarray(fit["converged"], dtype=bool)
+    converged_col = np.asarray(jnp.concatenate(converged_stacks), dtype=bool)
 
     # Subpixel-refined positions: integer peak + subpixel offset.
     z_col = (rows_z.astype(np.float32) + z_offsets).astype(np.float32)

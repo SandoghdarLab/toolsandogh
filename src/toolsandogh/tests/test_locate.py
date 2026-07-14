@@ -726,6 +726,54 @@ def test_resolve_chunk_size_auto() -> None:
     assert _resolve_chunk_size("auto", 10**9, (1, 128, 128), itemsize) == expected
 
 
+def test_locate_n_active_frames_filters_padded_detections() -> None:
+    """``n_active_frames`` must suppress detections from zero-padded tail frames."""
+    psf = _gaussian_psf(1.5, 7).reshape(1, 7, 7)
+    trajectories = polars.DataFrame(
+        {
+            "t": [0],
+            "c": [0],
+            "z": [0.0],
+            "y": [5.0],
+            "x": [5.0],
+            "contrast": [1.0],
+            "particle_id": [0],
+        }
+    )
+    video = tog.simulate_particles(
+        trajectories,
+        psf,
+        shape=(1, 1, 1, 10, 10),
+        noise_sigma=0.0,
+        dtype=np.float32,
+    )
+    # Build a (4, 1, 10, 10) chunk with one real frame and three zero pads.
+    real = jnp.asarray(video.values[0, 0])  # (1, 1, 10, 10)
+    padded = jnp.zeros((4, 1, 10, 10), dtype=np.float32)
+    padded = padded.at[0].set(real[0])
+    locs = tog.locate_in_chunk(
+        padded,
+        psf,
+        n_active_frames=1,
+        min_distance=3,
+        min_contrast=0.0,
+        iterations=10,
+        atol=1e-3,
+    )
+    assert locs.shape[0] == 1
+    assert locs["t"].to_list() == [0]
+
+
+def test_locate_n_active_frames_validation() -> None:
+    """Out-of-range ``n_active_frames`` must raise."""
+    psf = _gaussian_psf(1.5, 7).reshape(1, 7, 7)
+    chunk = jnp.zeros((4, 1, 10, 10), dtype=np.float32)
+    with pytest.raises(ValueError, match="n_active_frames"):
+        tog.locate_in_chunk(chunk, psf, n_active_frames=5)
+    with pytest.raises(ValueError, match="n_active_frames"):
+        tog.locate_in_chunk(chunk, psf, n_active_frames=-1)
+
+
 def test_resolve_chunk_size_explicit_and_invalid() -> None:
     """Explicit sizes are capped at ``n_frames``; bad values raise."""
     from toolsandogh._locate import _resolve_chunk_size

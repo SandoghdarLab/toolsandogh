@@ -293,13 +293,15 @@ def locate_in_chunk(
             fit["contrast"],
             fit["mass"],
             fit["chi2"],
+            fit["snr"],
         ]
-    )  # (6, n)
+    )  # (7, n)
     fit_np = np.asarray(fit_stack, dtype=np.float32)
     z_offsets, y_offsets, x_offsets = fit_np[0], fit_np[1], fit_np[2]
     contrast_col = np.ascontiguousarray(fit_np[3])
     mass_col = np.ascontiguousarray(fit_np[4])
     chi2_col = np.ascontiguousarray(fit_np[5])
+    snr_col = np.ascontiguousarray(fit_np[6])
     n_iter_col = np.full(n_emitters, np.int32(iterations), dtype=np.int32)
     converged_col = np.asarray(fit["converged"], dtype=bool)
 
@@ -307,8 +309,6 @@ def locate_in_chunk(
     z_col = (rows_z.astype(np.float32) + z_offsets).astype(np.float32)
     y_col = (rows_y.astype(np.float32) + y_offsets).astype(np.float32)
     x_col = (rows_x.astype(np.float32) + x_offsets).astype(np.float32)
-
-    snr_col: list[float | None] = [None] * n_emitters
 
     return polars.DataFrame(
         {
@@ -319,7 +319,7 @@ def locate_in_chunk(
             "x": x_col,
             "contrast": contrast_col,
             "mass": mass_col,
-            "snr": polars.Series(snr_col, dtype=polars.Float32),
+            "snr": snr_col,
             "chi2": chi2_col,
             "n_iter": n_iter_col,
             "converged": converged_col,
@@ -462,7 +462,7 @@ def _fit_emitters_batch(
 
     Returns a dictionary of per-emitter outputs:
     ``contrast``, ``background``, ``z_offset``, ``y_offset``,
-    ``x_offset``, ``converged``, ``chi2``, ``mass``.
+    ``x_offset``, ``converged``, ``chi2``, ``mass``, ``snr``.
     """
     is_3d = psf.shape[0] > 1
     fit_one = jax.vmap(
@@ -645,6 +645,15 @@ def _fit_one_emitter(
     mass = jnp.sum(stamp)
     converged = final_delta_max < atol
 
+    # Signal-to-noise ratio: fitted contrast over the standard
+    # deviation of the per-pixel residuals.  The residual floor guards
+    # against a zero residual (e.g. noise-free synthetic data with a
+    # perfect fit), in which case the true SNR is infinite and is
+    # reported as a large finite value instead of NaN.
+    resid_std = jnp.std(residual(final_params))
+    resid_floor = jnp.asarray(jnp.finfo(stamp.dtype).tiny, dtype=stamp.dtype)
+    snr = contrast / jnp.maximum(resid_std, resid_floor)
+
     return {
         "contrast": contrast,
         "background": bg_fit,
@@ -654,6 +663,7 @@ def _fit_one_emitter(
         "converged": converged,
         "chi2": 2.0 * final_cost,
         "mass": mass,
+        "snr": snr,
     }
 
 

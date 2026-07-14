@@ -549,6 +549,63 @@ def test_locate_anisotropic_psf() -> None:
     assert a1 < 0
 
 
+def test_locate_snr_is_computed() -> None:
+    """The ``snr`` column must be finite and scale with contrast over noise."""
+    psf = _gaussian_psf(1.5, 7).reshape(1, 7, 7)
+    trajectories = polars.DataFrame(
+        {
+            "t": [0],
+            "c": [0],
+            "z": [0.0],
+            "y": [5.0],
+            "x": [5.0],
+            "contrast": [2.0],
+            "particle_id": [0],
+        }
+    )
+    common = {
+        "min_distance": 3,
+        "min_contrast": 0.1,
+        "sign": "positive",
+        "iterations": 50,
+        "atol": 1e-4,
+    }
+    quiet = tog.simulate_particles(
+        trajectories,
+        psf,
+        shape=(1, 1, 1, 10, 10),
+        noise_sigma=0.02,
+        seed=0,
+        dtype=np.float32,
+    )
+    loud = tog.simulate_particles(
+        trajectories,
+        psf,
+        shape=(1, 1, 1, 10, 10),
+        noise_sigma=0.5,
+        seed=0,
+        dtype=np.float32,
+    )
+    quiet_locs = tog.locate_in_chunk(jnp.asarray(quiet.values[0]), psf, **common)
+    loud_locs = tog.locate_in_chunk(jnp.asarray(loud.values[0]), psf, **common)
+
+    # Pick the detection nearest the true emitter position (5, 5).
+    def _nearest_snr(locs: polars.DataFrame) -> float:
+        dy = locs["y"].to_numpy() - 5.0
+        dx = locs["x"].to_numpy() - 5.0
+        idx = int(np.argmin(dy * dy + dx * dx))
+        return float(locs["snr"][idx])
+
+    quiet_snr = _nearest_snr(quiet_locs)
+    loud_snr = _nearest_snr(loud_locs)
+    # Finite, positive, and a quiet background yields higher SNR than a loud one.
+    assert np.isfinite(quiet_snr)
+    assert np.isfinite(loud_snr)
+    assert quiet_snr > 0
+    assert loud_snr > 0
+    assert quiet_snr > loud_snr
+
+
 def test_locate_auto_chunk_is_default() -> None:
     """The default ``chunk_size`` must be ``"auto"``."""
     import inspect

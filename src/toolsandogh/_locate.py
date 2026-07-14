@@ -107,7 +107,7 @@ def locate(
     -------
     polars.DataFrame
         A Polars DataFrame with the columns
-        ``t, c, z, y, x, contrast, mass, snr, chi2, n_iter, converged``.
+        ``t, c, z, y, x, contrast, background, mass, snr, chi2, n_iter, converged``.
     """
     # Cast the PSF to the requested dtype and check its rank.
     dtype = np.dtype(dtype)
@@ -225,7 +225,7 @@ def locate_in_chunk(
     -------
     polars.DataFrame
         A Polars DataFrame with the columns
-        ``t, c, z, y, x, contrast, mass, snr, chi2, n_iter, converged``.
+        ``t, c, z, y, x, contrast, background, mass, snr, chi2, n_iter, converged``.
     """
     chunk = jnp.asarray(chunk)
     psf = jnp.asarray(psf)
@@ -291,17 +291,19 @@ def locate_in_chunk(
             fit["y_offset"],
             fit["x_offset"],
             fit["contrast"],
+            fit["background"],
             fit["mass"],
             fit["chi2"],
             fit["snr"],
         ]
-    )  # (7, n)
+    )  # (8, n)
     fit_np = np.asarray(fit_stack, dtype=np.float32)
     z_offsets, y_offsets, x_offsets = fit_np[0], fit_np[1], fit_np[2]
     contrast_col = np.ascontiguousarray(fit_np[3])
-    mass_col = np.ascontiguousarray(fit_np[4])
-    chi2_col = np.ascontiguousarray(fit_np[5])
-    snr_col = np.ascontiguousarray(fit_np[6])
+    background_col = np.ascontiguousarray(fit_np[4])
+    mass_col = np.ascontiguousarray(fit_np[5])
+    chi2_col = np.ascontiguousarray(fit_np[6])
+    snr_col = np.ascontiguousarray(fit_np[7])
     n_iter_col = np.full(n_emitters, np.int32(iterations), dtype=np.int32)
     converged_col = np.asarray(fit["converged"], dtype=bool)
 
@@ -318,6 +320,7 @@ def locate_in_chunk(
             "y": y_col,
             "x": x_col,
             "contrast": contrast_col,
+            "background": background_col,
             "mass": mass_col,
             "snr": snr_col,
             "chi2": chi2_col,
@@ -331,6 +334,7 @@ def locate_in_chunk(
             "y": polars.Float32,
             "x": polars.Float32,
             "contrast": polars.Float32,
+            "background": polars.Float32,
             "mass": polars.Float32,
             "snr": polars.Float32,
             "chi2": polars.Float32,
@@ -704,6 +708,7 @@ def _empty_result(channel: int | str | float = 0) -> polars.DataFrame:
             "y": polars.Float32,
             "x": polars.Float32,
             "contrast": polars.Float32,
+            "background": polars.Float32,
             "mass": polars.Float32,
             "snr": polars.Float32,
             "chi2": polars.Float32,

@@ -58,6 +58,7 @@ def test_locate_returns_strict_schema() -> None:
         "y": polars.Float32,
         "x": polars.Float32,
         "contrast": polars.Float32,
+        "background": polars.Float32,
         "mass": polars.Float32,
         "snr": polars.Float32,
         "chi2": polars.Float32,
@@ -238,7 +239,7 @@ def test_locate_dtype_strictness() -> None:
         iterations=50,
         atol=1e-4,
     )
-    float_cols = {"z", "y", "x", "contrast", "mass", "snr", "chi2"}
+    float_cols = {"z", "y", "x", "contrast", "background", "mass", "snr", "chi2"}
     for col in float_cols:
         if col in locs.columns and locs[col].null_count() < locs.shape[0]:
             assert locs[col].dtype == polars.Float32
@@ -604,6 +605,48 @@ def test_locate_snr_is_computed() -> None:
     assert quiet_snr > 0
     assert loud_snr > 0
     assert quiet_snr > loud_snr
+
+
+def test_locate_background_matches_constant_offset() -> None:
+    """The fitted ``background`` must recover a constant video offset."""
+    psf = _gaussian_psf(1.5, 7).reshape(1, 7, 7)
+    trajectories = polars.DataFrame(
+        {
+            "t": [0],
+            "c": [0],
+            "z": [0.0],
+            "y": [5.0],
+            "x": [5.0],
+            "contrast": [2.0],
+            "particle_id": [0],
+        }
+    )
+    video = tog.simulate_particles(
+        trajectories,
+        psf,
+        shape=(1, 1, 1, 10, 10),
+        noise_sigma=0.0,
+        dtype=np.float32,
+    )
+    # Add a constant background offset of 42.0 to every pixel of the video.
+    video = video + 42.0
+    locs = tog.locate_in_chunk(
+        jnp.asarray(video.values[0]),
+        psf,
+        min_distance=3,
+        min_contrast=0.1,
+        sign="positive",
+        iterations=50,
+        atol=1e-4,
+    )
+    # The fitter models a per-emitter additive background, so the recovered
+    # ``background`` column must reproduce the 42.0 offset (well within the
+    # float32 fit tolerance) and be correctly typed.
+    assert locs["background"].dtype == polars.Float32
+    assert locs.shape[0] >= 1
+    assert np.all(np.abs(locs["background"].to_numpy() - 42.0) < 0.1)
+    # And it must be distinct from the contrast column.
+    assert not np.allclose(locs["background"].to_numpy(), locs["contrast"].to_numpy(), atol=1e-6)
 
 
 def test_locate_auto_chunk_is_default() -> None:

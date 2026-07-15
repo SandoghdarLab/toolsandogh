@@ -60,6 +60,7 @@ def locate(
     atol: float = 1e-3,
     noise_sigma: float | None = None,
     dtype: npt.DTypeLike = np.float32,
+    on_progress: Callable[[int], None] | None = None,
 ) -> polars.DataFrame:
     """
     Locate particles in every frame of a (T, C, Z, Y, X) video.
@@ -120,12 +121,19 @@ def locate(
         comparable across runs and devices.  The default is ``None``.
     dtype : numpy dtype
         Dtype used for the data during localization.
+    on_progress : callable, optional
+        A callback invoked with the number of frames completed so far.
+        It is called once with ``0`` before any frame is processed
+        (also the only call when the video has no frames), and again
+        after one or more frames have been processed.  The final value
+        equals ``video.sizes["T"]``.  ``None`` (the default) disables
+        progress reporting.
 
     Returns
     -------
     polars.DataFrame
         A Polars DataFrame with the columns
-        ``t, c, z, y, x, contrast, background, mass, snr, chi2, n_iter, converged``.
+        ``t, c, z, y, x, contrast, background, mass, snr, chi2, reduced_chi2, n_iter, converged``.
 
     Notes
     -----
@@ -176,6 +184,12 @@ def locate(
     chunk_axis = _resolve_chunk_size(chunk_size, n_frames, frame_shape, np.dtype(dtype).itemsize)
     video = video.chunk({"T": chunk_axis})
 
+    # Validate an optional progress callback at the public boundary.
+    if on_progress is not None and not callable(on_progress):
+        raise TypeError(f"`on_progress` must be callable, got {type(on_progress).__name__}.")
+    if on_progress is not None:
+        on_progress(0)
+
     # Walk the blocks and accumulate the per-chunk results.  Each chunk is
     # computed independently from the Dask array, so only one chunk's data
     # is held in memory at a time.  The tail chunk is zero-padded to the
@@ -199,21 +213,22 @@ def locate(
                 mode="constant",
             )
         chunk = jnp.asarray(chunk_np)
-        results.append(
-            locate_in_chunk(
-                chunk=chunk,
-                psf=psf_jax,
-                n_active_frames=n_active,
-                starting_frame=starting_frame + start,
-                channel=c_label,
-                min_distance=min_distance,
-                min_contrast=min_contrast,
-                sign=sign,
-                iterations=iterations,
-                atol=atol,
-                noise_sigma=noise_sigma,
-            )
+        result = locate_in_chunk(
+            chunk=chunk,
+            psf=psf_jax,
+            n_active_frames=n_active,
+            starting_frame=starting_frame + start,
+            channel=c_label,
+            min_distance=min_distance,
+            min_contrast=min_contrast,
+            sign=sign,
+            iterations=iterations,
+            atol=atol,
+            noise_sigma=noise_sigma,
         )
+        results.append(result)
+        if on_progress is not None:
+            on_progress(end)
 
     if not results:
         return _empty_result(channel=c_label)

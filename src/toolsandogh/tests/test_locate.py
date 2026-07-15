@@ -997,3 +997,174 @@ def test_resolve_chunk_size_explicit_and_invalid() -> None:
         _resolve_chunk_size(-2, 20, (1, 10, 10), itemsize)
     with pytest.raises(ValueError, match="chunk_size"):
         _resolve_chunk_size("weird", 20, (1, 10, 10), itemsize)  # type: ignore
+
+
+def test_locate_on_progress_sequence() -> None:
+    """``on_progress`` is called with 0 then after each chunk with frames done."""
+    psf = _gaussian_psf(1.5, 9).reshape(1, 9, 9)
+    n_frames = 24
+    cy, cx = 8.5, 8.5
+    radius = 2.5
+    t = np.arange(n_frames)
+    theta = 2.0 * np.pi * t / n_frames
+    trajectories = polars.DataFrame(
+        {
+            "t": t.tolist(),
+            "c": [0] * n_frames,
+            "z": [0.0] * n_frames,
+            "y": (cy + radius * np.cos(theta)).tolist(),
+            "x": (cx + radius * np.sin(theta)).tolist(),
+            "contrast": [2.0] * n_frames,
+            "particle_id": [0] * n_frames,
+        }
+    )
+    video = tog.simulate_particles(
+        trajectories,
+        psf,
+        shape=(n_frames, 1, 1, 18, 18),
+        noise_sigma=0.02,
+        seed=0,
+        dtype=np.float32,
+    )
+    chunk = 4
+    calls: list[int] = []
+    tog.locate(
+        video,
+        psf,
+        chunk_size=chunk,
+        min_distance=4,
+        min_contrast=0.2,
+        iterations=10,
+        atol=1e-3,
+        on_progress=calls.append,
+    )
+    expected = [0, 4, 8, 12, 16, 20, 24]
+    assert calls == expected
+
+
+def test_locate_on_progress_single_chunk() -> None:
+    """``n_frames`` divisible by ``chunk_size`` yields the exact plan."""
+    psf = _gaussian_psf(1.5, 7).reshape(1, 7, 7)
+    trajectories = polars.DataFrame(
+        {
+            "t": [0],
+            "c": [0],
+            "z": [0.0],
+            "y": [5.0],
+            "x": [5.0],
+            "contrast": [1.0],
+            "particle_id": [0],
+        }
+    )
+    video = tog.simulate_particles(
+        trajectories,
+        psf,
+        shape=(1, 1, 1, 10, 10),
+        noise_sigma=0.0,
+        dtype=np.float32,
+    )
+    calls: list[int] = []
+    tog.locate(video, psf, chunk_size=1, on_progress=calls.append)
+    assert calls == [0, 1]
+
+
+def test_locate_on_progress_is_observation_only() -> None:
+    """Progress reporting must not change the returned DataFrame."""
+    psf = _gaussian_psf(1.5, 9).reshape(1, 9, 9)
+    n_frames = 24
+    cy, cx = 8.5, 8.5
+    radius = 2.5
+    t = np.arange(n_frames)
+    theta = 2.0 * np.pi * t / n_frames
+    trajectories = polars.DataFrame(
+        {
+            "t": t.tolist(),
+            "c": [0] * n_frames,
+            "z": [0.0] * n_frames,
+            "y": (cy + radius * np.cos(theta)).tolist(),
+            "x": (cx + radius * np.sin(theta)).tolist(),
+            "contrast": [2.0] * n_frames,
+            "particle_id": [0] * n_frames,
+        }
+    )
+    video = tog.simulate_particles(
+        trajectories,
+        psf,
+        shape=(n_frames, 1, 1, 18, 18),
+        noise_sigma=0.02,
+        seed=0,
+        dtype=np.float32,
+    )
+    common = {
+        "min_distance": 4,
+        "min_contrast": 0.2,
+        "iterations": 10,
+        "atol": 1e-3,
+    }
+    silent = tog.locate(video, psf, chunk_size=4, **common).sort("t", "y", "x")
+    loud = tog.locate(video, psf, chunk_size=4, **common, on_progress=lambda _v: None).sort(
+        "t", "y", "x"
+    )
+    assert silent.shape == loud.shape
+    np.testing.assert_allclose(silent["y"].to_numpy(), loud["y"].to_numpy(), rtol=1e-6)
+    np.testing.assert_allclose(silent["x"].to_numpy(), loud["x"].to_numpy(), rtol=1e-6)
+    np.testing.assert_allclose(
+        silent["contrast"].to_numpy(), loud["contrast"].to_numpy(), rtol=1e-6
+    )
+
+
+def test_locate_on_progress_propagates_exception() -> None:
+    """An exception raised inside ``on_progress`` must propagate."""
+    psf = _gaussian_psf(1.5, 7).reshape(1, 7, 7)
+    trajectories = polars.DataFrame(
+        {
+            "t": [0],
+            "c": [0],
+            "z": [0.0],
+            "y": [5.0],
+            "x": [5.0],
+            "contrast": [1.0],
+            "particle_id": [0],
+        }
+    )
+    video = tog.simulate_particles(
+        trajectories,
+        psf,
+        shape=(1, 1, 1, 10, 10),
+        noise_sigma=0.0,
+        dtype=np.float32,
+    )
+
+    class _Boom(Exception):
+        pass
+
+    def boom(_v: int) -> None:
+        raise _Boom
+
+    with pytest.raises(_Boom):
+        tog.locate(video, psf, chunk_size=1, on_progress=boom)
+
+
+def test_locate_on_progress_non_callable_raises_typeerror() -> None:
+    """A non-callable ``on_progress`` is rejected before any work."""
+    psf = _gaussian_psf(1.5, 7).reshape(1, 7, 7)
+    trajectories = polars.DataFrame(
+        {
+            "t": [0],
+            "c": [0],
+            "z": [0.0],
+            "y": [5.0],
+            "x": [5.0],
+            "contrast": [1.0],
+            "particle_id": [0],
+        }
+    )
+    video = tog.simulate_particles(
+        trajectories,
+        psf,
+        shape=(1, 1, 1, 10, 10),
+        noise_sigma=0.0,
+        dtype=np.float32,
+    )
+    with pytest.raises(TypeError, match="on_progress"):
+        tog.locate(video, psf, chunk_size=1, on_progress=42)  # type: ignore

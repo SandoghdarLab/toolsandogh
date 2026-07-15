@@ -14,6 +14,7 @@ from typing import Callable, Literal
 import jax
 import jax.numpy as jnp
 import jax.scipy.signal as jsignal
+import jax.scipy.stats as jstats
 import numpy as np
 import numpy.typing as npt
 import polars
@@ -57,6 +58,7 @@ def locate(
     sign: Literal["both", "positive", "negative"] = "both",
     iterations: int = 10,
     atol: float = 1e-3,
+    noise_sigma: float | None = None,
     dtype: npt.DTypeLike = np.float32,
 ) -> polars.DataFrame:
     """
@@ -109,6 +111,13 @@ def locate(
         Convergence threshold on the maximum absolute parameter
         update.  Emitters with a final parameter update smaller than
         ``atol`` are marked ``converged=True``.
+    noise_sigma : float, optional
+        Standard deviation of the per-pixel Gaussian noise.  When
+        ``None`` (the default) it is estimated robustly from each chunk
+        via the median absolute deviation of second differences.  The
+        value normalises the ``chi2``, ``reduced_chi2`` and ``snr`` output
+        columns; supplying a known value yields statistics that are
+        comparable across runs and devices.  The default is ``None``.
     dtype : numpy dtype
         Dtype used for the data during localization.
 
@@ -117,6 +126,17 @@ def locate(
     polars.DataFrame
         A Polars DataFrame with the columns
         ``t, c, z, y, x, contrast, background, mass, snr, chi2, n_iter, converged``.
+
+    Notes
+    -----
+    The ``chi2`` column is the chi-squared statistic
+    ``sum(residual**2) / noise_sigma**2``, which follows a chi-squared
+    distribution with ``dof = Pz*Py*Px - n_params`` degrees of freedom
+    under a correct model and Gaussian noise.  The ``reduced_chi2`` column
+    is ``chi2 / dof`` and has expectation 1.  The ``snr`` column is the
+    fitted contrast divided by ``noise_sigma``.  When ``noise_sigma`` is
+    not supplied, it is estimated per chunk as described under the
+    ``noise_sigma`` parameter.
     """
     # Cast the PSF to the requested dtype and check its rank.
     dtype = np.dtype(dtype)
@@ -191,6 +211,7 @@ def locate(
                 sign=sign,
                 iterations=iterations,
                 atol=atol,
+                noise_sigma=noise_sigma,
             )
         )
 
@@ -212,6 +233,7 @@ def locate_in_chunk(
     sign: Literal["both", "positive", "negative"] = "both",
     iterations: int = 10,
     atol: float = 1e-3,
+    noise_sigma: float | None = None,
 ) -> polars.DataFrame:
     """
     Locate particles in a single (B, Z, Y, X) chunk.
@@ -252,12 +274,28 @@ def locate_in_chunk(
         Convergence threshold on the maximum absolute parameter
         update.  Emitters with a final parameter update smaller than
         ``atol`` are marked ``converged=True``.
+    noise_sigma : float, optional
+        Standard deviation of the per-pixel Gaussian noise.  When
+        ``None`` (the default) it is estimated robustly from the
+        chunk's active frames via the median absolute deviation of
+        second differences.  The value normalises the ``chi2``,
+        ``reduced_chi2`` and ``snr`` output columns.  The default is
+        ``None``.
 
     Returns
     -------
     polars.DataFrame
         A Polars DataFrame with the columns
-        ``t, c, z, y, x, contrast, background, mass, snr, chi2, n_iter, converged``.
+        ``t, c, z, y, x, contrast, background, mass, snr, chi2, reduced_chi2, n_iter, converged``.
+
+    Notes
+    -----
+    The ``chi2`` column is the chi-squared statistic
+    ``sum(residual**2) / noise_sigma**2``, which follows a chi-squared
+    distribution with ``dof = Pz*Py*Px - n_params`` degrees of freedom
+    under a correct model and Gaussian noise.  The ``reduced_chi2``
+    column is ``chi2 / dof`` and has expectation 1.  The ``snr`` column
+    is the fitted contrast divided by ``noise_sigma``.
     """
     chunk = jnp.asarray(chunk)
     psf = jnp.asarray(psf)
@@ -275,6 +313,8 @@ def locate_in_chunk(
         n_active_frames = B
     elif not (0 <= n_active_frames <= B):
         raise ValueError(f"`n_active_frames` must be in [0, {B}], got {n_active_frames}.")
+    if noise_sigma is not None and noise_sigma < 0:
+        raise ValueError(f"`noise_sigma` must be non-negative, got {noise_sigma!r}.")
 
     # 1+2. Fused matched-filter score and non-maximum-suppression peak
     #      mask.  A single JIT kernel produces the boolean (B, Z, Y, X) peak
@@ -311,6 +351,15 @@ def locate_in_chunk(
     #    all emitters, instead of one eager pad+slice per emitter).
     stamps = _extract_stamps_batch(chunk, b_idx, rows_z, rows_y, rows_x, (Pz, Py, Px))
 
+    # Resolve the per-pixel noise standard deviation: either the value
+    # supplied by the caller or a robust estimate from the chunk's active
+    # frames.  It is kept as a device-resident scalar so no extra host sync
+    # is needed before the batched fit.
+    if noise_sigma is None:
+        noise_sigma_arr = _estimate_noise_sigma(chunk, n_active_frames)
+    else:
+        noise_sigma_arr = jnp.asarray(noise_sigma, dtype=chunk.dtype)
+
     # 4. Batched Levenberg--Marquardt refinement.  Stamps are processed in
     #    sub-batches whose size is the next power of two (capped at
     #    ``_MAX_EMITTERS_PER_BATCH``) so that the JIT-compiled fitting kernel
@@ -328,6 +377,7 @@ def locate_in_chunk(
         "background",
         "mass",
         "chi2",
+        "reduced_chi2",
         "snr",
     ]
     fit_stacks: list[jax.Array] = []
@@ -347,8 +397,9 @@ def locate_in_chunk(
             psf,
             iterations=iterations,
             atol=atol,
+            noise_sigma=noise_sigma_arr,
         )
-        sub_stack = jnp.stack([sub_fit[k] for k in fit_keys])  # (8, batch)
+        sub_stack = jnp.stack([sub_fit[k] for k in fit_keys])  # (9, batch)
         fit_stacks.append(sub_stack[:, :n_sub])
         converged_stacks.append(sub_fit["converged"][:n_sub])
         n_iter_stacks.append(sub_fit["n_iter"][:n_sub])
@@ -365,7 +416,8 @@ def locate_in_chunk(
     background_col = np.ascontiguousarray(fit_np[4])
     mass_col = np.ascontiguousarray(fit_np[5])
     chi2_col = np.ascontiguousarray(fit_np[6])
-    snr_col = np.ascontiguousarray(fit_np[7])
+    reduced_chi2_col = np.ascontiguousarray(fit_np[7])
+    snr_col = np.ascontiguousarray(fit_np[8])
     n_iter_col = np.asarray(jnp.concatenate(n_iter_stacks), dtype=np.int32)
     converged_col = np.asarray(jnp.concatenate(converged_stacks), dtype=bool)
 
@@ -386,6 +438,7 @@ def locate_in_chunk(
             "mass": mass_col,
             "snr": snr_col,
             "chi2": chi2_col,
+            "reduced_chi2": reduced_chi2_col,
             "n_iter": n_iter_col,
             "converged": converged_col,
         },
@@ -400,6 +453,7 @@ def locate_in_chunk(
             "mass": polars.Float32,
             "snr": polars.Float32,
             "chi2": polars.Float32,
+            "reduced_chi2": polars.Float32,
             "n_iter": polars.Int32,
             "converged": polars.Boolean,
         },
@@ -517,6 +571,7 @@ def _fit_emitters_batch(
     *,
     iterations: int,
     atol: float,
+    noise_sigma: jax.Array,
 ) -> dict[str, jax.Array]:
     """
     Fit all emitters in parallel with Levenberg--Marquardt.
@@ -526,39 +581,45 @@ def _fit_emitters_batch(
     through ``jax.vmap``.  Convergence is decided afterwards by
     comparing the final parameter update to ``atol``.
 
+    ``noise_sigma`` is the per-pixel noise standard deviation used to
+    normalise each emitter's ``chi2``, ``reduced_chi2`` and ``snr``
+    outputs.  It is a scalar shared across the batch and is passed to
+    the per-emitter closure unbatched (``in_axes=None``) so it is not
+    replicated.
+
     Returns a dictionary of per-emitter outputs:
     ``contrast``, ``background``, ``z_offset``, ``y_offset``,
-    ``x_offset``, ``converged``, ``n_iter``, ``chi2``, ``mass``,
-    ``snr``.
+    ``x_offset``, ``converged``, ``n_iter``, ``chi2``,
+    ``reduced_chi2``, ``mass``, ``snr``.
     """
-    is_3d = psf.shape[0] > 1
-    shifted_psf, n_shift, pad = _make_shifted_psf(psf, is_3d)
+    shifted_psf, n_shift = _make_shifted_psf(psf)
+    sigma = jnp.asarray(noise_sigma, dtype=stamps.dtype)
     fit_one = jax.vmap(
-        lambda stamp: _fit_one_emitter(
+        lambda stamp, sig: _fit_one_emitter(
             stamp,
             shifted_psf=shifted_psf,
             n_shift=n_shift,
-            pad=pad,
             iterations=iterations,
             atol=atol,
-        )
+            noise_sigma=sig,
+        ),
+        in_axes=(0, None),
     )
-    return fit_one(stamps)
+    return fit_one(stamps, sigma)
 
 
 def _make_shifted_psf(
     psf: Float[Array, "Pz Py Px"],
-    is_3d: bool,
-) -> tuple[Callable, int, int]:
+) -> tuple[Callable, int]:
     """
     Precompute the PSF's padded FFT and frequency grid.
 
-    Returns ``(shifted_psf, n_shift, pad)`` where ``shifted_psf`` is a
-    closure that takes the full parameter vector
-    ``[contrast, bg, *shifts]`` and returns the subpixel-shifted PSF
-    (contrast and bg are ignored by the closure), ``n_shift`` is the
-    number of shift parameters (3 for 3D, 2 for 2D), and ``pad`` is the
-    edge-pad width.
+    Returns ``(shifted_psf, n_shift)`` where ``shifted_psf`` is a closure
+    that takes the full parameter vector ``[contrast, bg, *shifts]`` and
+    returns the subpixel-shifted PSF (contrast and bg are ignored by the
+    closure), and ``n_shift`` is the number of shift parameters (3 for
+    3D, 2 for 2D).  The 2D path is selected when the PSF is a single
+    plane (``Pz == 1``).
 
     Building the FFT and frequency grids here -- once, outside the
     per-emitter ``vmap`` -- avoids recomputing them for every emitter
@@ -567,7 +628,7 @@ def _make_shifted_psf(
     """
     Pz, Py, Px = psf.shape
     pad = max(Pz, Py, Px)
-    if is_3d:
+    if Pz > 1:
         psf_padded = jnp.pad(psf, pad, mode="edge")
         kz = jnp.fft.fftfreq(Pz + 2 * pad)[:, None, None]
         ky = jnp.fft.fftfreq(Py + 2 * pad)[None, :, None]
@@ -580,7 +641,7 @@ def _make_shifted_psf(
             full = jnp.fft.ifftn(psf_fft * phase).real
             return full[pad : pad + Pz, pad : pad + Py, pad : pad + Px]
 
-        return shifted_psf, 3, pad
+        return shifted_psf, 3
 
     # 2D: the PSF is constant along z (Pz == 1); only (dy, dx) are fitted.
     psf_padded = jnp.pad(psf[0], pad, mode="edge")
@@ -594,83 +655,35 @@ def _make_shifted_psf(
         full = jnp.fft.ifftn(psf_fft * phase).real
         return full[pad : pad + Py, pad : pad + Px]
 
-    return shifted_psf, 2, pad
+    return shifted_psf, 2
 
 
-def _fit_one_emitter(
-    stamp: Float[Array, "Pz Py Px"],
+def _lm_refine(
+    params0: jax.Array,
+    residual: Callable[[jax.Array], jax.Array],
+    cost: Callable[[jax.Array], jax.Array],
     *,
-    shifted_psf: Callable,
-    n_shift: int,
-    pad: int,
     iterations: int,
     atol: float,
-) -> dict[str, jax.Array]:
+) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
     """
-    Refine a single emitter with Levenberg--Marquardt.
+    Run a fixed-length damped Gauss-Newton (Levenberg--Marquardt) scan.
 
-    Runs exactly ``iterations`` damped Gauss-Newton steps.  The
-    damping factor ``lambda`` is updated each iteration: divided by
-    two on accept, multiplied by two on reject.
+    Each step solves the Gauss--Newton normal equations
+    ``(J^T J + lambda * diag(J^T J)) delta = -J^T r`` with
+    ``J = jacfwd(residual)``; the damping ``lambda`` is halved on
+    accept and doubled on reject.  Once an emitter's
+    ``max(abs(delta))`` falls below ``atol`` it is marked converged and
+    **frozen** -- its parameters, damping, and cost are held fixed for
+    the remainder of the scan so later iterations cannot perturb a
+    converged result.
 
-    Once an emitter's parameter update falls below ``atol`` it is
-    marked converged and **frozen** -- its parameters, damping, and
-    cost are held fixed for the remainder of the scan so that later
-    iterations cannot perturb a converged result.  The ``n_iter``
-    output records the (1-indexed) iteration at which each emitter
-    first converged, or ``iterations`` if it never converged.
-
-    The shifted-PSF closure and its supporting precomputed data
-    (padded FFT, frequency grid, pad width) are supplied by the
-    caller so they are built once per batch rather than once per
-    emitter.  Two parameterizations are supported, selected by
-    ``n_shift`` (a Python int, so the branching folds into JIT):
-
-    - ``n_shift == 3``: 5 parameters ``(contrast, background, dz, dy, dx)``.
-    - ``n_shift == 2``: 4 parameters ``(contrast, background, dy, dx)``.
-
-    The 2D case avoids a spurious unconstrained ``dz`` direction
-    (the PSF is constant along ``z`` when ``Pz = 1``, so the
-    subpixel z-shift is meaningless and the Levenberg--Marquardt
-    solver would otherwise pick up numerical noise).
-
-    Internally the model is unified: the parameter vector always
-    has the form ``[contrast, bg, *shift_params]``, and the
-    ``shifted_psf`` closure unpacks the shift parameters itself.
-    This lets the cost function, the Levenberg--Marquardt step,
-    and the scan be shared between the 2D and 3D code paths.
+    Returns ``(final_params, final_cost, converged, n_iter)`` where
+    ``final_cost`` is ``0.5 * sum(residual(final_params)**2)`` and
+    ``n_iter`` is the 1-indexed iteration at which the emitter first
+    converged, or ``iterations`` if it never converged.
     """
-    Pz, Py, Px = stamp.shape
-
-    # Unified model: ``contrast * shifted_psf(params) + bg``.  The
-    # closure knows how to unpack the shift parameters from ``params``.
-    def model(params: Float[Array, " n_params"]) -> Float[Array, "Pz Py Px"]:
-        return params[0] * shifted_psf(params) + params[1]
-
-    # Initial guesses: contrast from the stamp centre, background from
-    # the stamp median, and zero subpixel shifts.
-    amp0 = stamp[Pz // 2, Py // 2, Px // 2]
-    bg0 = jnp.median(stamp)
-    shift0 = jnp.zeros(n_shift, dtype=stamp.dtype)
-    params0 = jnp.concatenate([jnp.array([amp0, bg0], dtype=stamp.dtype), shift0])
-
-    def residual(params: Float[Array, " n_params"]) -> Float[Array, " m"]:
-        return (stamp - model(params)).ravel()
-
-    def cost(params: Float[Array, " n_params"]) -> Float[Array, ""]:
-        r = residual(params)
-        return 0.5 * jnp.sum(r * r)
-
-    # Fixed-length Levenberg--Marquardt scan.  Every emitter runs the
-    # same number of iterations, which keeps the ``vmap`` over
-    # emitters happy.
-    #
-    # The normal equations use the Gauss--Newton approximation
-    # ``J^T J`` of the Hessian, with ``J = jacfwd(residual)``.  For only
-    # 4--5 parameters, forward-mode AD over the residual is far cheaper
-    # than ``jax.hessian``'s reverse-over-reverse pass, and Gauss--Newton
-    # is the standard model for least-squares refinement of a PSF.
-    lambda0 = jnp.array(1e-3, dtype=stamp.dtype)
+    lambda0 = jnp.array(1e-3, dtype=params0.dtype)
 
     def lm_step(carry, _):
         params, lambda_, prev_cost, converged, n_iter = carry
@@ -692,14 +705,12 @@ def _fit_one_emitter(
         step_cost = jnp.where(accept, candidate_cost, prev_cost)
         delta_max = jnp.max(jnp.abs(delta))
 
-        # Freeze already-converged emitters: keep their state unchanged
-        # so later iterations cannot perturb a converged result.
+        # Freeze already-converged emitters so later iterations cannot
+        # perturb a converged result.
         new_params = jnp.where(converged, params, step_params)
         new_lambda = jnp.where(converged, lambda_, step_lambda)
         new_cost = jnp.where(converged, prev_cost, step_cost)
 
-        # An emitter converges when its step satisfies delta_max < atol.
-        # Once converged it stays frozen for the remainder of the scan.
         newly_converged = (delta_max < atol) & ~converged
         new_converged = converged | newly_converged
         new_n_iter = jnp.where(converged, n_iter, n_iter + 1)
@@ -716,7 +727,42 @@ def _fit_one_emitter(
     (final_params, _, final_cost, final_converged, final_n_iter), _ = jax.lax.scan(
         lm_step, init_carry, None, length=iterations
     )
+    return final_params, final_cost, final_converged, final_n_iter
 
+
+def _fit_outputs(
+    stamp: jax.Array,
+    final_params: jax.Array,
+    final_cost: jax.Array,
+    converged: jax.Array,
+    n_iter: jax.Array,
+    *,
+    n_shift: int,
+    noise_sigma: jax.Array,
+) -> dict[str, jax.Array]:
+    """
+    Unpack fitted parameters and compute the per-emitter output columns.
+
+    The parameter vector has the form ``[contrast, bg, *shifts]`` with
+    ``len(shifts) == n_shift`` (3 for 3D, 2 for 2D).  The 2D case carries
+    a zero ``z_offset`` since the PSF is constant along ``z``.
+
+    Goodness of fit and signal-to-noise are normalised by the per-pixel
+    noise standard deviation ``noise_sigma``.  ``final_cost`` is
+    ``0.5 * sum(residual**2)``, so the sum of squared residuals is
+    ``2 * final_cost`` and no residual is re-evaluated here.
+
+    - ``chi2`` is the chi-squared statistic ``ssr / sigma**2``, which
+      follows a chi-squared distribution with ``dof = stamp.size -
+      n_params`` degrees of freedom under a correct model and Gaussian
+      noise.
+    - ``reduced_chi2`` is ``chi2 / dof`` and has expectation 1.
+    - ``snr`` is the fitted contrast divided by ``sigma``.
+
+    ``sigma`` is floored at a precision-relative value so that noise-free
+    data (``sigma == 0``, residual ``~ 0``) yields a near-zero ``chi2``
+    and a large-but-finite ``snr`` instead of NaN/inf.
+    """
     contrast = final_params[0]
     bg_fit = final_params[1]
     if n_shift == 3:
@@ -726,16 +772,19 @@ def _fit_one_emitter(
         dz = jnp.array(0.0, dtype=stamp.dtype)
 
     mass = jnp.sum(stamp)
-    converged = final_converged
 
-    # Signal-to-noise ratio: fitted contrast over the standard
-    # deviation of the per-pixel residuals.  The residual floor guards
-    # against a zero residual (e.g. noise-free synthetic data with a
-    # perfect fit), in which case the true SNR is infinite and is
-    # reported as a large finite value instead of NaN.
-    resid_std = jnp.std(residual(final_params))
-    resid_floor = jnp.asarray(jnp.finfo(stamp.dtype).tiny, dtype=stamp.dtype)
-    snr = contrast / jnp.maximum(resid_std, resid_floor)
+    ssr = 2.0 * final_cost
+    n_params = n_shift + 2
+    dof = jnp.maximum(
+        jnp.asarray(stamp.size - n_params, dtype=stamp.dtype),
+        jnp.asarray(1, dtype=stamp.dtype),
+    )
+    stamp_scale = jnp.maximum(jnp.max(jnp.abs(stamp)), jnp.asarray(1.0, dtype=stamp.dtype))
+    sigma_floor = jnp.asarray(jnp.sqrt(jnp.finfo(stamp.dtype).eps), dtype=stamp.dtype) * stamp_scale
+    sigma = jnp.maximum(noise_sigma, sigma_floor)
+    chi2 = ssr / (sigma * sigma)
+    reduced_chi2 = chi2 / dof
+    snr = contrast / sigma
 
     return {
         "contrast": contrast,
@@ -744,16 +793,134 @@ def _fit_one_emitter(
         "y_offset": dy,
         "x_offset": dx,
         "converged": converged,
-        "n_iter": final_n_iter,
-        "chi2": 2.0 * final_cost,
+        "n_iter": n_iter,
+        "chi2": chi2,
+        "reduced_chi2": reduced_chi2,
         "mass": mass,
         "snr": snr,
     }
 
 
+def _fit_one_emitter(
+    stamp: jax.Array,
+    *,
+    shifted_psf: Callable,
+    n_shift: int,
+    iterations: int,
+    atol: float,
+    noise_sigma: jax.Array,
+) -> dict[str, jax.Array]:
+    """
+    Refine a single emitter with Levenberg--Marquardt.
+
+    Builds the unified model ``contrast * shifted_psf(params) + bg``
+    (the ``shifted_psf`` closure unpacks the shift parameters itself),
+    forms the residual and cost, computes initial guesses, then
+    delegates the fixed-length LM scan to :func:`_lm_refine` and the
+    output assembly to :func:`_fit_outputs`.
+
+    Two parameterizations are supported, selected by ``n_shift`` (a
+    Python int so the branching folds into JIT):
+
+    - ``n_shift == 3``: 5 parameters ``(contrast, background, dz, dy, dx)``.
+    - ``n_shift == 2``: 4 parameters ``(contrast, background, dy, dx)``.
+
+    The 2D case avoids a spurious unconstrained ``dz`` direction (the
+    PSF is constant along ``z`` when ``Pz = 1``, so the subpixel
+    z-shift is meaningless and the solver would otherwise pick up
+    numerical noise).
+    """
+    Pz, Py, Px = stamp.shape
+
+    def model(params: jax.Array) -> jax.Array:
+        return params[0] * shifted_psf(params) + params[1]
+
+    def residual(params: jax.Array) -> jax.Array:
+        return (stamp - model(params)).ravel()
+
+    def cost(params: jax.Array) -> jax.Array:
+        r = residual(params)
+        return 0.5 * jnp.sum(r * r)
+
+    # Initial guesses: contrast from the stamp centre, background from
+    # the stamp median, and zero subpixel shifts.
+    amp0 = stamp[Pz // 2, Py // 2, Px // 2]
+    bg0 = jnp.median(stamp)
+    shift0 = jnp.zeros(n_shift, dtype=stamp.dtype)
+    params0 = jnp.concatenate([jnp.array([amp0, bg0], dtype=stamp.dtype), shift0])
+
+    final_params, final_cost, converged, n_iter = _lm_refine(
+        params0,
+        residual,
+        cost,
+        iterations=iterations,
+        atol=atol,
+    )
+    return _fit_outputs(
+        stamp,
+        final_params,
+        final_cost,
+        converged,
+        n_iter,
+        n_shift=n_shift,
+        noise_sigma=noise_sigma,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Small helpers
 # ---------------------------------------------------------------------------
+
+
+def _estimate_noise_sigma(
+    chunk: Float[Array, "B Z Y X"],
+    n_active_frames: int,
+) -> jax.Array:
+    """
+    Estimate the per-pixel noise standard deviation of ``chunk``.
+
+    A second-difference filter (taps ``[1, -2, 1]``) cancels smooth
+    signal and constant background, so its output is dominated by noise.
+    Second differences are pooled over every spatial axis with at least
+    three samples, and the median absolute deviation (MAD) -- a robust
+    scale estimator tolerant of the sparse emitter pixels -- is
+    converted to a standard deviation.
+
+    Two derived (non hard-coded) constants appear:
+
+    * ``hf_gain`` -- the L2 gain of the high-pass filter, computed as
+      ``sqrt(sum(taps**2))``; for ``[1, -2, 1]`` this is ``sqrt(6)``.
+    * ``mad_to_sigma`` -- the MAD-to-standard-deviation factor for a
+      normal distribution, ``1 / norm.ppf(0.75)`` (about 1.4826).
+
+    A tiny floor guards against noise-free data, where the estimate is
+    exactly zero; the per-emitter precision floor in
+    :func:`_fit_outputs` dominates in practice.
+    """
+    active = chunk[:n_active_frames]
+    Z, Y, X = active.shape[1], active.shape[2], active.shape[3]
+    taps = jnp.array([1.0, -2.0, 1.0], dtype=active.dtype)
+    hf_gain = jnp.sqrt(jnp.sum(taps**2))
+    mad_to_sigma = 1.0 / jstats.norm.ppf(0.75)
+    diffs: list[jax.Array] = []
+    if X >= 3:
+        diffs.append((active[..., 2:] - 2 * active[..., 1:-1] + active[..., :-2]).reshape(-1))
+    if Y >= 3:
+        diffs.append(
+            (active[:, :, 2:, :] - 2 * active[:, :, 1:-1, :] + active[:, :, :-2, :]).reshape(-1)
+        )
+    if Z >= 3:
+        diffs.append(
+            (active[:, 2:, :, :] - 2 * active[:, 1:-1, :, :] + active[:, :-2, :, :]).reshape(-1)
+        )
+    if not diffs:
+        return jnp.asarray(jnp.finfo(active.dtype).tiny, dtype=active.dtype)
+    d = jnp.concatenate(diffs)
+    med = jnp.median(d)
+    mad = jnp.median(jnp.abs(d - med))
+    sigma = mad_to_sigma * mad / hf_gain
+    floor = jnp.asarray(jnp.finfo(active.dtype).tiny, dtype=active.dtype)
+    return jnp.maximum(sigma, floor)
 
 
 def _channel_scalar_and_dtype(
@@ -792,6 +959,7 @@ def _empty_result(channel: int | str | float = 0) -> polars.DataFrame:
             "mass": polars.Float32,
             "snr": polars.Float32,
             "chi2": polars.Float32,
+            "reduced_chi2": polars.Float32,
             "n_iter": polars.Int32,
             "converged": polars.Boolean,
         },

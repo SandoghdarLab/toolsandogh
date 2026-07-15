@@ -62,6 +62,7 @@ def test_locate_returns_strict_schema() -> None:
         "mass": polars.Float32,
         "snr": polars.Float32,
         "chi2": polars.Float32,
+        "reduced_chi2": polars.Float32,
         "n_iter": polars.Int32,
         "converged": polars.Boolean,
     }
@@ -239,7 +240,7 @@ def test_locate_dtype_strictness() -> None:
         iterations=50,
         atol=1e-4,
     )
-    float_cols = {"z", "y", "x", "contrast", "background", "mass", "snr", "chi2"}
+    float_cols = {"z", "y", "x", "contrast", "background", "mass", "snr", "chi2", "reduced_chi2"}
     for col in float_cols:
         if col in locs.columns and locs[col].null_count() < locs.shape[0]:
             assert locs[col].dtype == polars.Float32
@@ -551,15 +552,19 @@ def test_locate_anisotropic_psf() -> None:
 
 
 def test_locate_snr_is_computed() -> None:
-    """The ``snr`` column must be finite and scale with contrast over noise."""
+    """The ``snr`` column must be finite and scale with contrast over noise.
+
+    A 20x20 frame keeps the 7x7 particle sparse so the robust noise
+    estimate is accurate, making the quiet/loud SNR ordering reliable.
+    """
     psf = _gaussian_psf(1.5, 7).reshape(1, 7, 7)
     trajectories = polars.DataFrame(
         {
             "t": [0],
             "c": [0],
             "z": [0.0],
-            "y": [5.0],
-            "x": [5.0],
+            "y": [10.0],
+            "x": [10.0],
             "contrast": [2.0],
             "particle_id": [0],
         }
@@ -574,7 +579,7 @@ def test_locate_snr_is_computed() -> None:
     quiet = tog.simulate_particles(
         trajectories,
         psf,
-        shape=(1, 1, 1, 10, 10),
+        shape=(1, 1, 1, 20, 20),
         noise_sigma=0.02,
         seed=0,
         dtype=np.float32,
@@ -582,7 +587,7 @@ def test_locate_snr_is_computed() -> None:
     loud = tog.simulate_particles(
         trajectories,
         psf,
-        shape=(1, 1, 1, 10, 10),
+        shape=(1, 1, 1, 20, 20),
         noise_sigma=0.5,
         seed=0,
         dtype=np.float32,
@@ -590,10 +595,10 @@ def test_locate_snr_is_computed() -> None:
     quiet_locs = tog.locate_in_chunk(jnp.asarray(quiet.values[0]), psf, **common)
     loud_locs = tog.locate_in_chunk(jnp.asarray(loud.values[0]), psf, **common)
 
-    # Pick the detection nearest the true emitter position (5, 5).
+    # Pick the detection nearest the true emitter position (10, 10).
     def _nearest_snr(locs: polars.DataFrame) -> float:
-        dy = locs["y"].to_numpy() - 5.0
-        dx = locs["x"].to_numpy() - 5.0
+        dy = locs["y"].to_numpy() - 10.0
+        dx = locs["x"].to_numpy() - 10.0
         idx = int(np.argmin(dy * dy + dx * dx))
         return float(locs["snr"][idx])
 
@@ -605,6 +610,136 @@ def test_locate_snr_is_computed() -> None:
     assert quiet_snr > 0
     assert loud_snr > 0
     assert quiet_snr > loud_snr
+
+
+def test_locate_snr_uses_supplied_noise() -> None:
+    """A supplied ``noise_sigma`` must set the ``snr`` scale directly."""
+    psf = _gaussian_psf(1.5, 7).reshape(1, 7, 7)
+    trajectories = polars.DataFrame(
+        {
+            "t": [0],
+            "c": [0],
+            "z": [0.0],
+            "y": [10.0],
+            "x": [10.0],
+            "contrast": [2.0],
+            "particle_id": [0],
+        }
+    )
+    # Noise-free data so the fit recovers the contrast exactly; the
+    # supplied sigma then fixes the SNR scale.
+    video = tog.simulate_particles(
+        trajectories,
+        psf,
+        shape=(1, 1, 1, 20, 20),
+        noise_sigma=0.0,
+        dtype=np.float32,
+    )
+    locs = tog.locate_in_chunk(
+        jnp.asarray(video.values[0]),
+        psf,
+        min_distance=3,
+        min_contrast=0.1,
+        sign="positive",
+        iterations=50,
+        atol=1e-4,
+        noise_sigma=0.1,
+    )
+    assert locs.shape[0] >= 1
+    # Fitted contrast ~ 2.0, supplied sigma 0.1 -> snr ~ 20.
+    snr = float(locs["snr"][0])
+    assert np.isfinite(snr)
+    assert snr > 0
+    assert abs(snr - 20.0) < 5.0
+
+
+def test_locate_chi2_near_dof_for_good_fit() -> None:
+    """``chi2`` centres on ``dof`` and ``reduced_chi2`` on 1 for a good fit."""
+    psf = _gaussian_psf(1.5, 9).reshape(1, 9, 9)
+    n_frames = 16
+    cy, cx = 9.0, 9.0
+    radius = 2.5
+    t = np.arange(n_frames)
+    theta = 2.0 * np.pi * t / n_frames
+    trajectories = polars.DataFrame(
+        {
+            "t": t.tolist(),
+            "c": [0] * n_frames,
+            "z": [0.0] * n_frames,
+            "y": (cy + radius * np.cos(theta)).tolist(),
+            "x": (cx + radius * np.sin(theta)).tolist(),
+            "contrast": [2.0] * n_frames,
+            "particle_id": [0] * n_frames,
+        }
+    )
+    video = tog.simulate_particles(
+        trajectories,
+        psf,
+        shape=(n_frames, 1, 1, 20, 20),
+        noise_sigma=0.1,
+        seed=1,
+        dtype=np.float32,
+    )
+    locs = tog.locate(
+        video,
+        psf,
+        chunk_size=4,
+        min_distance=4,
+        min_contrast=0.2,
+        iterations=30,
+        atol=1e-4,
+        noise_sigma=0.1,
+    )
+    assert locs.shape[0] >= n_frames
+    # Spurious noise peaks survive the modest threshold; keep, for each
+    # frame, the detection nearest the known true position and compute
+    # chi2 on that subset (the real, well-fit emitters).
+    locs = locs.with_columns(
+        (polars.col("y") - cy).alias("_dy"), (polars.col("x") - cx).alias("_dx")
+    )
+    # distance to the true circular trajectory at the detection's frame.
+    true_y = cy + radius * np.cos(2.0 * np.pi * locs["t"].to_numpy() / n_frames)
+    true_x = cx + radius * np.sin(2.0 * np.pi * locs["t"].to_numpy() / n_frames)
+    dist = np.sqrt((locs["y"].to_numpy() - true_y) ** 2 + (locs["x"].to_numpy() - true_x) ** 2)
+    locs = locs.with_columns(polars.Series("_dist", dist))
+    keep_idx = locs.sort("_dist").group_by("t", maintain_order=True).first()
+    chi2 = keep_idx.sort("t")["chi2"].to_numpy()
+    reduced = keep_idx.sort("t")["reduced_chi2"].to_numpy()
+    assert chi2.shape[0] == n_frames
+    # The 9x9 2D stamp has dof = 81 - 4 = 77; with the matching noise
+    # sigma the chi-squared statistic should centre on dof.
+    dof = 9 * 9 - 4
+    assert dof == 77
+    assert np.all(np.isfinite(chi2))
+    assert np.all(chi2 > 0)
+    assert 0.5 * dof < np.mean(chi2) < 1.7 * dof
+    assert np.max(chi2) < 3.0 * dof
+    # And the reduced chi-squared centres on 1.
+    assert np.all(np.isfinite(reduced))
+    assert 0.5 < np.mean(reduced) < 1.7
+    assert np.max(reduced) < 3.0
+
+
+def test_estimate_noise_sigma_recovers_known_std() -> None:
+    """The robust estimator recovers a known noise std from pure noise."""
+    import jax
+
+    from toolsandogh._locate import _estimate_noise_sigma
+
+    key = jax.random.PRNGKey(0)
+    noise = 0.3 * jax.random.normal(key, (1, 1, 64, 64), dtype=np.float32)
+    est = float(np.asarray(_estimate_noise_sigma(noise, 1)))
+    # The MAD estimate from ~8k second-difference samples is accurate to
+    # a few percent; allow a generous band.
+    assert 0.27 < est < 0.33
+
+
+def test_locate_noise_sigma_validation() -> None:
+    """A negative ``noise_sigma`` must be rejected at the boundary."""
+    psf = _gaussian_psf(1.5, 7).reshape(1, 7, 7)
+    chunk = jnp.zeros((1, 1, 10, 10), dtype=np.float32)
+    with pytest.raises(ValueError, match="noise_sigma"):
+        tog.locate_in_chunk(chunk, psf, noise_sigma=-0.1)
 
 
 def test_locate_background_matches_constant_offset() -> None:

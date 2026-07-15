@@ -7,6 +7,7 @@ import pytest
 import xarray as xr
 
 import toolsandogh as tog
+from toolsandogh._locate import _locate_in_chunk as locate_in_chunk
 
 
 def _gaussian_psf(sigma: float, n: int) -> jnp.ndarray:
@@ -50,7 +51,7 @@ def test_simulate_particles_roundtrip_single_emitter() -> None:
     assert video.dtype == np.float32
 
     # Locate the emitter with the same PSF.
-    locs = tog.locate_in_chunk(
+    locs = locate_in_chunk(
         jnp.asarray(video.values[0]),
         psf,
         min_distance=3,
@@ -87,7 +88,7 @@ def test_simulate_particles_negative_contrast() -> None:
         noise_sigma=0.0,
         dtype=np.float32,
     )
-    locs = tog.locate_in_chunk(
+    locs = locate_in_chunk(
         jnp.asarray(video.values[0]),
         psf,
         min_distance=3,
@@ -172,7 +173,7 @@ def test_simulate_particles_3d() -> None:
         noise_sigma=0.0,
         dtype=np.float32,
     )
-    locs = tog.locate_in_chunk(
+    locs = locate_in_chunk(
         jnp.asarray(video.values[0]),
         psf,
         min_distance=3,

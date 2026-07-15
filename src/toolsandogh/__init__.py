@@ -8,7 +8,7 @@ from ._canonicalize_video import canonicalize_video
 from ._generate_video import generate_video
 from ._link import link
 from ._load_video import load_video
-from ._locate import locate, locate_in_chunk
+from ._locate import locate
 from ._rolling import differential_rolling_average, rolling_average, rolling_sum
 from ._rvt import radial_variance_transform
 from ._simulate_particles import simulate_particles
@@ -51,7 +51,6 @@ __all__: list[str] = [
     "differential_rolling_average",
     "link",
     "locate",
-    "locate_in_chunk",
     "focused_incident_field",
     "generate_video",
     "image_field_from_pupil",

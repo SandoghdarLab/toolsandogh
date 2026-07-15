@@ -1,12 +1,13 @@
 """
 Localization of point spread functions.
 
-The :func:`locate` function is the public entry point: it accepts a canonical
-Dask-backed ``(T, C, Z, Y, X)`` :class:`xarray.DataArray` and a PSF model and
-returns a Polars DataFrame of detected emitters with fitted positions,
-contrasts, and per-emitter statistics.  The auxiliary function
-:func:`locate_in_chunk` operates on a single in-memory chunk of shape ``(B, Z,
-Y, X)``.
+The :func:`locate` function is the public entry point: it accepts any
+array-like video (canonicalized internally to a Dask-backed
+``(T, C, Z, Y, X)`` :class:`xarray.DataArray`) and a 2D or 3D PSF model,
+and returns a Polars DataFrame of detected emitters with fitted positions,
+contrasts, and per-emitter statistics.  The private helper
+:func:`_locate_in_chunk` operates on a single in-memory chunk of shape
+``(B, Z, Y, X)`` and expects well-formed JAX-array arguments.
 """
 
 from typing import Callable, Literal
@@ -47,7 +48,7 @@ _MAX_EMITTERS_PER_BATCH = 256
 
 
 def locate(
-    video: xr.DataArray,
+    video: npt.ArrayLike,
     psf: npt.ArrayLike,
     *,
     channel: int | str | float | None = None,
@@ -71,11 +72,16 @@ def locate(
 
     Parameters
     ----------
-    video : xarray.DataArray
-        A canonical ``(T, C, Z, Y, X)`` :class:`xarray.DataArray`,
-        typically Dask-backed.
+    video : array-like or xarray.DataArray
+        The video to localize.  Any object accepted by
+        :func:`canonicalize_video` may be supplied: a raw NumPy array,
+        a Dask array, a list, or an already-canonical
+        ``(T, C, Z, Y, X)`` :class:`xarray.DataArray`.  The argument is
+        canonicalized before any work is done.
     psf : array-like
-        The 3D point-spread function model, shape ``(Pz, Py, Px)``.
+        The point-spread function model, shape ``(Py, Px)`` for a 2D
+        (widefield) PSF or ``(Pz, Py, Px)`` for a 3D PSF.  A 2D PSF is
+        promoted to ``(1, Py, Px)`` internally.
     channel : int or str or float, optional
         The channel to localize.  Required when the video has more than
         one channel.  May be a label (anything xarray's ``.sel``
@@ -146,14 +152,14 @@ def locate(
     not supplied, it is estimated per chunk as described under the
     ``noise_sigma`` parameter.
     """
-    # Cast the PSF to the requested dtype and check its rank.
+    # Canonicalize the inputs.  ``video`` may be any array-like (a raw
+    # NumPy array, a Dask array, a list, or an already-canonical DataArray);
+    # ``canonicalize_video`` coerces it into the canonical Dask-backed
+    # ``(T, C, Z, Y, X)`` representation.  ``psf`` is promoted to 3D and cast
+    # to the requested dtype.
     dtype = np.dtype(dtype)
-    psf_arr = np.asarray(psf, dtype=dtype)
-    if psf_arr.ndim != 3:
-        raise ValueError(f"`psf` must be a 3D array, got an array of shape {psf_arr.shape}.")
-
-    # Validate the video.
-    canonicalize_video(video)
+    video = canonicalize_video(video)
+    psf_arr = _canonicalize_psf(psf, dtype=dtype)
 
     # Select the channel.  ``channel`` may be a label (string) or an
     # integer index.  We keep the original label so it can be written
@@ -213,7 +219,7 @@ def locate(
                 mode="constant",
             )
         chunk = jnp.asarray(chunk_np)
-        result = locate_in_chunk(
+        result = _locate_in_chunk(
             chunk=chunk,
             psf=psf_jax,
             n_active_frames=n_active,
@@ -236,7 +242,7 @@ def locate(
     return polars.concat(results, how="vertical_relaxed")
 
 
-def locate_in_chunk(
+def _locate_in_chunk(
     chunk: Float[Array, "B Z Y X"],
     psf: Float[Array, "Z Y X"],
     *,
@@ -251,7 +257,14 @@ def locate_in_chunk(
     noise_sigma: float | None = None,
 ) -> polars.DataFrame:
     """
-    Locate particles in a single (B, Z, Y, X) chunk.
+    Locate particles in a single ``(B, Z, Y, X)`` chunk.
+
+    This is the in-memory, single-chunk primitive used by :func:`locate`.
+    Both ``chunk`` and ``psf`` must already be well-formed JAX arrays:
+    ``chunk`` is a dense 4D ``(B, Z, Y, X)`` array and ``psf`` is a 3D
+    ``(Pz, Py, Px)`` array (a 2D PSF must have been promoted to ``(1, Py,
+    Px)`` by the caller).  Input canonicalization and validation are the
+    responsibility of :func:`locate`, not of this function.
 
     Parameters
     ----------
@@ -885,6 +898,45 @@ def _fit_one_emitter(
 # ---------------------------------------------------------------------------
 # Small helpers
 # ---------------------------------------------------------------------------
+
+
+def _canonicalize_psf(
+    psf: npt.ArrayLike,
+    *,
+    dtype: npt.DTypeLike | None = None,
+) -> np.ndarray:
+    """
+    Coerce a PSF model to the canonical 3D ``(Pz, Py, Px)`` form.
+
+    A 2D ``(Py, Px)`` PSF (widefield) is promoted to ``(1, Py, Px)``.
+    Any other rank is rejected.  The result is cast to ``dtype`` when
+    supplied, otherwise the input dtype is preserved.
+
+    Parameters
+    ----------
+    psf : array-like
+        The PSF model, 2D or 3D.
+    dtype : numpy dtype, optional
+        The dtype to cast the PSF to.
+
+    Returns
+    -------
+    numpy.ndarray
+        A 3D ``(Pz, Py, Px)`` array of the requested dtype.
+
+    Raises
+    ------
+    ValueError
+        If ``psf`` is neither 2D nor 3D.
+    """
+    arr = np.asarray(psf)
+    if arr.ndim == 2:
+        arr = arr[np.newaxis, :, :]
+    if arr.ndim != 3:
+        raise ValueError(f"`psf` must be a 2D or 3D array, got an array of shape {arr.shape}.")
+    if dtype is not None:
+        arr = arr.astype(dtype)
+    return arr
 
 
 def _estimate_noise_sigma(

@@ -55,6 +55,10 @@ def generate_video(
             size=(T, C, Z, Y, X),
             dtype=dtype,  # type: ignore
         ),
+        dt=dt,
+        dz=dz,
+        dy=dy,
+        dx=dx,
     )
 
     # Check that the video matches the supplied parameters.

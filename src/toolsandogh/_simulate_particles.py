@@ -192,6 +192,10 @@ def simulate_particles(
         Z=Z,
         Y=Y,
         X=X,
+        dt=1.0,
+        dz=1.0,
+        dy=1.0,
+        dx=1.0,
         dtype=dtype,
     )
 

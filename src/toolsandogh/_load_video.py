@@ -291,7 +291,7 @@ def load_raw_video(
         dask_array = load_raw_array(path, shape=shape, dtype=dtype, chunk_size=frames_per_chunk)
 
     # Wrap the dask array as a xarray.DataArray and return it.
-    return canonicalize_video(dask_array)  # type: ignore
+    return canonicalize_video(dask_array, dt=dt, dz=dz, dy=dy, dx=dx)  # type: ignore
 
 
 def load_raw_array(

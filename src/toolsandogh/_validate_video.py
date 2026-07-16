@@ -47,6 +47,23 @@ def validate_video(video) -> None:
         if coord.dtype != np.float64:
             raise TypeError(f"The {dim} coordinate is not continuous.")
 
+    # Ensure temporal and spatial coordinates are uniformly spaced.
+    # ``locate`` relies on a constant per-axis step when mapping subpixel
+    # offsets into coordinate units; a sporadic check (first spacing versus
+    # the middle spacing) catches irregular sampling cheaply without
+    # scanning the whole axis.
+    for dim in ("T", "Z", "Y", "X"):
+        coord = video[dim]
+        n = coord.size
+        if n >= 3:
+            first = float(coord.values[1] - coord.values[0])
+            mid = float(coord.values[n // 2] - coord.values[n // 2 - 1])
+            if not np.isclose(first, mid, rtol=1e-6, atol=0.0):
+                raise ValueError(
+                    f"The {dim} coordinate is not uniformly spaced: "
+                    f"first spacing {first} differs from midpoint spacing {mid}."
+                )
+
     # Ensure metadata exists and is of the right format.
     metadata = video.attrs["processed"]
     if not isinstance(metadata, ome.OME):

@@ -17,7 +17,6 @@ from typing import Callable, Literal
 import jax
 import jax.numpy as jnp
 import jax.scipy.signal as jsignal
-import jax.scipy.stats as jstats
 import numpy as np
 import numpy.typing as npt
 import polars
@@ -118,11 +117,12 @@ def locate(
         ``atol`` are marked ``converged=True``.
     noise_sigma : float, optional
         Standard deviation of the per-pixel Gaussian noise.  When
-        ``None`` (the default) it is estimated robustly from each chunk
-        via the median absolute deviation of second differences.  The
-        value normalises the ``chi2``, ``reduced_chi2`` and ``snr`` output
-        columns; supplying a known value yields statistics that are
-        comparable across runs and devices.  The default is ``None``.
+        ``None`` (the default) it is estimated **per frame** from the
+        standard deviation of second differences (a single-pass
+        Laplacian-based noise estimator).  The value normalises the
+        ``chi2``, ``reduced_chi2`` and ``snr`` output columns; supplying
+        a known value yields statistics that are comparable across runs
+        and devices.  The default is ``None``.
     dtype : numpy dtype
         Dtype used for the data during localization.
     on_progress : callable, optional
@@ -153,7 +153,7 @@ def locate(
     under a correct model and Gaussian noise.  The ``reduced_chi2`` column
     is ``chi2 / dof`` and has expectation 1.  The ``snr`` column is the
     fitted contrast divided by ``noise_sigma``.  When ``noise_sigma`` is
-    not supplied, it is estimated per chunk as described under the
+    not supplied, it is estimated per frame as described under the
     ``noise_sigma`` parameter.
     """
     # Canonicalize the inputs.  ``video`` may be any array-like (a raw
@@ -343,11 +343,10 @@ def _locate_in_chunk(
         ``atol`` are marked ``converged=True``.
     noise_sigma : float, optional
         Standard deviation of the per-pixel Gaussian noise.  When
-        ``None`` (the default) it is estimated robustly from the
-        chunk's active frames via the median absolute deviation of
-        second differences.  The value normalises the ``chi2``,
-        ``reduced_chi2`` and ``snr`` output columns.  The default is
-        ``None``.
+        ``None`` (the default) it is estimated **per frame** from the
+        standard deviation of second differences.  The value normalises
+        the ``chi2``, ``reduced_chi2`` and ``snr`` output columns.  The
+        default is ``None``.
 
     Returns
     -------
@@ -413,14 +412,17 @@ def _locate_in_chunk(
     #    all emitters, instead of one eager pad+slice per emitter).
     stamps = _extract_stamps_batch(chunk, b_idx, rows_z, rows_y, rows_x, (Pz, Py, Px))
 
-    # Resolve the per-pixel noise standard deviation: either the value
-    # supplied by the caller or a robust estimate from the chunk's active
-    # frames.  It is kept as a device-resident scalar so no extra host sync
-    # is needed before the batched fit.
+    # Resolve the per-emitter noise standard deviation.  When the caller
+    # does not supply one, it is estimated per frame from the standard
+    # deviation of second differences (a single-pass O(n) estimator) and
+    # gathered per emitter by frame index.  A supplied scalar is broadcast
+    # across all emitters.  The result is a (n_emitters,) device array
+    # kept resident so no extra host sync is needed before the batched fit.
     if noise_sigma is None:
-        noise_sigma_arr = _estimate_noise_sigma(chunk, n_active_frames)
+        per_frame_sigma = _estimate_noise_sigma(chunk, n_active_frames)  # (B,)
+        noise_sigma_arr = per_frame_sigma[jnp.asarray(b_idx)]  # (n_emitters,)
     else:
-        noise_sigma_arr = jnp.asarray(noise_sigma, dtype=chunk.dtype)
+        noise_sigma_arr = jnp.full((n_emitters,), noise_sigma, dtype=chunk.dtype)
 
     # 4. Batched Levenberg--Marquardt refinement.  Stamps are processed in
     #    sub-batches whose size is the next power of two (capped at
@@ -447,6 +449,7 @@ def _locate_in_chunk(
     n_iter_stacks: list[jax.Array] = []
     for i in range(0, n_emitters, batch_size):
         sub_stamps = stamps[i : i + batch_size]
+        sub_sigma = noise_sigma_arr[i : i + batch_size]
         n_sub = sub_stamps.shape[0]
         if n_sub < batch_size:
             sub_stamps = jnp.pad(
@@ -454,12 +457,13 @@ def _locate_in_chunk(
                 ((0, batch_size - n_sub), (0, 0), (0, 0), (0, 0)),
                 mode="constant",
             )
+            sub_sigma = jnp.pad(sub_sigma, (0, batch_size - n_sub), mode="constant")
         sub_fit = _fit_emitters_batch(
             sub_stamps,
             psf,
             iterations=iterations,
             atol=atol,
-            noise_sigma=noise_sigma_arr,
+            noise_sigma=sub_sigma,
         )
         sub_stack = jnp.stack([sub_fit[k] for k in fit_keys])  # (9, batch)
         fit_stacks.append(sub_stack[:, :n_sub])
@@ -640,11 +644,10 @@ def _fit_emitters_batch(
     through ``jax.vmap``.  Convergence is decided afterwards by
     comparing the final parameter update to ``atol``.
 
-    ``noise_sigma`` is the per-pixel noise standard deviation used to
-    normalise each emitter's ``chi2``, ``reduced_chi2`` and ``snr``
-    outputs.  It is a scalar shared across the batch and is passed to
-    the per-emitter closure unbatched (``in_axes=None``) so it is not
-    replicated.
+    ``noise_sigma`` is the per-emitter noise standard deviation (a
+    ``(batch,)`` array, one value per emitter) used to normalise each
+    emitter's ``chi2``, ``reduced_chi2`` and ``snr`` outputs.  It is
+    mapped alongside the stamps (``in_axes=(0, 0)``).
 
     Returns a dictionary of per-emitter outputs:
     ``contrast``, ``background``, ``z_offset``, ``y_offset``,
@@ -662,7 +665,7 @@ def _fit_emitters_batch(
             atol=atol,
             noise_sigma=sig,
         ),
-        in_axes=(0, None),
+        in_axes=(0, 0),
     )
     return fit_one(stamps, sigma)
 
@@ -975,48 +978,50 @@ def _estimate_noise_sigma(
     n_active_frames: int,
 ) -> jax.Array:
     """
-    Estimate the per-pixel noise standard deviation of ``chunk``.
+    Estimate the per-pixel noise standard deviation of ``chunk`` per frame.
+
+    Returns a ``(n_active_frames,)`` array with one sigma value per
+    frame.
 
     A second-difference filter (taps ``[1, -2, 1]``) cancels smooth
-    signal and constant background, so its output is dominated by noise.
-    Second differences are pooled over every spatial axis with at least
-    three samples, and the median absolute deviation (MAD) -- a robust
-    scale estimator tolerant of the sparse emitter pixels -- is
-    converted to a standard deviation.
+    signal and constant background, so its output is dominated by
+    noise.  Second differences are computed along every spatial axis
+    with at least three samples, pooled per frame, and the per-frame
+    standard deviation is divided by the filter's L2 gain
+    ``sqrt(sum(taps**2))`` (``sqrt(6)`` for ``[1, -2, 1]``) to recover
+    the underlying noise sigma.
 
-    Two derived (non hard-coded) constants appear:
-
-    * ``hf_gain`` -- the L2 gain of the high-pass filter, computed as
-      ``sqrt(sum(taps**2))``; for ``[1, -2, 1]`` this is ``sqrt(6)``.
-    * ``mad_to_sigma`` -- the MAD-to-standard-deviation factor for a
-      normal distribution, ``1 / norm.ppf(0.75)`` (about 1.4826).
+    This is a single-pass O(n) estimator (one fused reduction per
+    frame, no sort).  It is non-robust to bright emitter pixels, but
+    emitters are sparse and this is a fallback for when the caller does
+    not supply a known ``noise_sigma``; a supplied value always takes
+    precedence.  On pure Gaussian noise the standard deviation is a
+    lower-variance estimator than the median absolute deviation.
 
     A tiny floor guards against noise-free data, where the estimate is
-    exactly zero; the per-emitter precision floor in
-    :func:`_fit_outputs` dominates in practice.
+    exactly zero; the per-emitter precision floor in :func:`_fit_outputs`
+    dominates in practice.
     """
-    active = chunk[:n_active_frames]
+    active = chunk[:n_active_frames]  # (B, Z, Y, X)
+    B = active.shape[0]
     Z, Y, X = active.shape[1], active.shape[2], active.shape[3]
     taps = jnp.array([1.0, -2.0, 1.0], dtype=active.dtype)
-    hf_gain = jnp.sqrt(jnp.sum(taps**2))
-    mad_to_sigma = 1.0 / jstats.norm.ppf(0.75)
+    hf_gain = jnp.sqrt(jnp.sum(taps**2))  # sqrt(6)
     diffs: list[jax.Array] = []
     if X >= 3:
-        diffs.append((active[..., 2:] - 2 * active[..., 1:-1] + active[..., :-2]).reshape(-1))
+        diffs.append((active[..., 2:] - 2 * active[..., 1:-1] + active[..., :-2]).reshape(B, -1))
     if Y >= 3:
         diffs.append(
-            (active[:, :, 2:, :] - 2 * active[:, :, 1:-1, :] + active[:, :, :-2, :]).reshape(-1)
+            (active[:, :, 2:, :] - 2 * active[:, :, 1:-1, :] + active[:, :, :-2, :]).reshape(B, -1)
         )
     if Z >= 3:
         diffs.append(
-            (active[:, 2:, :, :] - 2 * active[:, 1:-1, :, :] + active[:, :-2, :, :]).reshape(-1)
+            (active[:, 2:, :, :] - 2 * active[:, 1:-1, :, :] + active[:, :-2, :, :]).reshape(B, -1)
         )
     if not diffs:
-        return jnp.asarray(jnp.finfo(active.dtype).tiny, dtype=active.dtype)
-    d = jnp.concatenate(diffs)
-    med = jnp.median(d)
-    mad = jnp.median(jnp.abs(d - med))
-    sigma = mad_to_sigma * mad / hf_gain
+        return jnp.full((B,), jnp.finfo(active.dtype).tiny, dtype=active.dtype)
+    d = jnp.concatenate(diffs, axis=1)  # (B, n_samples)
+    sigma = jnp.std(d, axis=1) / hf_gain  # (B,)
     floor = jnp.asarray(jnp.finfo(active.dtype).tiny, dtype=active.dtype)
     return jnp.maximum(sigma, floor)
 

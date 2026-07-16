@@ -825,17 +825,21 @@ def test_locate_chi2_near_dof_for_good_fit() -> None:
 
 
 def test_estimate_noise_sigma_recovers_known_std() -> None:
-    """The robust estimator recovers a known noise std from pure noise."""
+    """The per-frame estimator recovers a known noise std from pure noise."""
     import jax
 
     from toolsandogh._locate import _estimate_noise_sigma
 
     key = jax.random.PRNGKey(0)
     noise = 0.3 * jax.random.normal(key, (1, 1, 64, 64), dtype=np.float32)
-    est = float(np.asarray(_estimate_noise_sigma(noise, 1)))
-    # The MAD estimate from ~8k second-difference samples is accurate to
-    # a few percent; allow a generous band.
-    assert 0.27 < est < 0.33
+    est = np.asarray(_estimate_noise_sigma(noise, 1))
+    # The estimator returns one sigma per frame.
+    assert est.shape == (1,)
+    est = float(est[0])
+    # The std-of-second-differences estimator from ~8k samples recovers
+    # the true sigma to within a fraction of a percent; allow a small
+    # band for float32 reduction noise.
+    assert 0.285 < est < 0.315
 
 
 def test_locate_noise_sigma_validation() -> None:

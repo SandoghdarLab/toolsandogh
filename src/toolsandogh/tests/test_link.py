@@ -390,7 +390,7 @@ def test_link_per_axis_tuple_requires_z_column() -> None:
     locs = _simulate_and_locate(trajectories, psf, (n_frames, 1, 1, 10, 10))
     # Drop the z column to force the error.
     locs_no_z = locs.drop("z")
-    with pytest.raises(ValueError, match="requires the columns"):
+    with pytest.raises(ValueError, match="missing required columns"):
         tog.link(locs_no_z, search_range_micrometers=(1.0, 1.0, 1.0))
 
 
@@ -413,3 +413,106 @@ def test_link_rejects_2_tuple() -> None:
     locs = _simulate_and_locate(trajectories, psf, (n_frames, 1, 1, 10, 10))
     with pytest.raises(ValueError, match="3-tuple"):
         tog.link(locs, search_range_micrometers=(1.0, 2.0))
+
+
+def test_link_without_channel_column() -> None:
+    """A table without a ``c`` column is linked as a single channel."""
+    psf = _gaussian_psf(1.0, 7).reshape(1, 7, 7)
+    n_frames = 6
+    t = np.arange(n_frames)
+    ys = 4.0 + 0.1 * t
+    xs = 5.0 + 0.1 * t
+    trajectories = polars.DataFrame(
+        {
+            "t": t.tolist(),
+            "c": [0] * n_frames,
+            "z": [0.0] * n_frames,
+            "y": ys.tolist(),
+            "x": xs.tolist(),
+            "contrast": [2.0] * n_frames,
+            "particle_id": [0] * n_frames,
+        }
+    )
+    locs = _simulate_and_locate(trajectories, psf, (n_frames, 1, 1, 10, 10))
+    # Drop the channel column; the result should still link into one
+    # trajectory and must not add a ``c`` column.
+    locs_no_c = locs.drop("c")
+    linked = tog.link(locs_no_c, search_range_micrometers=1.0, memory=0)
+    assert "c" not in linked.columns
+    assert linked["particle_id"].n_unique() == 1
+    # All input columns are preserved.
+    for col in locs_no_c.columns:
+        assert col in linked.columns
+
+
+def test_link_on_progress_reports_rows() -> None:
+    """The progress callback reports cumulative rows processed."""
+    psf = _gaussian_psf(1.0, 7).reshape(1, 7, 7)
+    n_frames = 8
+    t = np.arange(n_frames)
+    ys = 4.0 + 0.1 * t
+    xs = 5.0 + 0.1 * t
+    trajectories = polars.DataFrame(
+        {
+            "t": t.tolist(),
+            "c": [0] * n_frames,
+            "z": [0.0] * n_frames,
+            "y": ys.tolist(),
+            "x": xs.tolist(),
+            "contrast": [2.0] * n_frames,
+            "particle_id": [0] * n_frames,
+        }
+    )
+    locs = _simulate_and_locate(trajectories, psf, (n_frames, 1, 1, 10, 10))
+    seen: list[int] = []
+    tog.link(locs, search_range_micrometers=1.0, on_progress=seen.append)
+    # The first call is 0; the last equals the row count.
+    assert seen[0] == 0
+    assert seen[-1] == locs.height
+    # Values are monotonically non-decreasing.
+    assert all(b >= a for a, b in zip(seen, seen[1:]))
+
+
+def test_link_on_progress_is_observation_only() -> None:
+    """The result is identical with or without a progress callback."""
+    psf = _gaussian_psf(1.0, 7).reshape(1, 7, 7)
+    n_frames = 6
+    t = np.arange(n_frames)
+    ys = 4.0 + 0.1 * t
+    xs = 5.0 + 0.1 * t
+    trajectories = polars.DataFrame(
+        {
+            "t": t.tolist(),
+            "c": [0] * n_frames,
+            "z": [0.0] * n_frames,
+            "y": ys.tolist(),
+            "x": xs.tolist(),
+            "contrast": [2.0] * n_frames,
+            "particle_id": [0] * n_frames,
+        }
+    )
+    locs = _simulate_and_locate(trajectories, psf, (n_frames, 1, 1, 10, 10))
+    plain = tog.link(locs, search_range_micrometers=1.0)
+    with_cb = tog.link(locs, search_range_micrometers=1.0, on_progress=lambda _: None)
+    assert plain["particle_id"].to_list() == with_cb["particle_id"].to_list()
+
+
+def test_link_on_progress_non_callable_raises_typeerror() -> None:
+    """A non-callable ``on_progress`` is rejected before any work."""
+    psf = _gaussian_psf(1.0, 7).reshape(1, 7, 7)
+    n_frames = 3
+    t = np.arange(n_frames)
+    trajectories = polars.DataFrame(
+        {
+            "t": t.tolist(),
+            "c": [0] * n_frames,
+            "z": [0.0] * n_frames,
+            "y": [5.0] * n_frames,
+            "x": [5.0] * n_frames,
+            "contrast": [2.0] * n_frames,
+            "particle_id": [0] * n_frames,
+        }
+    )
+    locs = _simulate_and_locate(trajectories, psf, (n_frames, 1, 1, 10, 10))
+    with pytest.raises(TypeError, match="on_progress"):
+        tog.link(locs, search_range_micrometers=1.0, on_progress=42)  # type: ignore

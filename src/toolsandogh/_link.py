@@ -19,16 +19,11 @@ counted by the integer ``t_idx`` column so that gaps and ``memory`` are
 independent of the frame rate.
 """
 
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 
 import numpy as np
 import polars
 import scipy.optimize
-
-# Spatial column names, in the canonical ``(z, y, x)`` order, for the two
-# coordinate spaces ``link`` can operate in.
-_SPATIAL_COLS_PHYS = ("z", "y", "x")
-_SPATIAL_COLS_PX = ("z_idx", "y_idx", "x_idx")
 
 
 def _parse_search_range(
@@ -67,53 +62,6 @@ def _parse_search_range(
     return out
 
 
-def _resolve_search_ranges(
-    search_range_pixels: float | int | Sequence[float | int] | None,
-    search_range_micrometers: float | int | Sequence[float | int] | None,
-    locs: polars.DataFrame,
-) -> tuple[np.ndarray, tuple[str, str, str]]:
-    """
-    Resolve the two mutually-exclusive search-range arguments.
-
-    Exactly one of ``search_range_pixels`` and ``search_range_micrometers``
-    must be supplied.  The chosen mode determines which spatial columns
-    are required and read:
-
-    * micrometre mode reads the physical ``z``/``y``/``x`` columns;
-    * pixel mode reads the index-space ``z_idx``/``y_idx``/``x_idx`` columns.
-
-    Returns ``(ranges, columns)`` where ``ranges`` is a float64 ``(3,)``
-    array of per-axis thresholds and ``columns`` is the tuple of column
-    names the caller should read for positions.
-    """
-    if search_range_pixels is None and search_range_micrometers is None:
-        raise ValueError(
-            "Exactly one of `search_range_pixels` and `search_range_micrometers` must be supplied."
-        )
-    if search_range_pixels is not None and search_range_micrometers is not None:
-        raise ValueError(
-            "`search_range_pixels` and `search_range_micrometers` are "
-            "mutually exclusive; supply only one."
-        )
-
-    if search_range_micrometers is not None:
-        cols = _SPATIAL_COLS_PHYS
-        param_name = "search_range_micrometers"
-        value: float | int | Sequence[float | int] = search_range_micrometers
-    else:
-        assert search_range_pixels is not None
-        cols = _SPATIAL_COLS_PX
-        param_name = "search_range_pixels"
-        value = search_range_pixels
-
-    missing = set(cols) - set(locs.columns)
-    if missing:
-        raise ValueError(
-            f"`{param_name}` requires the columns {sorted(cols)}, missing: {sorted(missing)}."
-        )
-    return _parse_search_range(value, param_name=param_name), cols
-
-
 def link(
     locs: polars.DataFrame,
     *,
@@ -121,6 +69,7 @@ def link(
     search_range_micrometers: float | int | Sequence[float | int] | None = None,
     memory: int = 0,
     adaptive_step: float | None = None,
+    on_progress: Callable[[int], None] | None = None,
 ) -> polars.DataFrame:
     """
     Link per-frame emitter localizations into trajectories.
@@ -132,20 +81,22 @@ def link(
     new one.  A trajectory that goes unmatched for more than
     ``memory`` frames is closed.
 
-    Each channel (``c`` column) is linked independently.  Frames are
-    counted by the integer ``t_idx`` column, so ``memory`` and any
-    adaptive scaling are independent of the frame rate.
+    Each channel (``c`` column) is linked independently.  When ``c`` is
+    absent all rows are linked together.  Frames are counted by the
+    integer ``t_idx`` column, so ``memory`` and any adaptive scaling are
+    independent of the frame rate.
 
     Parameters
     ----------
     locs : polars.DataFrame
-        Per-frame emitter table from :func:`toolsandogh.locate`.  Must
-        contain the columns ``c`` and ``t_idx``, plus either the
-        physical spatial columns (``z``, ``y``, ``x``) when using
+        Per-frame emitter table, typically from
+        :func:`toolsandogh.locate`.  Must contain ``t_idx`` and either
+        the physical spatial columns (``z``, ``y``, ``x``) when using
         ``search_range_micrometers`` or the index-space columns
         (``z_idx``, ``y_idx``, ``x_idx``) when using
-        ``search_range_pixels``.  Any additional columns are passed
-        through.
+        ``search_range_pixels``.  The channel column ``c`` is optional;
+        when present, each channel is linked independently.  Any
+        additional columns are passed through.
     search_range_pixels : float or tuple of float, optional
         Per-axis maximum displacement in pixel (index) units between two
         consecutive frames.  A scalar is broadcast to every spatial
@@ -167,6 +118,12 @@ def link(
         sqrt(1 + adaptive_step * k)``).  This is the Brownian-motion
         scaling: tracks that have been missing for a while are
         searched over a wider area.
+    on_progress : callable, optional
+        A callback invoked with the number of rows (detections)
+        processed so far.  It is called once with ``0`` before any row
+        is processed, and again after one or more rows have been
+        processed.  The final value equals ``locs.height``.  ``None``
+        (the default) disables progress reporting.
 
     Returns
     -------
@@ -182,12 +139,31 @@ def link(
     ``adaptive_step`` scaling the threshold).  A scalar search range
     therefore reduces to the familiar Euclidean ball.
     """
-    # Resolve the search-range mode (pixel or micrometre) and the
-    # spatial columns it implies, then validate the remaining arguments.
-    ranges, spatial_cols = _resolve_search_ranges(
-        search_range_pixels, search_range_micrometers, locs
-    )
-    required = {"c", "t_idx"} | set(spatial_cols)
+    # Validate the search-range arguments.  Exactly one of the two
+    # mutually-exclusive modes must be supplied; it determines which
+    # spatial columns are read and required.
+    if search_range_pixels is None and search_range_micrometers is None:
+        raise ValueError(
+            "Exactly one of `search_range_pixels` and `search_range_micrometers` must be supplied."
+        )
+    if search_range_pixels is not None and search_range_micrometers is not None:
+        raise ValueError(
+            "`search_range_pixels` and `search_range_micrometers` are "
+            "mutually exclusive; supply only one."
+        )
+    if search_range_micrometers is not None:
+        columns = ("z", "y", "x")
+        search_ranges = _parse_search_range(
+            search_range_micrometers, param_name="search_range_micrometers"
+        )
+    else:
+        assert search_range_pixels is not None
+        columns = ("z_idx", "y_idx", "x_idx")
+        search_ranges = _parse_search_range(search_range_pixels, param_name="search_range_pixels")
+
+    # Validate the remaining arguments and the input schema.  ``c`` is
+    # optional; when absent all rows are linked together.
+    required = {"t_idx"} | set(columns)
     missing = required - set(locs.columns)
     if missing:
         raise ValueError(f"locs is missing required columns: {sorted(missing)}")
@@ -195,59 +171,59 @@ def link(
         raise ValueError(f"`memory` must be non-negative, got {memory}.")
     if adaptive_step is not None and adaptive_step < 0:
         raise ValueError(f"`adaptive_step` must be non-negative, got {adaptive_step}.")
+    if on_progress is not None and not callable(on_progress):
+        raise TypeError(f"`on_progress` must be callable, got {type(on_progress).__name__}.")
 
-    n_rows = locs.shape[0]
+    n_rows = locs.height
     if n_rows == 0:
+        if on_progress is not None:
+            on_progress(0)
         return locs.with_columns(polars.Series([], dtype=polars.Int32).alias("particle_id"))
 
-    # Sort by (channel, frame) for sequential processing, but keep a
-    # ``__row_index`` so we can return the result in the input order.
-    sorted_locs = locs.with_row_index(name="__row_index").sort(["c", "t_idx"])
+    if on_progress is not None:
+        on_progress(0)
 
-    t_idx_arr = sorted_locs["t_idx"].to_numpy().astype(np.int64, copy=False)
-    c_arr = sorted_locs["c"].to_numpy()
-    pos_cols = [sorted_locs[col].to_numpy().astype(np.float64, copy=False) for col in spatial_cols]
-    idx_arr = sorted_locs["__row_index"].to_numpy()
+    # Attach a row index so we can write particle ids back into the
+    # original row order after sorting and grouping.  Sort once by the
+    # full grouping key so the ``partition_by`` calls below do not need
+    # to re-sort: rows within each group are already in frame order.
+    has_channel = "c" in locs.columns
+    sort_keys = ["c", "t_idx"] if has_channel else ["t_idx"]
+    indexed = locs.with_row_index(name="__row_index").sort(sort_keys)
 
-    # Per-row particle id, in sorted order.
-    particle_ids = np.empty(n_rows, dtype=np.int32)
+    # Per-row particle id, indexed by the original row order.
+    particle_ids = np.full(n_rows, -1, dtype=np.int32)
     next_id = np.int32(0)
+    rows_done = 0
 
-    # Split the sorted array by channel and process each in turn.  We
-    # iterate over the sorted array once and slice out the chunks that
-    # belong to each unique channel.
-    unique_channels, channel_starts = np.unique(c_arr, return_index=True)
-    channel_ends = np.append(channel_starts[1:], np.array(len(c_arr)).reshape(()))
-
-    for chan_start, chan_end in zip(channel_starts, channel_ends):
-        # Each track is a small dict: last position, last frame on which
-        # it was matched, and the assigned particle id.
+    # Outer loop: one iteration per channel (or a single pass over the
+    # whole table when ``c`` is absent).  Each channel keeps its own set
+    # of active tracks, which is reset at the top of the loop.
+    channel_groups = indexed.partition_by("c", maintain_order=True) if has_channel else [indexed]
+    for channel_df in channel_groups:
         active_tracks: list[dict] = []
 
-        frame_start = chan_start
-        while frame_start < chan_end:
-            t = t_idx_arr[frame_start]
-            frame_end = frame_start
-            while frame_end < chan_end and t_idx_arr[frame_end] == t:
-                frame_end += 1
-
-            current_t = int(t)
+        # Inner loop: one iteration per detected frame, in ascending
+        # ``t_idx`` order.  ``partition_by`` returns one DataFrame per
+        # frame, carrying the original row indices.
+        for frame_df in channel_df.partition_by("t_idx", maintain_order=True):
+            frame_t = int(frame_df["t_idx"][0])
+            row_indices = frame_df["__row_index"].to_numpy()
             det_pos = np.stack(
-                [col[frame_start:frame_end] for col in pos_cols],
+                [frame_df[col].to_numpy().astype(np.float64, copy=False) for col in columns],
                 axis=1,
             )
-            n_dets = frame_end - frame_start
+            n_dets = frame_df.height
 
             # Close every active track whose last match is too far in
             # the past.  ``memory`` counts the number of *empty* frames
             # a track is allowed to go through, so a track that was
-            # last seen at ``last_seen_t`` is alive at ``current_t`` iff
-            # ``current_t - last_seen_t - 1 <= memory``, i.e. iff the
-            # number of intervening frames is at most ``memory``.
+            # last seen at ``last_seen_t`` is alive at ``frame_t`` iff
+            # ``frame_t - last_seen_t - 1 <= memory``.
             if active_tracks:
                 kept: list[dict] = []
                 for tr in active_tracks:
-                    if current_t - tr["last_seen_t"] <= memory + 1:
+                    if frame_t - tr["last_seen_t"] <= memory + 1:
                         kept.append(tr)
                 active_tracks = kept
 
@@ -256,11 +232,11 @@ def link(
                 for j in range(n_dets):
                     pid = next_id
                     next_id += 1
-                    particle_ids[frame_start + j] = pid
+                    particle_ids[row_indices[j]] = pid
                     active_tracks.append(
                         {
                             "last_pos": det_pos[j],
-                            "last_seen_t": current_t,
+                            "last_seen_t": frame_t,
                             "particle_id": pid,
                         }
                     )
@@ -273,24 +249,23 @@ def link(
                 # is scaled by its per-axis search range, so a scalar
                 # range reduces to the Euclidean ball and a per-axis
                 # tuple gives an ellipsoid with semi-axes ``r_i``.
-                norm_diff = diff / ranges[None, None, :]
+                norm_diff = diff / search_ranges[None, None, :]
                 dist = np.sqrt(np.sum(norm_diff * norm_diff, axis=2))
 
-                # Effective per-track threshold (Brownian-motion scaling:
-                # sqrt growth in the number of unseen frames).
+                # Effective per-track threshold (Brownian-motion
+                # scaling: sqrt growth in the number of unseen frames).
                 if adaptive_step is not None:
-                    frames_unseen = np.array(
-                        [current_t - tr["last_seen_t"] for tr in active_tracks]
-                    )
+                    frames_unseen = np.array([frame_t - tr["last_seen_t"] for tr in active_tracks])
                     effective_threshold = np.sqrt(1.0 + adaptive_step * frames_unseen)
                 else:
                     effective_threshold = np.ones(len(active_tracks), dtype=np.float64)
 
                 cost = dist.copy()
                 # Use a large finite value instead of ``np.inf`` for
-                # out-of-range entries: ``scipy.optimize.linear_sum_assignment``
-                # raises ``ValueError: cost matrix is infeasible`` when
-                # the matrix contains ``inf`` (the algorithm treats ``inf``
+                # out-of-range entries:
+                # ``scipy.optimize.linear_sum_assignment`` raises
+                # ``ValueError: cost matrix is infeasible`` when the
+                # matrix contains ``inf`` (the algorithm treats ``inf``
                 # entries as truly unreachable, which is not what we
                 # want for a thresholded cost).
                 big = 1.0e12
@@ -311,8 +286,8 @@ def link(
                     if cost[i, j] >= big:
                         continue
                     active_tracks[i]["last_pos"] = det_pos[j]
-                    active_tracks[i]["last_seen_t"] = current_t
-                    particle_ids[frame_start + j] = active_tracks[i]["particle_id"]
+                    active_tracks[i]["last_seen_t"] = frame_t
+                    particle_ids[row_indices[j]] = active_tracks[i]["particle_id"]
                     matched_tracks.add(int(i))
                     matched_dets.add(int(j))
 
@@ -322,21 +297,18 @@ def link(
                         continue
                     pid = next_id
                     next_id += 1
-                    particle_ids[frame_start + j] = pid
+                    particle_ids[row_indices[j]] = pid
                     active_tracks.append(
                         {
                             "last_pos": det_pos[j],
-                            "last_seen_t": current_t,
+                            "last_seen_t": frame_t,
                             "particle_id": pid,
                         }
                     )
 
-            frame_start = frame_end
+            # Report progress.
+            rows_done += n_dets
+            if on_progress is not None:
+                on_progress(rows_done)
 
-    # Reorder particle_ids back to the input order.
-    original_particle_ids = np.empty(n_rows, dtype=np.int32)
-    original_particle_ids[idx_arr] = particle_ids
-
-    return locs.with_columns(
-        polars.Series(original_particle_ids, dtype=polars.Int32).alias("particle_id")
-    )
+    return locs.with_columns(polars.Series(particle_ids, dtype=polars.Int32).alias("particle_id"))

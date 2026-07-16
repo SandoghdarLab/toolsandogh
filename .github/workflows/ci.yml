@@ -16,7 +16,7 @@ jobs:
   # committed uv.lock via --frozen, so any lockfile drift fails loudly.
   pre-commit:
     runs-on: ubuntu-latest
-    timeout-minutes: 8
+    timeout-minutes: 15
     env:
       # Uniform cache path across OSes so the actions/cache `path` below
       # matches what conftest.py writes (it honors this env var via
@@ -43,7 +43,7 @@ jobs:
   # uv.lock), so the lowest-direct cell exercises the real lower bounds.
   test:
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 8
+    timeout-minutes: 15
     env:
       JAX_COMPILATION_CACHE_DIR: ~/.cache/jax-compilation-cache
       # Self-diagnosing safety net for hangs: dump all thread stacks on

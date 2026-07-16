@@ -59,7 +59,7 @@ def test_link_linear_motion_single_particle() -> None:
     )
     locs = _simulate_and_locate(trajectories, psf, (n_frames, 1, 1, 10, 10))
     assert locs.shape[0] == n_frames
-    linked = tog.link(locs, search_range=1.0, memory=0)
+    linked = tog.link(locs, search_range_micrometers=1.0, memory=0)
     assert linked.shape[0] == n_frames
     assert "particle_id" in linked.columns
     assert linked["particle_id"].dtype == polars.Int32
@@ -89,12 +89,12 @@ def test_link_two_particles_separated() -> None:
         }
     )
     locs = _simulate_and_locate(trajectories, psf, (n_frames, 1, 1, 14, 14))
-    linked = tog.link(locs, search_range=1.0, memory=0)
+    linked = tog.link(locs, search_range_micrometers=1.0, memory=0)
     # Both particles should keep their ids throughout the video.
-    sorted_linked = linked.sort(["t", "y"])
+    sorted_linked = linked.sort(["t_idx", "y"])
     pids_per_frame = []
     for tt in range(n_frames):
-        rows = sorted_linked.filter(polars.col("t") == tt)
+        rows = sorted_linked.filter(polars.col("t_idx") == tt)
         assert rows.shape[0] == 2
         pids_per_frame.append(rows["particle_id"].to_list())
     particle_0_ids = {p[0] for p in pids_per_frame}
@@ -127,11 +127,11 @@ def test_link_gap_closing() -> None:
     locs = _simulate_and_locate(trajectories, psf, (n_frames, 1, 1, 12, 12))
     # With memory=3, the gap of 3 frames (frames 4, 5, 6 skipped) should
     # be closed: all detections share the same id.
-    linked = tog.link(locs, search_range=1.0, memory=3)
+    linked = tog.link(locs, search_range_micrometers=1.0, memory=3)
     assert linked["particle_id"].n_unique() == 1
 
     # With memory=0, the same gap is fatal: the trajectory is split.
-    linked_strict = tog.link(locs, search_range=1.0, memory=0)
+    linked_strict = tog.link(locs, search_range_micrometers=1.0, memory=0)
     assert linked_strict["particle_id"].n_unique() > 1
 
 
@@ -165,7 +165,7 @@ def test_link_adaptive_search_range() -> None:
     # bridge the gap.
     linked_adaptive = tog.link(
         locs,
-        search_range=1.0,
+        search_range_micrometers=1.0,
         memory=5,
         adaptive_step=2.0,
     )
@@ -215,7 +215,7 @@ def test_link_multi_channel_independent() -> None:
         parts.append(locs_ch)
     locs = polars.concat(parts, how="vertical_relaxed")
     # Each channel should contribute its own trajectory.
-    linked = tog.link(locs, search_range=1.0, memory=0)
+    linked = tog.link(locs, search_range_micrometers=1.0, memory=0)
     channel_0_ids = set(linked.filter(polars.col("c") == 0)["particle_id"].to_list())
     channel_1_ids = set(linked.filter(polars.col("c") == 1)["particle_id"].to_list())
     assert len(channel_0_ids) == 1
@@ -228,15 +228,14 @@ def test_link_empty_input() -> None:
     """An empty input returns an empty output with the right schema."""
     locs = polars.DataFrame(
         schema={
-            "t": polars.Int32,
             "c": polars.Int32,
-            "z": polars.Float32,
-            "y": polars.Float32,
-            "x": polars.Float32,
-            "contrast": polars.Float32,
+            "t_idx": polars.Int32,
+            "z": polars.Float64,
+            "y": polars.Float64,
+            "x": polars.Float64,
         }
     )
-    out = tog.link(locs, search_range=1.0)
+    out = tog.link(locs, search_range_micrometers=1.0)
     assert "particle_id" in out.columns
     assert out["particle_id"].dtype == polars.Int32
     assert out.shape[0] == 0
@@ -259,7 +258,7 @@ def test_link_schema_strictness() -> None:
         }
     )
     locs = _simulate_and_locate(trajectories, psf, (n_frames, 1, 1, 10, 10))
-    linked = tog.link(locs, search_range=1.0, memory=0)
+    linked = tog.link(locs, search_range_micrometers=1.0, memory=0)
     assert "particle_id" in linked.columns
     assert linked["particle_id"].dtype == polars.Int32
     # The original columns are preserved.
@@ -285,15 +284,132 @@ def test_link_validates_input() -> None:
     )
     locs = _simulate_and_locate(trajectories, psf, (n_frames, 1, 1, 10, 10))
     # Missing required column.
-    bad = locs.drop("contrast")
+    bad = locs.drop("t_idx")
     with pytest.raises(ValueError, match="missing required columns"):
-        tog.link(bad, search_range=1.0)
+        tog.link(bad, search_range_micrometers=1.0)
     # Negative memory.
     with pytest.raises(ValueError, match="memory"):
-        tog.link(locs, search_range=1.0, memory=-1)
+        tog.link(locs, search_range_micrometers=1.0, memory=-1)
     # Non-positive search_range.
-    with pytest.raises(ValueError, match="search_range"):
-        tog.link(locs, search_range=0.0)
+    with pytest.raises(ValueError, match="search_range_micrometers"):
+        tog.link(locs, search_range_micrometers=0.0)
     # Negative adaptive_step.
     with pytest.raises(ValueError, match="adaptive_step"):
-        tog.link(locs, search_range=1.0, adaptive_step=-1.0)
+        tog.link(locs, search_range_micrometers=1.0, adaptive_step=-1.0)
+
+
+def test_link_search_range_modes_mutually_exclusive() -> None:
+    """The two search-range arguments are mutually exclusive."""
+    psf = _gaussian_psf(1.0, 7).reshape(1, 7, 7)
+    n_frames = 3
+    t = np.arange(n_frames)
+    trajectories = polars.DataFrame(
+        {
+            "t": t.tolist(),
+            "c": [0] * n_frames,
+            "z": [0.0] * n_frames,
+            "y": [5.0] * n_frames,
+            "x": [5.0] * n_frames,
+            "contrast": [2.0] * n_frames,
+            "particle_id": [0] * n_frames,
+        }
+    )
+    locs = _simulate_and_locate(trajectories, psf, (n_frames, 1, 1, 10, 10))
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        tog.link(locs, search_range_pixels=1.0, search_range_micrometers=1.0)
+    with pytest.raises(ValueError, match="Exactly one"):
+        tog.link(locs)
+
+
+def test_link_pixel_mode_matches_micrometre_mode_at_unit_scale() -> None:
+    """At unit pixel scale, pixel and micrometre modes give the same links."""
+    psf = _gaussian_psf(1.0, 7).reshape(1, 7, 7)
+    n_frames = 8
+    t = np.arange(n_frames)
+    ys = 4.0 + 0.1 * t
+    xs = 5.0 + 0.1 * t
+    trajectories = polars.DataFrame(
+        {
+            "t": t.tolist(),
+            "c": [0] * n_frames,
+            "z": [0.0] * n_frames,
+            "y": ys.tolist(),
+            "x": xs.tolist(),
+            "contrast": [2.0] * n_frames,
+            "particle_id": [0] * n_frames,
+        }
+    )
+    locs = _simulate_and_locate(trajectories, psf, (n_frames, 1, 1, 10, 10))
+    # ``simulate_particles`` uses dy=dx=1.0, so 1 px == 1 µm and the two
+    # modes are numerically identical.
+    linked_um = tog.link(locs, search_range_micrometers=1.0, memory=0)
+    linked_px = tog.link(locs, search_range_pixels=1.0, memory=0)
+    assert linked_um["particle_id"].to_list() == linked_px["particle_id"].to_list()
+
+
+def test_link_per_axis_tuple_3d() -> None:
+    """A 3-tuple search range is interpreted as ``(z, y, x)``."""
+    psf = _gaussian_psf(1.0, 7).reshape(1, 7, 7)
+    n_frames = 3
+    t = np.arange(n_frames)
+    # A particle that moves only along y, by 0.3 px/frame.
+    trajectories = polars.DataFrame(
+        {
+            "t": t.tolist(),
+            "c": [0] * n_frames,
+            "z": [0.0] * n_frames,
+            "y": (5.0 + 0.3 * t).tolist(),
+            "x": [5.0] * n_frames,
+            "contrast": [2.0] * n_frames,
+            "particle_id": [0] * n_frames,
+        }
+    )
+    locs = _simulate_and_locate(trajectories, psf, (n_frames, 1, 1, 10, 10))
+    # A generous y range and a tight z/x range: since the particle does
+    # not move in z or x, all frames link into one track.
+    linked = tog.link(locs, search_range_micrometers=(0.1, 2.0, 0.1), memory=0)
+    assert linked["particle_id"].n_unique() == 1
+
+
+def test_link_per_axis_tuple_requires_z_column() -> None:
+    """A 3-tuple search range requires the ``z`` column to be present."""
+    psf = _gaussian_psf(1.0, 7).reshape(1, 7, 7)
+    n_frames = 3
+    t = np.arange(n_frames)
+    trajectories = polars.DataFrame(
+        {
+            "t": t.tolist(),
+            "c": [0] * n_frames,
+            "z": [0.0] * n_frames,
+            "y": [5.0] * n_frames,
+            "x": [5.0] * n_frames,
+            "contrast": [2.0] * n_frames,
+            "particle_id": [0] * n_frames,
+        }
+    )
+    locs = _simulate_and_locate(trajectories, psf, (n_frames, 1, 1, 10, 10))
+    # Drop the z column to force the error.
+    locs_no_z = locs.drop("z")
+    with pytest.raises(ValueError, match="requires the columns"):
+        tog.link(locs_no_z, search_range_micrometers=(1.0, 1.0, 1.0))
+
+
+def test_link_rejects_2_tuple() -> None:
+    """A 2-tuple search range is rejected; only scalar or 3-tuple is valid."""
+    psf = _gaussian_psf(1.0, 7).reshape(1, 7, 7)
+    n_frames = 3
+    t = np.arange(n_frames)
+    trajectories = polars.DataFrame(
+        {
+            "t": t.tolist(),
+            "c": [0] * n_frames,
+            "z": [0.0] * n_frames,
+            "y": [5.0] * n_frames,
+            "x": [5.0] * n_frames,
+            "contrast": [2.0] * n_frames,
+            "particle_id": [0] * n_frames,
+        }
+    )
+    locs = _simulate_and_locate(trajectories, psf, (n_frames, 1, 1, 10, 10))
+    with pytest.raises(ValueError, match="3-tuple"):
+        tog.link(locs, search_range_micrometers=(1.0, 2.0))

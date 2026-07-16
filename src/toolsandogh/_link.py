@@ -12,17 +12,113 @@ start new trajectories.
 Empty frames (frames that contain no detections) are not present in the
 input.  They are inferred from the gap between consecutive detected
 frames and count against ``memory`` for every active trajectory.
+
+Positions are compared in either physical (micrometre) or index (pixel)
+space, as selected by the search-range argument; frames are always
+counted by the integer ``t_idx`` column so that gaps and ``memory`` are
+independent of the frame rate.
 """
+
+from collections.abc import Sequence
 
 import numpy as np
 import polars
 import scipy.optimize
 
+# Spatial column names, in the canonical ``(z, y, x)`` order, for the two
+# coordinate spaces ``link`` can operate in.
+_SPATIAL_COLS_PHYS = ("z", "y", "x")
+_SPATIAL_COLS_PX = ("z_idx", "y_idx", "x_idx")
+
+
+def _parse_search_range(
+    search_range: float | int | Sequence[float | int],
+    *,
+    param_name: str,
+) -> np.ndarray:
+    """
+    Turn a scalar or 3-tuple search range into a ``(3,)`` float64 array.
+
+    A scalar is broadcast to every axis.  A sequence of length 3 is
+    interpreted as ``(z, y, x)``.  Any other length or type is rejected.
+    All entries must be positive and finite.
+    """
+    if isinstance(search_range, (int, float, np.integer, np.floating)):
+        val = float(search_range)
+        if not np.isfinite(val) or val <= 0:
+            raise ValueError(f"`{param_name}` must be positive and finite, got {search_range!r}.")
+        return np.full(3, val, dtype=np.float64)
+
+    try:
+        seq = list(search_range)
+    except TypeError as exc:
+        raise ValueError(
+            f"`{param_name}` must be a scalar or a 3-tuple of scalars, "
+            f"got {type(search_range).__name__}."
+        ) from exc
+
+    if len(seq) != 3:
+        raise ValueError(
+            f"`{param_name}` must be a scalar or a 3-tuple ``(z, y, x)``, got length {len(seq)}."
+        )
+    out = np.asarray(seq, dtype=np.float64)
+    if not np.all(np.isfinite(out)) or np.any(out <= 0):
+        raise ValueError(f"`{param_name}` entries must all be positive and finite, got {seq!r}.")
+    return out
+
+
+def _resolve_search_ranges(
+    search_range_pixels: float | int | Sequence[float | int] | None,
+    search_range_micrometers: float | int | Sequence[float | int] | None,
+    locs: polars.DataFrame,
+) -> tuple[np.ndarray, tuple[str, str, str]]:
+    """
+    Resolve the two mutually-exclusive search-range arguments.
+
+    Exactly one of ``search_range_pixels`` and ``search_range_micrometers``
+    must be supplied.  The chosen mode determines which spatial columns
+    are required and read:
+
+    * micrometre mode reads the physical ``z``/``y``/``x`` columns;
+    * pixel mode reads the index-space ``z_idx``/``y_idx``/``x_idx`` columns.
+
+    Returns ``(ranges, columns)`` where ``ranges`` is a float64 ``(3,)``
+    array of per-axis thresholds and ``columns`` is the tuple of column
+    names the caller should read for positions.
+    """
+    if search_range_pixels is None and search_range_micrometers is None:
+        raise ValueError(
+            "Exactly one of `search_range_pixels` and `search_range_micrometers` must be supplied."
+        )
+    if search_range_pixels is not None and search_range_micrometers is not None:
+        raise ValueError(
+            "`search_range_pixels` and `search_range_micrometers` are "
+            "mutually exclusive; supply only one."
+        )
+
+    if search_range_micrometers is not None:
+        cols = _SPATIAL_COLS_PHYS
+        param_name = "search_range_micrometers"
+        value: float | int | Sequence[float | int] = search_range_micrometers
+    else:
+        assert search_range_pixels is not None
+        cols = _SPATIAL_COLS_PX
+        param_name = "search_range_pixels"
+        value = search_range_pixels
+
+    missing = set(cols) - set(locs.columns)
+    if missing:
+        raise ValueError(
+            f"`{param_name}` requires the columns {sorted(cols)}, missing: {sorted(missing)}."
+        )
+    return _parse_search_range(value, param_name=param_name), cols
+
 
 def link(
     locs: polars.DataFrame,
     *,
-    search_range: float,
+    search_range_pixels: float | int | Sequence[float | int] | None = None,
+    search_range_micrometers: float | int | Sequence[float | int] | None = None,
     memory: int = 0,
     adaptive_step: float | None = None,
 ) -> polars.DataFrame:
@@ -31,22 +127,35 @@ def link(
 
     For every detected frame, the still-open trajectories are matched
     to the new detections with the Hungarian algorithm.  Each detection
-    is either appended to an existing trajectory (if it is within
-    ``search_range`` of the trajectory's last known position) or starts
-    a new one.  A trajectory that goes unmatched for more than
+    is either appended to an existing trajectory (if it is within the
+    search range of the trajectory's last known position) or starts a
+    new one.  A trajectory that goes unmatched for more than
     ``memory`` frames is closed.
 
-    Each channel (``c`` column) is linked independently.
+    Each channel (``c`` column) is linked independently.  Frames are
+    counted by the integer ``t_idx`` column, so ``memory`` and any
+    adaptive scaling are independent of the frame rate.
 
     Parameters
     ----------
     locs : polars.DataFrame
         Per-frame emitter table from :func:`toolsandogh.locate`.  Must
-        contain the columns ``t``, ``c``, ``z``, ``y``, ``x``,
-        ``contrast``.  Any additional columns are passed through.
-    search_range : float
-        Maximum Euclidean distance (in pixel units) an emitter may
-        travel between two consecutive frames and still be linked.
+        contain the columns ``c`` and ``t_idx``, plus either the
+        physical spatial columns (``z``, ``y``, ``x``) when using
+        ``search_range_micrometers`` or the index-space columns
+        (``z_idx``, ``y_idx``, ``x_idx``) when using
+        ``search_range_pixels``.  Any additional columns are passed
+        through.
+    search_range_pixels : float or tuple of float, optional
+        Per-axis maximum displacement in pixel (index) units between two
+        consecutive frames.  A scalar is broadcast to every spatial
+        axis; a 3-tuple is interpreted as ``(z, y, x)``.  Mutually
+        exclusive with ``search_range_micrometers``.
+    search_range_micrometers : float or tuple of float, optional
+        Per-axis maximum displacement in micrometres between two
+        consecutive frames.  A scalar is broadcast to every spatial
+        axis; a 3-tuple is interpreted as ``(z, y, x)``.  Mutually
+        exclusive with ``search_range_pixels``.
     memory : int
         Number of frames a trajectory is allowed to go unmatched
         before it is closed.  Default 0 (a trajectory must be matched
@@ -64,16 +173,26 @@ def link(
     polars.DataFrame
         A new DataFrame with the same columns and row order as ``locs``,
         plus a ``particle_id`` column (``Int32``).
+
+    Notes
+    -----
+    The per-axis search ranges define an ellipsoidal gating region: a
+    candidate link is accepted iff the normalized distance
+    ``sqrt(sum((d_i / r_i)**2))`` is at most 1 (with
+    ``adaptive_step`` scaling the threshold).  A scalar search range
+    therefore reduces to the familiar Euclidean ball.
     """
-    # Validate the input schema.
-    required = {"t", "c", "z", "y", "x", "contrast"}
+    # Resolve the search-range mode (pixel or micrometre) and the
+    # spatial columns it implies, then validate the remaining arguments.
+    ranges, spatial_cols = _resolve_search_ranges(
+        search_range_pixels, search_range_micrometers, locs
+    )
+    required = {"c", "t_idx"} | set(spatial_cols)
     missing = required - set(locs.columns)
     if missing:
         raise ValueError(f"locs is missing required columns: {sorted(missing)}")
     if memory < 0:
         raise ValueError(f"`memory` must be non-negative, got {memory}.")
-    if search_range <= 0:
-        raise ValueError(f"`search_range` must be positive, got {search_range}.")
     if adaptive_step is not None and adaptive_step < 0:
         raise ValueError(f"`adaptive_step` must be non-negative, got {adaptive_step}.")
 
@@ -83,13 +202,11 @@ def link(
 
     # Sort by (channel, frame) for sequential processing, but keep a
     # ``__row_index`` so we can return the result in the input order.
-    sorted_locs = locs.with_row_index(name="__row_index").sort(["c", "t"])
+    sorted_locs = locs.with_row_index(name="__row_index").sort(["c", "t_idx"])
 
-    t_arr = sorted_locs["t"].to_numpy()
+    t_idx_arr = sorted_locs["t_idx"].to_numpy().astype(np.int64, copy=False)
     c_arr = sorted_locs["c"].to_numpy()
-    z_arr = sorted_locs["z"].to_numpy()
-    y_arr = sorted_locs["y"].to_numpy()
-    x_arr = sorted_locs["x"].to_numpy()
+    pos_cols = [sorted_locs[col].to_numpy().astype(np.float64, copy=False) for col in spatial_cols]
     idx_arr = sorted_locs["__row_index"].to_numpy()
 
     # Per-row particle id, in sorted order.
@@ -103,24 +220,20 @@ def link(
     channel_ends = np.append(channel_starts[1:], np.array(len(c_arr)).reshape(()))
 
     for chan_start, chan_end in zip(channel_starts, channel_ends):
-        # Each track is a small dict: last (z, y, x) position, last
-        # frame on which it was matched, and the assigned particle id.
+        # Each track is a small dict: last position, last frame on which
+        # it was matched, and the assigned particle id.
         active_tracks: list[dict] = []
 
         frame_start = chan_start
         while frame_start < chan_end:
-            t = t_arr[frame_start]
+            t = t_idx_arr[frame_start]
             frame_end = frame_start
-            while frame_end < chan_end and t_arr[frame_end] == t:
+            while frame_end < chan_end and t_idx_arr[frame_end] == t:
                 frame_end += 1
 
             current_t = int(t)
             det_pos = np.stack(
-                [
-                    z_arr[frame_start:frame_end],
-                    y_arr[frame_start:frame_end],
-                    x_arr[frame_start:frame_end],
-                ],
+                [col[frame_start:frame_end] for col in pos_cols],
                 axis=1,
             )
             n_dets = frame_end - frame_start
@@ -155,17 +268,23 @@ def link(
                 # Build the cost matrix and solve the assignment.
                 track_pos = np.stack([tr["last_pos"] for tr in active_tracks])
                 diff = track_pos[:, None, :] - det_pos[None, :, :]
-                dist = np.sqrt(np.sum(diff * diff, axis=2))
 
-                # Effective per-track search range (Brownian-motion
-                # scaling: sqrt growth in the number of unseen frames).
+                # Normalized Euclidean (ellipsoidal) distance: each axis
+                # is scaled by its per-axis search range, so a scalar
+                # range reduces to the Euclidean ball and a per-axis
+                # tuple gives an ellipsoid with semi-axes ``r_i``.
+                norm_diff = diff / ranges[None, None, :]
+                dist = np.sqrt(np.sum(norm_diff * norm_diff, axis=2))
+
+                # Effective per-track threshold (Brownian-motion scaling:
+                # sqrt growth in the number of unseen frames).
                 if adaptive_step is not None:
                     frames_unseen = np.array(
                         [current_t - tr["last_seen_t"] for tr in active_tracks]
                     )
-                    effective_range = search_range * np.sqrt(1.0 + adaptive_step * frames_unseen)
+                    effective_threshold = np.sqrt(1.0 + adaptive_step * frames_unseen)
                 else:
-                    effective_range = np.full(len(active_tracks), search_range, dtype=np.float64)
+                    effective_threshold = np.ones(len(active_tracks), dtype=np.float64)
 
                 cost = dist.copy()
                 # Use a large finite value instead of ``np.inf`` for
@@ -175,7 +294,7 @@ def link(
                 # entries as truly unreachable, which is not what we
                 # want for a thresholded cost).
                 big = 1.0e12
-                cost[dist > effective_range[:, None]] = big
+                cost[dist > effective_threshold[:, None]] = big
 
                 if np.all(cost >= big):
                     row_ind = np.array([], dtype=np.int64)

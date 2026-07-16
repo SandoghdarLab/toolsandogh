@@ -279,6 +279,27 @@ def _coerce_to_xarray(array: npt.ArrayLike) -> xr.DataArray:
     return xr.DataArray(data=data, dims=dims)
 
 
+def _axis_origin_and_step(
+    video: xr.DataArray,
+    dim: str,
+    *,
+    default_step: float = 1.0,
+) -> tuple[float, float]:
+    """
+    Return ``(origin, step)`` for a uniformly-spaced physical axis.
+
+    The values are read directly from the ``dim`` coordinate of
+    ``video``.  For a size-1 axis (no spacing to infer) the supplied
+    ``default_step`` is returned.  Uniform spacing is guaranteed by
+    :func:`validate_video` for canonical videos, so the step is read
+    from the first two coordinate values without averaging.
+    """
+    coord = np.asarray(video[dim].values, dtype=np.float64)
+    origin = float(coord[0])
+    step = float(coord[1] - coord[0]) if coord.size >= 2 else default_step
+    return origin, step
+
+
 def _resolve_axis(
     video: xr.DataArray,
     dim: str,
@@ -305,21 +326,20 @@ def _resolve_axis(
     size = int(video.sizes[dim])
     if dim in video.coords:
         vals = np.asarray(video[dim].values, dtype=np.float64)
-        inferred_origin = float(vals[0])
-        if origin is not None and not np.isclose(origin, inferred_origin, rtol=1e-6, atol=1e-9):
+        axis_origin, axis_step = _axis_origin_and_step(video, dim, default_step=default_scale)
+        if origin is not None and not np.isclose(origin, axis_origin, rtol=1e-6, atol=1e-9):
             raise ValueError(
                 f"The supplied {dim.lower()}0={origin!r} does not match the "
-                f"{dim} coordinate origin {inferred_origin!r}."
+                f"{dim} coordinate origin {axis_origin!r}."
             )
         if size >= 2:
-            inferred_scale = float(vals[1] - vals[0])
-            if scale is not None and not np.isclose(scale, inferred_scale, rtol=1e-6, atol=1e-9):
+            if scale is not None and not np.isclose(scale, axis_step, rtol=1e-6, atol=1e-9):
                 raise ValueError(
                     f"The supplied d{dim.lower()}={scale!r} does not match the "
-                    f"{dim} coordinate spacing {inferred_scale!r}."
+                    f"{dim} coordinate spacing {axis_step!r}."
                 )
-            return vals, inferred_scale
-        # A size-1 axis has no spacing to infer.
+            return vals, axis_step
+        # A size-1 axis has no spacing to infer; respect an explicit scale.
         return vals, (scale if scale is not None else default_scale)
     # No existing coordinate: generate one.
     resolved_scale = scale if scale is not None else default_scale

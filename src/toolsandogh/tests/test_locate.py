@@ -24,7 +24,7 @@ def _gaussian_psf_3d(sigma: float, n: int) -> jnp.ndarray:
 
 
 def test_locate_returns_strict_schema() -> None:
-    """The returned DataFrame must have the agreed columns and dtypes."""
+    """The chunk DataFrame must have the agreed columns and dtypes."""
     psf = _gaussian_psf(1.5, 7).reshape(1, 7, 7)
     trajectories = polars.DataFrame(
         {
@@ -53,11 +53,10 @@ def test_locate_returns_strict_schema() -> None:
         atol=1e-4,
     )
     expected = {
-        "t": polars.Int32,
-        "c": polars.Int32,
-        "z": polars.Float32,
-        "y": polars.Float32,
-        "x": polars.Float32,
+        "b_idx": polars.Int32,
+        "z_idx": polars.Float32,
+        "y_idx": polars.Float32,
+        "x_idx": polars.Float32,
         "contrast": polars.Float32,
         "background": polars.Float32,
         "mass": polars.Float32,
@@ -72,6 +71,91 @@ def test_locate_returns_strict_schema() -> None:
         assert locs.schema[name] == dtype, (
             f"column {name} has dtype {locs.schema[name]}, expected {dtype}"
         )
+
+
+def test_locate_public_schema() -> None:
+    """``locate`` must return the full physical + index-space schema."""
+    psf = _gaussian_psf(1.5, 7).reshape(1, 7, 7)
+    trajectories = polars.DataFrame(
+        {
+            "t": [0],
+            "c": [0],
+            "z": [0.0],
+            "y": [5.0],
+            "x": [5.0],
+            "contrast": [1.0],
+            "particle_id": [0],
+        }
+    )
+    video = tog.simulate_particles(
+        trajectories,
+        psf,
+        shape=(1, 1, 1, 10, 10),
+        noise_sigma=0.0,
+        dtype=np.float32,
+    )
+    locs = tog.locate(video, psf, chunk_size=1, iterations=10, atol=1e-3)
+    expected = {
+        "t": polars.Float64,
+        "c": polars.Int32,
+        "z": polars.Float64,
+        "y": polars.Float64,
+        "x": polars.Float64,
+        "t_idx": polars.Int32,
+        "c_idx": polars.Int32,
+        "z_idx": polars.Float32,
+        "y_idx": polars.Float32,
+        "x_idx": polars.Float32,
+        "contrast": polars.Float32,
+        "background": polars.Float32,
+        "mass": polars.Float32,
+        "snr": polars.Float32,
+        "chi2": polars.Float32,
+        "reduced_chi2": polars.Float32,
+        "n_iter": polars.Int32,
+        "converged": polars.Boolean,
+    }
+    assert locs.columns == list(expected)
+    for name, dtype in expected.items():
+        assert locs.schema[name] == dtype, (
+            f"column {name} has dtype {locs.schema[name]}, expected {dtype}"
+        )
+
+
+def test_locate_public_schema_float64_t_with_nonzero_origin() -> None:
+    """Physical coordinates must absorb large origins without subpixel loss."""
+    psf = _gaussian_psf(1.5, 7).reshape(1, 7, 7)
+    trajectories = polars.DataFrame(
+        {
+            "t": [0],
+            "c": [0],
+            "z": [0.0],
+            "y": [5.0],
+            "x": [5.0],
+            "contrast": [1.0],
+            "particle_id": [0],
+        }
+    )
+    video = tog.simulate_particles(
+        trajectories,
+        psf,
+        shape=(1, 1, 1, 10, 10),
+        noise_sigma=0.0,
+        dtype=np.float32,
+    )
+    # Shift the spatial origin far from zero; the subpixel part of the
+    # position must survive the float64 physical coordinate.
+    video = video.assign_coords(
+        Y=video["Y"] + 5000.0,
+        X=video["X"] + 5000.0,
+    )
+    locs = tog.locate(video, psf, chunk_size=1, iterations=10, atol=1e-3)
+    assert locs.shape[0] == 1
+    # ``z_idx``/``y_idx``/``x_idx`` are the index-space (subpixel) positions.
+    assert abs(locs["y_idx"][0] - 5.0) < 0.05
+    # The physical coordinate is the origin plus the index, in float64.
+    assert abs(locs["y"][0] - 5005.0) < 0.05
+    assert locs.schema["y"] == polars.Float64
 
 
 def test_locate_two_separated_emitters() -> None:
@@ -104,7 +188,7 @@ def test_locate_two_separated_emitters() -> None:
         atol=1e-4,
     )
     assert locs.shape[0] == 2
-    ys = sorted(locs["y"].to_list())
+    ys = sorted(locs["y_idx"].to_list())
     assert abs(ys[0] - 3.0) < 0.05
     assert abs(ys[1] - 8.0) < 0.05
 
@@ -153,37 +237,46 @@ def test_locate_sign_argument() -> None:
     assert all(a < 0 for a in neg_locs["contrast"].to_list())
 
 
-def test_locate_starting_frame_offset() -> None:
-    """The starting_frame argument must be added to the t column."""
+def test_locate_t_idx_and_physical_t() -> None:
+    """``t_idx`` is the global frame index and ``t`` is the physical time."""
     psf = _gaussian_psf(1.5, 7).reshape(1, 7, 7)
+    n_frames = 5
     trajectories = polars.DataFrame(
         {
-            "t": [0],
-            "c": [0],
-            "z": [0.0],
-            "y": [5.0],
-            "x": [5.0],
-            "contrast": [1.0],
-            "particle_id": [0],
+            "t": list(range(n_frames)),
+            "c": [0] * n_frames,
+            "z": [0.0] * n_frames,
+            "y": [5.0] * n_frames,
+            "x": [5.0] * n_frames,
+            "contrast": [1.0] * n_frames,
+            "particle_id": [0] * n_frames,
         }
     )
     video = tog.simulate_particles(
         trajectories,
         psf,
-        shape=(1, 1, 1, 10, 10),
+        shape=(n_frames, 1, 1, 10, 10),
         noise_sigma=0.0,
         dtype=np.float32,
     )
-    locs = locate_in_chunk(
-        jnp.asarray(video.values[0]),
+    locs = tog.locate(
+        video,
         psf,
-        starting_frame=42,
+        chunk_size=2,
         min_distance=3,
         min_contrast=0.0,
         iterations=50,
         atol=1e-4,
     )
-    assert locs["t"].to_list() == [42]
+    # ``t_idx`` runs over the global frame indices 0..n-1.
+    assert locs["t_idx"].to_list() == list(range(n_frames))
+    # ``t`` is the physical time coordinate; with ``dt == 1`` (the
+    # default used by ``simulate_particles``) it equals ``t_idx``.
+    t_coord = np.asarray(video["T"].values)
+    np.testing.assert_allclose(np.sort(locs["t"].to_numpy()), np.sort(t_coord), rtol=1e-12)
+    # ``t`` is float64 (physical coordinate precision).
+    assert locs.schema["t"] == polars.Float64
+    assert locs.schema["t_idx"] == polars.Int32
 
 
 def test_locate_channel_validation() -> None:
@@ -241,7 +334,17 @@ def test_locate_dtype_strictness() -> None:
         iterations=50,
         atol=1e-4,
     )
-    float_cols = {"z", "y", "x", "contrast", "background", "mass", "snr", "chi2", "reduced_chi2"}
+    float_cols = {
+        "z_idx",
+        "y_idx",
+        "x_idx",
+        "contrast",
+        "background",
+        "mass",
+        "snr",
+        "chi2",
+        "reduced_chi2",
+    }
     for col in float_cols:
         if col in locs.columns and locs[col].null_count() < locs.shape[0]:
             assert locs[col].dtype == polars.Float32
@@ -341,8 +444,8 @@ def test_locate_in_chunk_2d() -> None:
     assert locs.shape[0] >= 1
     # At least one located emitter should be near the true position.
     best = int(np.argmax(np.abs(locs["contrast"].to_numpy())))
-    assert abs(locs["y"][best] - 3.4) < 0.1
-    assert abs(locs["x"][best] - 5.6) < 0.1
+    assert abs(locs["y_idx"][best] - 3.4) < 0.1
+    assert abs(locs["x_idx"][best] - 5.6) < 0.1
 
 
 def test_locate_circular_motion_2d() -> None:
@@ -598,8 +701,8 @@ def test_locate_snr_is_computed() -> None:
 
     # Pick the detection nearest the true emitter position (10, 10).
     def _nearest_snr(locs: polars.DataFrame) -> float:
-        dy = locs["y"].to_numpy() - 10.0
-        dx = locs["x"].to_numpy() - 10.0
+        dy = locs["y_idx"].to_numpy() - 10.0
+        dx = locs["x_idx"].to_numpy() - 10.0
         idx = int(np.argmin(dy * dy + dx * dx))
         return float(locs["snr"][idx])
 
@@ -897,7 +1000,7 @@ def test_locate_n_active_frames_filters_padded_detections() -> None:
         atol=1e-3,
     )
     assert locs.shape[0] == 1
-    assert locs["t"].to_list() == [0]
+    assert locs["b_idx"].to_list() == [0]
 
 
 def test_locate_n_active_frames_validation() -> None:

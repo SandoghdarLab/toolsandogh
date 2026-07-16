@@ -60,8 +60,8 @@ def test_simulate_particles_roundtrip_single_emitter() -> None:
         atol=1e-4,
     )
     assert locs.shape[0] == 1
-    assert abs(locs["y"][0] - true_y) < 0.05
-    assert abs(locs["x"][0] - true_x) < 0.05
+    assert abs(locs["y_idx"][0] - true_y) < 0.05
+    assert abs(locs["x_idx"][0] - true_x) < 0.05
     assert abs(locs["contrast"][0] - true_amp) < 0.1
     assert bool(locs["converged"][0]) is True
 
@@ -185,9 +185,9 @@ def test_simulate_particles_3d() -> None:
     # artefacts, so filter to the one with the largest absolute contrast.
     abs_amps = np.abs(locs["contrast"].to_numpy())
     best = int(np.argmax(abs_amps))
-    assert abs(locs["z"][best] - true_z) < 0.1
-    assert abs(locs["y"][best] - true_y) < 0.1
-    assert abs(locs["x"][best] - true_x) < 0.1
+    assert abs(locs["z_idx"][best] - true_z) < 0.1
+    assert abs(locs["y_idx"][best] - true_y) < 0.1
+    assert abs(locs["x_idx"][best] - true_x) < 0.1
     assert abs(locs["contrast"][best] - true_amp) < 0.1
 
 

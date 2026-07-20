@@ -83,7 +83,12 @@ def locate(
     psf : array-like
         The point-spread function model, shape ``(Py, Px)`` for a 2D
         (widefield) PSF or ``(Pz, Py, Px)`` for a 3D PSF.  A 2D PSF is
-        promoted to ``(1, Py, Px)`` internally.
+        promoted to ``(1, Py, Px)`` internally.  The PSF is normalized
+        (mean-subtracted and L2-normalized) so that the matched-filter
+        score of a unit-contrast emitter is exactly 1; this makes
+        ``min_contrast`` a direct threshold on the fitted ``contrast``
+        column.  The fitted ``contrast`` is therefore reported relative
+        to the normalized PSF, not the supplied one.
     channel : int or str or float, optional
         The channel to localize, given as a coordinate label (anything
         xarray's ``.sel`` accepts).  Required when the video has more
@@ -103,7 +108,10 @@ def locate(
         suppressed.
     min_contrast : float
         Minimum absolute value of the matched-filter score for a peak
-        to be reported.  Must be strictly positive; the default is
+        to be reported.  Because the PSF is normalized (mean-zero,
+        unit L2 norm), the score at a true peak equals the emitter's
+        fitted contrast, so this is a direct threshold on the
+        ``contrast`` column.  Must be strictly positive; the default is
         ``1.0``.
     sign : {"both", "positive", "negative"}
         Whether to detect only positive peaks, only negative peaks, or
@@ -148,6 +156,14 @@ def locate(
 
     Notes
     -----
+    The PSF is normalized (mean-subtracted, L2-normalized) internally,
+    so the fitted ``contrast`` is relative to the normalized PSF: a
+    unit-contrast emitter (one that matches the normalized PSF with
+    amplitude 1) produces a peak matched-filter score of 1 and a fitted
+    contrast of 1.  The fitted ``background`` absorbs the DC component
+    removed by mean-subtraction, so for an all-positive PSF it is biased
+    high relative to the true additive offset by ``contrast * mean(psf)``.
+
     The ``chi2`` column is the chi-squared statistic
     ``sum(residual**2) / noise_sigma**2``, which follows a chi-squared
     distribution with ``dof = Pz*Py*Px - n_params`` degrees of freedom
@@ -302,7 +318,12 @@ def _locate_in_chunk(
     Both ``chunk`` and ``psf`` must already be well-formed JAX arrays:
     ``chunk`` is a dense 4D ``(B, Z, Y, X)`` array and ``psf`` is a 3D
     ``(Pz, Py, Px)`` array (a 2D PSF must have been promoted to ``(1, Py,
-    Px)`` by the caller).  Input canonicalization and validation are the
+    Px)`` by the caller).  The PSF must also be **normalized**
+    (mean-subtracted and L2-normalized, as :func:`_canonicalize_psf`
+    does) so that the matched-filter score and the fitted contrast share
+    a scale; :func:`locate` guarantees this, but direct callers of
+    :func:`_locate_in_chunk` are responsible for normalizing the PSF
+    themselves.  Input canonicalization and validation are the
     responsibility of :func:`locate`, not of this function.
 
     The returned DataFrame carries only index-space coordinates:
@@ -318,6 +339,9 @@ def _locate_in_chunk(
         A dense ``(B, Z, Y, X)`` array of image data.
     psf : jax.Array
         The 3D point-spread function model, shape ``(Pz, Py, Px)``.
+        Must be mean-zero and L2-normalized (see :func:`_canonicalize_psf`)
+        so that the matched-filter score and the fitted contrast share
+        a scale.
     n_active_frames : int, optional
         Number of frames at the start of ``chunk`` that contain real
         data.  When ``None`` (the default), all ``B`` frames are
@@ -939,11 +963,26 @@ def _canonicalize_psf(
     dtype: npt.DTypeLike | None = None,
 ) -> np.ndarray:
     """
-    Coerce a PSF model to the canonical 3D ``(Pz, Py, Px)`` form.
+    Coerce a PSF model to the canonical normalized 3D ``(Pz, Py, Px)`` form.
 
     A 2D ``(Py, Px)`` PSF (widefield) is promoted to ``(1, Py, Px)``.
-    Any other rank is rejected.  The result is cast to ``dtype`` when
+    Any other rank is rejected.  The PSF is then **normalized** so that
+    the matched-filter score and the fitted contrast land on the same
+    scale: the mean is subtracted (making the PSF mean-zero, so a flat
+    background contributes nothing to the correlation score) and the
+    result is divided by its L2 norm (so a unit-contrast emitter
+    produces a unit peak score).  The result is cast to ``dtype`` when
     supplied, otherwise the input dtype is preserved.
+
+    Normalization matters because :func:`locate` uses the PSF both as
+    the matched-filter kernel (for detection) and as the fitting
+    template (for refinement).  With a mean-zero, L2-normalized PSF the
+    peak matched-filter score of a unit-contrast emitter is exactly 1,
+    so ``min_contrast`` becomes a direct threshold on the fitted
+    ``contrast`` column rather than on a PSF- and background-dependent
+    score.  A constant or all-zero PSF (L2 norm zero) is left unchanged
+    after mean subtraction, with a precision-relative floor guarding the
+    division.
 
     Parameters
     ----------
@@ -955,7 +994,7 @@ def _canonicalize_psf(
     Returns
     -------
     numpy.ndarray
-        A 3D ``(Pz, Py, Px)`` array of the requested dtype.
+        A normalized 3D ``(Pz, Py, Px)`` array of the requested dtype.
 
     Raises
     ------
@@ -969,6 +1008,13 @@ def _canonicalize_psf(
         raise ValueError(f"`psf` must be a 2D or 3D array, got an array of shape {arr.shape}.")
     if dtype is not None:
         arr = arr.astype(dtype)
+    # Mean-subtract (kills the background contribution to the matched-filter
+    # score) and L2-normalize (so a unit-contrast emitter scores 1.0).  The
+    # floor on the norm avoids a divide-by-zero for a constant PSF.
+    arr = arr - arr.mean()
+    norm = np.linalg.norm(arr)
+    floor = np.sqrt(np.finfo(arr.dtype).eps) * max(float(np.max(np.abs(arr))), 1.0)
+    arr = arr / max(norm, floor)
     return arr
 
 

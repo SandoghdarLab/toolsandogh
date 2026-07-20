@@ -103,8 +103,8 @@ def main() -> None:
     print("auto chunk_size (default):")
     for hw in (64, 128):
         bench(64, hw, "auto", min_contrast=0.2)
-    print("Dense case (min_contrast=0):")
-    bench(64, 64, 8, min_contrast=0.0)
+    print("Dense case (min_contrast=0.1):")
+    bench(64, 64, 8, min_contrast=0.1)
 
 
 if __name__ == "__main__":

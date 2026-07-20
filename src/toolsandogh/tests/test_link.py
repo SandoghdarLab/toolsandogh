@@ -33,6 +33,7 @@ def _simulate_and_locate(
         psf,
         min_distance=3,
         min_contrast=0.1,
+        sign="positive",
         iterations=10,
         atol=1e-3,
         **locate_kwargs,
@@ -209,6 +210,7 @@ def test_link_multi_channel_independent() -> None:
             channel=ch,
             min_distance=3,
             min_contrast=0.1,
+            sign="positive",
             iterations=10,
             atol=1e-3,
         )

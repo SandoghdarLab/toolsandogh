@@ -7,7 +7,6 @@ import pytest
 import xarray as xr
 
 import toolsandogh as tog
-from toolsandogh._locate import _locate_in_chunk as locate_in_chunk
 
 
 def _gaussian_psf(sigma: float, n: int) -> jnp.ndarray:
@@ -50,19 +49,25 @@ def test_simulate_particles_roundtrip_single_emitter() -> None:
     assert video.shape == (1, 1, 1, 10, 10)
     assert video.dtype == np.float32
 
-    # Locate the emitter with the same PSF.
-    locs = locate_in_chunk(
-        jnp.asarray(video.values[0]),
+    # Locate the emitter with the same PSF.  ``locate`` normalizes the PSF
+    # internally, so the fitted contrast is ``true_amp * s`` where ``s``
+    # is the L2 norm of the mean-subtracted PSF.
+    psf_np = np.asarray(psf)
+    psf_norm = np.linalg.norm(psf_np - psf_np.mean())
+    locs = tog.locate(
+        video,
         psf,
+        chunk_size=1,
         min_distance=3,
-        min_contrast=0.1,
+        min_contrast=0.5,
+        sign="positive",
         iterations=50,
         atol=1e-4,
     )
     assert locs.shape[0] == 1
     assert abs(locs["row"][0] - true_y) < 0.05
     assert abs(locs["column"][0] - true_x) < 0.05
-    assert abs(locs["contrast"][0] - true_amp) < 0.1
+    assert abs(locs["contrast"][0] - true_amp * psf_norm) < 0.1
     assert bool(locs["converged"][0]) is True
 
 
@@ -88,11 +93,16 @@ def test_simulate_particles_negative_contrast() -> None:
         noise_sigma=0.0,
         dtype=np.float32,
     )
-    locs = locate_in_chunk(
-        jnp.asarray(video.values[0]),
+    # ``locate`` normalizes the PSF, so the fitted contrast is
+    # ``true_amp * s`` where ``s`` is the L2 norm of the mean-subtracted PSF.
+    psf_np = np.asarray(psf)
+    psf_norm = np.linalg.norm(psf_np - psf_np.mean())
+    locs = tog.locate(
+        video,
         psf,
+        chunk_size=1,
         min_distance=3,
-        min_contrast=0.1,
+        min_contrast=0.5,
         sign="negative",
         iterations=50,
         atol=1e-4,
@@ -100,7 +110,7 @@ def test_simulate_particles_negative_contrast() -> None:
     assert locs.shape[0] >= 1
     # The most prominent negative emitter should be the one we placed.
     amps = sorted(locs["contrast"].to_list())
-    assert abs(amps[0] - true_amp) < 0.1
+    assert abs(amps[0] - true_amp * psf_norm) < 0.1
 
 
 def test_simulate_particles_noise_is_added() -> None:
@@ -173,11 +183,17 @@ def test_simulate_particles_3d() -> None:
         noise_sigma=0.0,
         dtype=np.float32,
     )
-    locs = locate_in_chunk(
-        jnp.asarray(video.values[0]),
+    # ``locate`` normalizes the PSF, so the fitted contrast is
+    # ``true_amp * s`` where ``s`` is the L2 norm of the mean-subtracted PSF.
+    psf_np = np.asarray(psf)
+    psf_norm = np.linalg.norm(psf_np - psf_np.mean())
+    locs = tog.locate(
+        video,
         psf,
+        chunk_size=1,
         min_distance=3,
-        min_contrast=0.1,
+        min_contrast=0.5,
+        sign="positive",
         iterations=50,
         atol=1e-4,
     )
@@ -188,7 +204,7 @@ def test_simulate_particles_3d() -> None:
     assert abs(locs["slice"][best] - true_z) < 0.1
     assert abs(locs["row"][best] - true_y) < 0.1
     assert abs(locs["column"][best] - true_x) < 0.1
-    assert abs(locs["contrast"][best] - true_amp) < 0.1
+    assert abs(locs["contrast"][best] - true_amp * psf_norm) < 0.1
 
 
 def test_simulate_particles_missing_columns() -> None:

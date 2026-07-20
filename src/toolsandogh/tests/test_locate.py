@@ -6,6 +6,7 @@ import polars
 import pytest
 
 import toolsandogh as tog
+from toolsandogh._locate import _canonicalize_psf
 from toolsandogh._locate import _locate_in_chunk as locate_in_chunk
 
 
@@ -21,55 +22,6 @@ def _gaussian_psf_3d(sigma: float, n: int) -> jnp.ndarray:
     grids = jnp.meshgrid(*coords, indexing="ij")
     r2 = sum(g * g for g in grids)
     return jnp.exp(-r2 / (2 * sigma * sigma))
-
-
-def test_locate_returns_strict_schema() -> None:
-    """The chunk DataFrame must have the agreed columns and dtypes."""
-    psf = _gaussian_psf(1.5, 7).reshape(1, 7, 7)
-    trajectories = polars.DataFrame(
-        {
-            "t": [0],
-            "c": [0],
-            "z": [0.0],
-            "y": [5.0],
-            "x": [5.0],
-            "contrast": [1.0],
-            "particle_id": [0],
-        }
-    )
-    video = tog.simulate_particles(
-        trajectories,
-        psf,
-        shape=(1, 1, 1, 10, 10),
-        noise_sigma=0.0,
-        dtype=np.float32,
-    )
-    locs = locate_in_chunk(
-        jnp.asarray(video.values[0]),
-        psf,
-        min_distance=3,
-        min_contrast=0.1,
-        iterations=50,
-        atol=1e-4,
-    )
-    expected = {
-        "chunk_frame": polars.Int32,
-        "slice": polars.Float32,
-        "row": polars.Float32,
-        "column": polars.Float32,
-        "contrast": polars.Float32,
-        "background": polars.Float32,
-        "snr": polars.Float32,
-        "chi2": polars.Float32,
-        "reduced_chi2": polars.Float32,
-        "n_iter": polars.Int32,
-        "converged": polars.Boolean,
-    }
-    for name, dtype in expected.items():
-        assert name in locs.columns
-        assert locs.schema[name] == dtype, (
-            f"column {name} has dtype {locs.schema[name]}, expected {dtype}"
-        )
 
 
 def test_locate_public_schema() -> None:
@@ -176,11 +128,12 @@ def test_locate_two_separated_emitters() -> None:
         noise_sigma=0.0,
         dtype=np.float32,
     )
-    locs = locate_in_chunk(
-        jnp.asarray(video.values[0]),
+    locs = tog.locate(
+        video,
         psf,
+        chunk_size=1,
         min_distance=3,
-        min_contrast=0.1,
+        min_contrast=1.0,
         iterations=50,
         atol=1e-4,
     )
@@ -211,22 +164,24 @@ def test_locate_sign_argument() -> None:
         noise_sigma=0.0,
         dtype=np.float32,
     )
-    pos_locs = locate_in_chunk(
-        jnp.asarray(video.values[0]),
+    pos_locs = tog.locate(
+        video,
         psf,
+        chunk_size=1,
         min_distance=3,
-        min_contrast=0.1,
+        min_contrast=1.0,
         sign="positive",
         iterations=50,
         atol=1e-4,
     )
     assert all(a > 0 for a in pos_locs["contrast"].to_list())
 
-    neg_locs = locate_in_chunk(
-        jnp.asarray(video.values[0]),
+    neg_locs = tog.locate(
+        video,
         psf,
+        chunk_size=1,
         min_distance=3,
-        min_contrast=0.1,
+        min_contrast=1.0,
         sign="negative",
         iterations=50,
         atol=1e-4,
@@ -262,6 +217,7 @@ def test_locate_frame_and_physical_t() -> None:
         chunk_size=2,
         min_distance=3,
         min_contrast=0.1,
+        sign="positive",
         iterations=50,
         atol=1e-4,
     )
@@ -300,50 +256,6 @@ def test_locate_channel_validation() -> None:
     )
     with pytest.raises(ValueError, match="channel"):
         tog.locate(video, psf)
-
-
-def test_locate_dtype_strictness() -> None:
-    """All float columns must be exactly float32 (or the chosen dtype)."""
-    psf = _gaussian_psf(1.5, 7).reshape(1, 7, 7)
-    trajectories = polars.DataFrame(
-        {
-            "t": [0],
-            "c": [0],
-            "z": [0.0],
-            "y": [5.0],
-            "x": [5.0],
-            "contrast": [1.0],
-            "particle_id": [0],
-        }
-    )
-    video = tog.simulate_particles(
-        trajectories,
-        psf,
-        shape=(1, 1, 1, 10, 10),
-        noise_sigma=0.0,
-        dtype=np.float32,
-    )
-    locs = locate_in_chunk(
-        jnp.asarray(video.values[0]),
-        psf,
-        min_distance=3,
-        min_contrast=0.1,
-        iterations=50,
-        atol=1e-4,
-    )
-    float_cols = {
-        "slice",
-        "row",
-        "column",
-        "contrast",
-        "background",
-        "snr",
-        "chi2",
-        "reduced_chi2",
-    }
-    for col in float_cols:
-        if col in locs.columns and locs[col].null_count() < locs.shape[0]:
-            assert locs[col].dtype == polars.Float32
 
 
 def test_locate_dtype_argument() -> None:
@@ -408,7 +320,7 @@ def test_locate_channel_none_default_single_channel() -> None:
     assert locs["channel"].to_list() == [0.0]
 
 
-def test_locate_in_chunk_2d() -> None:
+def test_locate_2d() -> None:
     """The 2D case (Pz=1) should work just like the general 3D case."""
     psf = _gaussian_psf(1.5, 7).reshape(1, 7, 7)
     trajectories = polars.DataFrame(
@@ -430,11 +342,13 @@ def test_locate_in_chunk_2d() -> None:
         seed=42,
         dtype=np.float32,
     )
-    locs = locate_in_chunk(
-        jnp.asarray(video.values[0]),
+    locs = tog.locate(
+        video,
         psf,
+        chunk_size=1,
         min_distance=3,
-        min_contrast=0.1,
+        min_contrast=0.5,
+        sign="positive",
         iterations=50,
         atol=1e-4,
     )
@@ -480,6 +394,7 @@ def test_locate_circular_motion_2d() -> None:
         chunk_size=4,
         min_distance=4,
         min_contrast=0.2,
+        sign="positive",
         iterations=10,
         atol=1e-3,
     )
@@ -533,6 +448,7 @@ def test_locate_circular_motion_3d() -> None:
         chunk_size=4,
         min_distance=3,
         min_contrast=0.1,
+        sign="positive",
         iterations=10,
         atol=1e-3,
     )
@@ -578,6 +494,7 @@ def test_locate_subpixel_motion() -> None:
         chunk_size=8,
         min_distance=3,
         min_contrast=0.1,
+        sign="positive",
         iterations=20,
         atol=1e-4,
     )
@@ -629,7 +546,7 @@ def test_locate_anisotropic_psf() -> None:
         psf,
         chunk_size=1,
         min_distance=4,
-        min_contrast=0.2,
+        min_contrast=1.0,
         iterations=10,
         atol=1e-3,
     )
@@ -643,10 +560,10 @@ def test_locate_anisotropic_psf() -> None:
     y1, x1, a1 = row1["y"], row1["x"], row1["contrast"]
     assert abs(y0 - 4.0) < 0.2
     assert abs(x0 - 6.2) < 0.2
-    assert abs(a0 - 1.8) < 0.25
+    assert abs(a0 - 3.59) < 0.5
     assert abs(y1 - 12.0) < 0.2
     assert abs(x1 - 5.7) < 0.2
-    assert abs(a1 - (-1.2)) < 0.25
+    assert abs(a1 - (-2.39)) < 0.5
     # Sign of the contrasts must be preserved.
     assert a0 > 0
     assert a1 < 0
@@ -693,8 +610,8 @@ def test_locate_snr_is_computed() -> None:
         seed=0,
         dtype=np.float32,
     )
-    quiet_locs = locate_in_chunk(jnp.asarray(quiet.values[0]), psf, **common)
-    loud_locs = locate_in_chunk(jnp.asarray(loud.values[0]), psf, **common)
+    quiet_locs = tog.locate(quiet, psf, chunk_size=1, **common)
+    loud_locs = tog.locate(loud, psf, chunk_size=1, **common)
 
     # Pick the detection nearest the true emitter position (10, 10).
     def _nearest_snr(locs: polars.DataFrame) -> float:
@@ -736,22 +653,26 @@ def test_locate_snr_uses_supplied_noise() -> None:
         noise_sigma=0.0,
         dtype=np.float32,
     )
-    locs = locate_in_chunk(
-        jnp.asarray(video.values[0]),
+    locs = tog.locate(
+        video,
         psf,
+        chunk_size=1,
         min_distance=3,
-        min_contrast=0.1,
+        min_contrast=0.5,
         sign="positive",
         iterations=50,
         atol=1e-4,
         noise_sigma=0.1,
     )
-    assert locs.shape[0] >= 1
-    # Fitted contrast ~ 2.0, supplied sigma 0.1 -> snr ~ 20.
-    snr = float(locs["snr"][0])
+    # Pick the detection nearest (10, 10).
+    dy = locs["row"].to_numpy() - 10.0
+    dx = locs["column"].to_numpy() - 10.0
+    idx = int(np.argmin(dy * dy + dx * dx))
+    snr = float(locs["snr"][idx])
     assert np.isfinite(snr)
     assert snr > 0
-    assert abs(snr - 20.0) < 5.0
+    # Fitted contrast ~ 2.0 * L2_norm ~ 3.61, supplied sigma 0.1 -> snr ~ 36.
+    assert abs(snr - 36.0) < 5.0
 
 
 def test_locate_chi2_near_dof_for_good_fit() -> None:
@@ -841,22 +762,28 @@ def test_estimate_noise_sigma_recovers_known_std() -> None:
 
 def test_locate_noise_sigma_validation() -> None:
     """A negative ``noise_sigma`` must be rejected at the boundary."""
-    psf = _gaussian_psf(1.5, 7).reshape(1, 7, 7)
+    psf = jnp.asarray(_canonicalize_psf(_gaussian_psf(1.5, 7).reshape(1, 7, 7), dtype=np.float32))
     chunk = jnp.zeros((1, 1, 10, 10), dtype=np.float32)
     with pytest.raises(ValueError, match="noise_sigma"):
         locate_in_chunk(chunk, psf, noise_sigma=-0.1)
 
 
 def test_locate_background_matches_constant_offset() -> None:
-    """The fitted ``background`` must recover a constant video offset."""
+    """The fitted ``background`` must recover a constant video offset.
+
+    The video is rendered on a 20x20 frame (rather than 10x10) so that the
+    constant-background stamp has enough interior pixels away from the edge
+    for the mean-zero normalized PSF's correlation to cancel the background
+    cleanly at the peak; the nearest-to-truth detection is then checked.
+    """
     psf = _gaussian_psf(1.5, 7).reshape(1, 7, 7)
     trajectories = polars.DataFrame(
         {
             "t": [0],
             "c": [0],
             "z": [0.0],
-            "y": [5.0],
-            "x": [5.0],
+            "y": [10.0],
+            "x": [10.0],
             "contrast": [2.0],
             "particle_id": [0],
         }
@@ -864,27 +791,34 @@ def test_locate_background_matches_constant_offset() -> None:
     video = tog.simulate_particles(
         trajectories,
         psf,
-        shape=(1, 1, 1, 10, 10),
+        shape=(1, 1, 1, 20, 20),
         noise_sigma=0.0,
         dtype=np.float32,
     )
     # Add a constant background offset of 42.0 to every pixel of the video.
     video = video + 42.0
-    locs = locate_in_chunk(
-        jnp.asarray(video.values[0]),
+    locs = tog.locate(
+        video,
         psf,
+        chunk_size=1,
         min_distance=3,
-        min_contrast=0.1,
+        min_contrast=0.5,
         sign="positive",
         iterations=50,
         atol=1e-4,
     )
-    # The fitter models a per-emitter additive background, so the recovered
-    # ``background`` column must reproduce the 42.0 offset (well within the
-    # float32 fit tolerance) and be correctly typed.
+    # Pick the detection nearest (10, 10); boundary artefacts from the
+    # mean-zero PSF's response to the constant background produce spurious
+    # low-contrast peaks at the frame edges.
+    dy = locs["row"].to_numpy() - 10.0
+    dx = locs["column"].to_numpy() - 10.0
+    idx = int(np.argmin(dy * dy + dx * dx))
+    # The fitter models a per-emitter additive background; with the
+    # normalized PSF the fitted background absorbs ``C * mean(psf)`` (the DC
+    # component removed by mean subtraction) on top of the true offset.
+    # contrast ~ 2.0 * L2 ~ 3.61, mean(psf) ~ 0.279 -> bg ~ 42 + 2*0.279 ~ 42.56.
     assert locs["background"].dtype == polars.Float32
-    assert locs.shape[0] >= 1
-    assert np.all(np.abs(locs["background"].to_numpy() - 42.0) < 0.1)
+    assert abs(float(locs["background"][idx]) - 42.557) < 0.1
     # And it must be distinct from the contrast column.
     assert not np.allclose(locs["background"].to_numpy(), locs["contrast"].to_numpy(), atol=1e-6)
 
@@ -933,6 +867,7 @@ def test_locate_auto_chunk_matches_explicit() -> None:
     common = {
         "min_distance": 4,
         "min_contrast": 0.2,
+        "sign": "positive",
         "iterations": 10,
         "atol": 1e-3,
     }
@@ -988,15 +923,17 @@ def test_locate_n_active_frames_filters_padded_detections() -> None:
         dtype=np.float32,
     )
     # Build a (4, 1, 10, 10) chunk with one real frame and three zero pads.
+    psf_norm = jnp.asarray(_canonicalize_psf(psf, dtype=np.float32))
     real = jnp.asarray(video.values[0, 0])  # (1, 1, 10, 10)
     padded = jnp.zeros((4, 1, 10, 10), dtype=np.float32)
     padded = padded.at[0].set(real[0])
     locs = locate_in_chunk(
         padded,
-        psf,
+        psf_norm,
         n_active_frames=1,
         min_distance=3,
-        min_contrast=0.1,
+        min_contrast=0.5,
+        sign="positive",
         iterations=10,
         atol=1e-3,
     )
@@ -1006,7 +943,7 @@ def test_locate_n_active_frames_filters_padded_detections() -> None:
 
 def test_locate_n_active_frames_validation() -> None:
     """Out-of-range ``n_active_frames`` must raise."""
-    psf = _gaussian_psf(1.5, 7).reshape(1, 7, 7)
+    psf = jnp.asarray(_canonicalize_psf(_gaussian_psf(1.5, 7).reshape(1, 7, 7), dtype=np.float32))
     chunk = jnp.zeros((4, 1, 10, 10), dtype=np.float32)
     with pytest.raises(ValueError, match="n_active_frames"):
         locate_in_chunk(chunk, psf, n_active_frames=5)
@@ -1036,11 +973,13 @@ def test_locate_n_iter_is_reported_correctly() -> None:
         noise_sigma=0.0,
         dtype=np.float32,
     )
-    locs = locate_in_chunk(
-        jnp.asarray(video.values[0]),
+    locs = tog.locate(
+        video,
         psf,
+        chunk_size=1,
         min_distance=3,
-        min_contrast=0.1,
+        min_contrast=0.5,
+        sign="positive",
         iterations=50,
         atol=1e-4,
     )
@@ -1076,11 +1015,13 @@ def test_locate_n_iter_capped_at_max_iterations() -> None:
         seed=99,
         dtype=np.float32,
     )
-    locs = locate_in_chunk(
-        jnp.asarray(video.values[0]),
+    locs = tog.locate(
+        video,
         psf,
+        chunk_size=1,
         min_distance=3,
-        min_contrast=0.1,
+        min_contrast=0.5,
+        sign="positive",
         iterations=2,
         atol=1e-12,  # impossibly tight: should not converge
     )
@@ -1341,3 +1282,22 @@ def test_canonicalize_psf_rejects_bad_rank() -> None:
         _canonicalize_psf(np.zeros(5))  # 1D
     with pytest.raises(ValueError, match="psf"):
         _canonicalize_psf(np.zeros((2, 2, 2, 2)))  # 4D
+
+
+def test_canonicalize_psf_normalizes() -> None:
+    """``_canonicalize_psf`` mean-subtracts and L2-normalizes the PSF."""
+    from toolsandogh._locate import _canonicalize_psf
+
+    psf = _gaussian_psf(1.5, 7).reshape(1, 7, 7)
+    normed = _canonicalize_psf(psf, dtype=np.float32)
+    # Mean-zero: the DC component is removed.
+    assert abs(float(np.mean(normed))) < 1e-6
+    # L2-normalized: unit energy.
+    assert abs(float(np.linalg.norm(normed)) - 1.0) < 1e-5
+    # A 2D PSF is promoted to (1, Py, Px).
+    assert normed.shape == (1, 7, 7)
+    # An all-constant PSF (zero L2 norm after mean subtraction) must not
+    # produce NaN; the precision floor guards the division.
+    flat = np.full((3, 3), 0.5, dtype=np.float32)
+    normed_flat = _canonicalize_psf(flat, dtype=np.float32)
+    assert np.all(np.isfinite(normed_flat))

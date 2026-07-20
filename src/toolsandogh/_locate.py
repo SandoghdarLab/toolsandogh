@@ -88,8 +88,8 @@ def locate(
         The channel to localize, given as a coordinate label (anything
         xarray's ``.sel`` accepts).  Required when the video has more
         than one channel.  Defaults to the only channel when ``C == 1``.
-        The value is written verbatim to the ``c`` column of the output;
-        its positional index is written to the ``c_idx`` column.
+        The value is written verbatim to the ``channel`` column of the
+        output.
     chunk_size : int or {"auto"}, optional
         Number of frames processed per chunk.  Larger chunks reduce
         dispatch and synchronization overhead; smaller chunks bound peak
@@ -137,13 +137,13 @@ def locate(
     -------
     polars.DataFrame
         A Polars DataFrame with the columns
-        ``t, c, z, y, x, t_idx, c_idx, z_idx, y_idx, x_idx, contrast,
+        ``t, channel, z, y, x, frame, slice, row, column, contrast,
         background, mass, snr, chi2, reduced_chi2, n_iter, converged``.
         The ``t``, ``z``, ``y``, ``x`` columns are physical coordinates
-        (float64, milliseconds and micrometres); the ``*_idx`` columns
-        are index-space positions (``t_idx`` and ``c_idx`` are Int32,
-        ``z_idx``/``y_idx``/``x_idx`` are Float32 with subpixel
-        refinement); ``c`` is the channel label.
+        (float64, milliseconds and micrometres); the ``frame``/``slice``/
+        ``row``/``column`` columns are index-space positions (``frame``
+        is Int32, ``slice``/``row``/``column`` are Float32 with subpixel
+        refinement); ``channel`` is the channel label.
 
     Notes
     -----
@@ -165,36 +165,26 @@ def locate(
     video = canonicalize_video(video)
     psf_arr = _canonicalize_psf(psf, dtype=dtype)
 
-    # Select the channel.  ``channel`` is a coordinate label (the value
-    # passed to xarray's ``.sel``); ``c_idx`` is its positional index (the
-    # value passed to ``.isel``).  The two coincide for the default
-    # ``arange`` channel coordinate but differ when the channels have been
-    # permuted or relabelled.  Both are emitted so downstream consumers can
-    # address the channel either way.
+    # Select the channel.  When the video has only one channel, default
+    # to it (using the coord value if the channel has a non-default
+    # label, e.g. ``"mCherry"``); otherwise the caller must specify which
+    # channel to localize.  ``xarray.DataArray.sel`` accepts both a coord
+    # label and a positional index, so it handles the "label or integer"
+    # dispatch in one step and raises ``KeyError``/``TypeError``/
+    # ``IndexError`` for the not-present cases.
     n_channels = int(video.sizes["C"])
-    c_label: int | str | float
-    c_idx: int
-    if n_channels == 1:
-        if channel is not None and channel != 0:
-            raise ValueError(f"`channel` is {channel!r} but the video has only one channel.")
-        c_label = 0
-        c_idx = 0
-        video = video.isel(C=0)
-    else:
-        if channel is None:
-            raise ValueError(f"Video has {n_channels} channels; please specify `channel`.")
-        if "C" in video.coords:
-            c_vals = np.asarray(video["C"].values)
-            matches = np.nonzero(c_vals == channel)[0]
-            if matches.size == 0:
-                raise ValueError(f"Channel {channel!r} is not present in the video.")
-            c_idx = int(matches[0])
+    sole_channel = video["C"].values[0] if "C" in video.coords else 0
+    if channel is None:
+        if n_channels == 1:
+            channel = sole_channel
         else:
-            if not isinstance(channel, (int, np.integer)):
-                raise ValueError(f"Channel {channel!r} is not present in the video.")
-            c_idx = int(channel)
-        c_label = channel
-        video = video.isel(C=c_idx)
+            raise ValueError(f"Video has {n_channels} channels; please specify `channel`.")
+    elif n_channels == 1 and channel != sole_channel:
+        raise ValueError(
+            f"`channel` is {channel!r} but the video has only one channel ({sole_channel!r})."
+        )
+    assert channel is not None  # narrow for type checkers; the branches above cover ``None``.
+    video = video.sel(C=channel)
 
     # Restrict to the chosen channel and chunk along the time axis.
     n_frames = int(video.sizes["T"])
@@ -262,9 +252,8 @@ def locate(
         results.append(
             _physical_result(
                 chunk_df,
-                t_idx_offset=start,
-                c_label=c_label,
-                c_idx=c_idx,
+                frame_offset=start,
+                channel=channel,
                 t0=t0,
                 dt=dt,
                 z0=z0,
@@ -279,7 +268,7 @@ def locate(
             on_progress(end)
 
     if not results:
-        return _empty_result(channel=c_label, c_idx=c_idx)
+        return _empty_result(channel=channel)
 
     return polars.concat(results, how="vertical_relaxed")
 
@@ -306,11 +295,12 @@ def _locate_in_chunk(
     Px)`` by the caller).  Input canonicalization and validation are the
     responsibility of :func:`locate`, not of this function.
 
-    The returned DataFrame carries only index-space coordinates: ``b_idx``
-    is the chunk-local frame index (Int32) and ``z_idx``/``y_idx``/``x_idx``
-    are subpixel-refined voxel indices (Float32).  Physical coordinates and
-    channel labels are attached by :func:`locate`, which scales the
-    index-space positions into the video's coordinate units.
+    The returned DataFrame carries only index-space coordinates:
+    ``chunk_frame`` is the chunk-local frame index (Int32) and ``slice``/
+    ``row``/``column`` are subpixel-refined voxel indices (Float32).
+    Physical coordinates and the channel label are attached by
+    :func:`locate`, which scales the index-space positions into the
+    video's coordinate units.
 
     Parameters
     ----------
@@ -352,11 +342,11 @@ def _locate_in_chunk(
     -------
     polars.DataFrame
         A Polars DataFrame with the columns
-        ``b_idx, z_idx, y_idx, x_idx, contrast, background, mass, snr,
-        chi2, reduced_chi2, n_iter, converged``.  The ``b_idx`` column is
-        Int32; ``z_idx``/``y_idx``/``x_idx`` are Float32 (subpixel); the
-        float statistics are Float32; ``n_iter`` is Int32; ``converged`` is
-        Boolean.
+        ``chunk_frame, slice, row, column, contrast, background, mass,
+        snr, chi2, reduced_chi2, n_iter, converged``.  The ``chunk_frame``
+        column is Int32; ``slice``/``row``/``column`` are Float32
+        (subpixel); the float statistics are Float32; ``n_iter`` is Int32;
+        ``converged`` is Boolean.
     """
     chunk = jnp.asarray(chunk)
     psf = jnp.asarray(psf)
@@ -402,15 +392,17 @@ def _locate_in_chunk(
     if n_emitters == 0:
         return _empty_chunk_result()
 
-    b_idx = np.ascontiguousarray(coords_np[:, 0], dtype=np.int32)
-    rows_z = np.ascontiguousarray(coords_np[:, 1], dtype=np.int32)
-    rows_y = np.ascontiguousarray(coords_np[:, 2], dtype=np.int32)
-    rows_x = np.ascontiguousarray(coords_np[:, 3], dtype=np.int32)
+    chunk_frame = np.ascontiguousarray(coords_np[:, 0], dtype=np.int32)
+    slice_peaks = np.ascontiguousarray(coords_np[:, 1], dtype=np.int32)
+    row_peaks = np.ascontiguousarray(coords_np[:, 2], dtype=np.int32)
+    column_peaks = np.ascontiguousarray(coords_np[:, 3], dtype=np.int32)
 
     # 3. Batched stamp extraction: pad the whole chunk once, then read every
     #    stamp with a single advanced-indexing gather (one device dispatch for
     #    all emitters, instead of one eager pad+slice per emitter).
-    stamps = _extract_stamps_batch(chunk, b_idx, rows_z, rows_y, rows_x, (Pz, Py, Px))
+    stamps = _extract_stamps_batch(
+        chunk, chunk_frame, slice_peaks, row_peaks, column_peaks, (Pz, Py, Px)
+    )
 
     # Resolve the per-emitter noise standard deviation.  When the caller
     # does not supply one, it is estimated per frame from the standard
@@ -420,7 +412,7 @@ def _locate_in_chunk(
     # kept resident so no extra host sync is needed before the batched fit.
     if noise_sigma is None:
         per_frame_sigma = _estimate_noise_sigma(chunk, n_active_frames)  # (B,)
-        noise_sigma_arr = per_frame_sigma[jnp.asarray(b_idx)]  # (n_emitters,)
+        noise_sigma_arr = per_frame_sigma[jnp.asarray(chunk_frame)]  # (n_emitters,)
     else:
         noise_sigma_arr = jnp.full((n_emitters,), noise_sigma, dtype=chunk.dtype)
 
@@ -487,16 +479,12 @@ def _locate_in_chunk(
     #    indices are the integer peak pixel plus the LM subpixel offset;
     #    they stay Float32 (the offset's precision).  Physical coordinates
     #    are derived by ``locate`` from the video's coordinate axes.
-    z_idx_col = (rows_z.astype(np.float32) + z_offsets).astype(np.float32)
-    y_idx_col = (rows_y.astype(np.float32) + y_offsets).astype(np.float32)
-    x_idx_col = (rows_x.astype(np.float32) + x_offsets).astype(np.float32)
-
     return polars.DataFrame(
         {
-            "b_idx": b_idx,
-            "z_idx": z_idx_col,
-            "y_idx": y_idx_col,
-            "x_idx": x_idx_col,
+            "chunk_frame": chunk_frame,
+            "slice": (slice_peaks.astype(np.float32) + z_offsets).astype(np.float32),
+            "row": (row_peaks.astype(np.float32) + y_offsets).astype(np.float32),
+            "column": (column_peaks.astype(np.float32) + x_offsets).astype(np.float32),
             "contrast": contrast_col,
             "background": background_col,
             "mass": mass_col,
@@ -507,10 +495,10 @@ def _locate_in_chunk(
             "converged": converged_col,
         },
         schema={
-            "b_idx": polars.Int32,
-            "z_idx": polars.Float32,
-            "y_idx": polars.Float32,
-            "x_idx": polars.Float32,
+            "chunk_frame": polars.Int32,
+            "slice": polars.Float32,
+            "row": polars.Float32,
+            "column": polars.Float32,
             "contrast": polars.Float32,
             "background": polars.Float32,
             "mass": polars.Float32,
@@ -573,10 +561,10 @@ def _peak_mask_batch(
 
 def _extract_stamps_batch(
     chunk: Float[Array, "B Z Y X"],
-    b_idx: npt.NDArray[np.int32],
-    z_idx: npt.NDArray[np.int32],
-    y_idx: npt.NDArray[np.int32],
-    x_idx: npt.NDArray[np.int32],
+    chunk_frame: npt.NDArray[np.int32],
+    slice_peaks: npt.NDArray[np.int32],
+    row_peaks: npt.NDArray[np.int32],
+    column_peaks: npt.NDArray[np.int32],
     shape: tuple[int, int, int],
 ) -> Float[Array, "n Pz Py Px"]:
     """
@@ -593,7 +581,7 @@ def _extract_stamps_batch(
     """
     Pz, Py, Px = shape
     half_z, half_y, half_x = Pz // 2, Py // 2, Px // 2
-    n = b_idx.shape[0]
+    n = chunk_frame.shape[0]
 
     # Pad the spatial axes of the whole chunk once.  Because
     # ``half_z == Pz // 2`` (etc.), a stamp centred on frame position
@@ -615,10 +603,10 @@ def _extract_stamps_batch(
     # only a handful of emitters.  All indices stay in range because the
     # padding above guarantees ``padded`` is large enough along every axis.
     oz, oy, ox = np.mgrid[:Pz, :Py, :Px]
-    b_g = np.broadcast_to(b_idx[:, None, None, None], (n, Pz, Py, Px))
-    z_g = z_idx[:, None, None, None] + oz[None]
-    y_g = y_idx[:, None, None, None] + oy[None]
-    x_g = x_idx[:, None, None, None] + ox[None]
+    b_g = np.broadcast_to(chunk_frame[:, None, None, None], (n, Pz, Py, Px))
+    z_g = slice_peaks[:, None, None, None] + oz[None]
+    y_g = row_peaks[:, None, None, None] + oy[None]
+    x_g = column_peaks[:, None, None, None] + ox[None]
     return padded[jnp.asarray(b_g), jnp.asarray(z_g), jnp.asarray(y_g), jnp.asarray(x_g)]
 
 
@@ -1050,15 +1038,14 @@ def _channel_scalar_and_dtype(
 # Column order of the public ``locate`` output.
 _LOCATE_COLUMNS = [
     "t",
-    "c",
+    "channel",
     "z",
     "y",
     "x",
-    "t_idx",
-    "c_idx",
-    "z_idx",
-    "y_idx",
-    "x_idx",
+    "frame",
+    "slice",
+    "row",
+    "column",
     "contrast",
     "background",
     "mass",
@@ -1072,27 +1059,25 @@ _LOCATE_COLUMNS = [
 
 def _empty_result(
     channel: int | str | float = 0,
-    c_idx: int = 0,
 ) -> polars.DataFrame:
     """
     Return an empty Polars DataFrame with the ``locate`` output schema.
 
-    The ``c`` column is typed to match ``channel`` (via
-    :func:`_channel_scalar_and_dtype`) and the ``c_idx`` column is Int32;
-    every other column follows the fixed :data:`_LOCATE_COLUMNS` schema.
+    The ``channel`` column is typed to match ``channel`` (via
+    :func:`_channel_scalar_and_dtype`); every other column follows the
+    fixed :data:`_LOCATE_COLUMNS` schema.
     """
     c_scalar, c_dtype = _channel_scalar_and_dtype(channel)
     schema = {
         "t": polars.Float64,
-        "c": c_dtype,
+        "channel": c_dtype,
         "z": polars.Float64,
         "y": polars.Float64,
         "x": polars.Float64,
-        "t_idx": polars.Int32,
-        "c_idx": polars.Int32,
-        "z_idx": polars.Float32,
-        "y_idx": polars.Float32,
-        "x_idx": polars.Float32,
+        "frame": polars.Int32,
+        "slice": polars.Float32,
+        "row": polars.Float32,
+        "column": polars.Float32,
         "contrast": polars.Float32,
         "background": polars.Float32,
         "mass": polars.Float32,
@@ -1103,8 +1088,7 @@ def _empty_result(
         "converged": polars.Boolean,
     }
     return polars.DataFrame(schema=schema).with_columns(
-        polars.lit(c_scalar).cast(c_dtype).alias("c"),
-        polars.lit(np.int32(c_idx)).alias("c_idx"),
+        polars.lit(c_scalar).cast(c_dtype).alias("channel"),
     )
 
 
@@ -1112,10 +1096,10 @@ def _empty_chunk_result() -> polars.DataFrame:
     """Return an empty Polars DataFrame with the ``_locate_in_chunk`` schema."""
     return polars.DataFrame(
         schema={
-            "b_idx": polars.Int32,
-            "z_idx": polars.Float32,
-            "y_idx": polars.Float32,
-            "x_idx": polars.Float32,
+            "chunk_frame": polars.Int32,
+            "slice": polars.Float32,
+            "row": polars.Float32,
+            "column": polars.Float32,
             "contrast": polars.Float32,
             "background": polars.Float32,
             "mass": polars.Float32,
@@ -1131,9 +1115,8 @@ def _empty_chunk_result() -> polars.DataFrame:
 def _physical_result(
     chunk_df: polars.DataFrame,
     *,
-    t_idx_offset: int,
-    c_label: int | str | float,
-    c_idx: int,
+    frame_offset: int,
+    channel: int | str | float,
     t0: float,
     dt: float,
     z0: float,
@@ -1147,39 +1130,38 @@ def _physical_result(
     Scale a chunk's index-space detections into the public physical schema.
 
     ``chunk_df`` is the DataFrame returned by :func:`_locate_in_chunk`
-    (columns ``b_idx``, ``z_idx``, ``y_idx``, ``x_idx`` and the fit
+    (columns ``chunk_frame``, ``slice``, ``row``, ``column`` and the fit
     statistics).  Physical coordinates are computed in float64 as
     ``X = X0 + X_idx * dX`` using the video's per-axis origin and step;
-    the global ``t_idx`` is the chunk-local ``b_idx`` plus the chunk's
-    frame offset.  The ``c`` (label) and ``c_idx`` (positional index)
-    columns are attached as constants.
+    the global ``frame`` is the chunk-local ``chunk_frame`` plus the
+    chunk's frame offset.  The ``channel`` label column is attached as a
+    constant.
     """
     n = chunk_df.height
     if n == 0:
-        return _empty_result(c_label, c_idx)
+        return _empty_result(channel)
 
-    c_scalar, c_dtype = _channel_scalar_and_dtype(c_label)
-    b_idx = chunk_df["b_idx"].to_numpy()
-    t_idx = (b_idx + np.int32(t_idx_offset)).astype(np.int32)
-    z_idx = chunk_df["z_idx"].to_numpy()
-    y_idx = chunk_df["y_idx"].to_numpy()
-    x_idx = chunk_df["x_idx"].to_numpy()
-    t = np.float64(t0) + t_idx.astype(np.float64) * np.float64(dt)
-    z = np.float64(z0) + z_idx.astype(np.float64) * np.float64(dz)
-    y = np.float64(y0) + y_idx.astype(np.float64) * np.float64(dy)
-    x = np.float64(x0) + x_idx.astype(np.float64) * np.float64(dx)
+    c_scalar, c_dtype = _channel_scalar_and_dtype(channel)
+    chunk_frame = chunk_df["chunk_frame"].to_numpy()
+    frame = (chunk_frame + np.int32(frame_offset)).astype(np.int32)
+    slice_arr = chunk_df["slice"].to_numpy()
+    row_arr = chunk_df["row"].to_numpy()
+    column_arr = chunk_df["column"].to_numpy()
+    t = np.float64(t0) + frame.astype(np.float64) * np.float64(dt)
+    z = np.float64(z0) + slice_arr.astype(np.float64) * np.float64(dz)
+    y = np.float64(y0) + row_arr.astype(np.float64) * np.float64(dy)
+    x = np.float64(x0) + column_arr.astype(np.float64) * np.float64(dx)
 
     return chunk_df.select(
         polars.Series("t", t, dtype=polars.Float64),
-        polars.Series("c", np.full(n, c_scalar), dtype=c_dtype),
+        polars.Series("channel", np.full(n, c_scalar), dtype=c_dtype),
         polars.Series("z", z, dtype=polars.Float64),
         polars.Series("y", y, dtype=polars.Float64),
         polars.Series("x", x, dtype=polars.Float64),
-        polars.Series("t_idx", t_idx, dtype=polars.Int32),
-        polars.Series("c_idx", np.full(n, c_idx, dtype=np.int32), dtype=polars.Int32),
-        polars.Series("z_idx", z_idx, dtype=polars.Float32),
-        polars.Series("y_idx", y_idx, dtype=polars.Float32),
-        polars.Series("x_idx", x_idx, dtype=polars.Float32),
+        polars.Series("frame", frame, dtype=polars.Int32),
+        polars.Series("slice", slice_arr, dtype=polars.Float32),
+        polars.Series("row", row_arr, dtype=polars.Float32),
+        polars.Series("column", column_arr, dtype=polars.Float32),
         polars.col("contrast"),
         polars.col("background"),
         polars.col("mass"),

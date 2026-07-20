@@ -15,7 +15,7 @@ frames and count against ``memory`` for every active trajectory.
 
 Positions are compared in either physical (micrometre) or index (pixel)
 space, as selected by the search-range argument; frames are always
-counted by the integer ``t_idx`` column so that gaps and ``memory`` are
+counted by the integer ``frame`` column so that gaps and ``memory`` are
 independent of the frame rate.
 """
 
@@ -81,20 +81,20 @@ def link(
     new one.  A trajectory that goes unmatched for more than
     ``memory`` frames is closed.
 
-    Each channel (``c`` column) is linked independently.  When ``c`` is
-    absent all rows are linked together.  Frames are counted by the
-    integer ``t_idx`` column, so ``memory`` and any adaptive scaling are
-    independent of the frame rate.
+    Each channel (``channel`` column) is linked independently.  When the
+    ``channel`` column is absent all rows are linked together.  Frames are
+    counted by the integer ``frame`` column, so ``memory`` and any
+    adaptive scaling are independent of the frame rate.
 
     Parameters
     ----------
     locs : polars.DataFrame
         Per-frame emitter table, typically from
-        :func:`toolsandogh.locate`.  Must contain ``t_idx`` and either
+        :func:`toolsandogh.locate`.  Must contain ``frame`` and either
         the physical spatial columns (``z``, ``y``, ``x``) when using
         ``search_range_micrometers`` or the index-space columns
-        (``z_idx``, ``y_idx``, ``x_idx``) when using
-        ``search_range_pixels``.  The channel column ``c`` is optional;
+        (``slice``, ``row``, ``column``) when using
+        ``search_range_pixels``.  The ``channel`` column is optional;
         when present, each channel is linked independently.  Any
         additional columns are passed through.
     search_range_pixels : float or tuple of float, optional
@@ -158,12 +158,12 @@ def link(
         )
     else:
         assert search_range_pixels is not None
-        columns = ("z_idx", "y_idx", "x_idx")
+        columns = ("slice", "row", "column")
         search_ranges = _parse_search_range(search_range_pixels, param_name="search_range_pixels")
 
-    # Validate the remaining arguments and the input schema.  ``c`` is
-    # optional; when absent all rows are linked together.
-    required = {"t_idx"} | set(columns)
+    # Validate the remaining arguments and the input schema.  ``channel``
+    # is optional; when absent all rows are linked together.
+    required = {"frame"} | set(columns)
     missing = required - set(locs.columns)
     if missing:
         raise ValueError(f"locs is missing required columns: {sorted(missing)}")
@@ -187,8 +187,8 @@ def link(
     # original row order after sorting and grouping.  Sort once by the
     # full grouping key so the ``partition_by`` calls below do not need
     # to re-sort: rows within each group are already in frame order.
-    has_channel = "c" in locs.columns
-    sort_keys = ["c", "t_idx"] if has_channel else ["t_idx"]
+    has_channel = "channel" in locs.columns
+    sort_keys = ["channel", "frame"] if has_channel else ["frame"]
     indexed = locs.with_row_index(name="__row_index").sort(sort_keys)
 
     # Per-row particle id, indexed by the original row order.
@@ -197,17 +197,20 @@ def link(
     rows_done = 0
 
     # Outer loop: one iteration per channel (or a single pass over the
-    # whole table when ``c`` is absent).  Each channel keeps its own set
-    # of active tracks, which is reset at the top of the loop.
-    channel_groups = indexed.partition_by("c", maintain_order=True) if has_channel else [indexed]
+    # whole table when the ``channel`` column is absent).  Each channel
+    # keeps its own set of active tracks, which is reset at the top of
+    # the loop.
+    channel_groups = (
+        indexed.partition_by("channel", maintain_order=True) if has_channel else [indexed]
+    )
     for channel_df in channel_groups:
         active_tracks: list[dict] = []
 
         # Inner loop: one iteration per detected frame, in ascending
-        # ``t_idx`` order.  ``partition_by`` returns one DataFrame per
+        # ``frame`` order.  ``partition_by`` returns one DataFrame per
         # frame, carrying the original row indices.
-        for frame_df in channel_df.partition_by("t_idx", maintain_order=True):
-            frame_t = int(frame_df["t_idx"][0])
+        for frame_df in channel_df.partition_by("frame", maintain_order=True):
+            frame_t = int(frame_df["frame"][0])
             row_indices = frame_df["__row_index"].to_numpy()
             det_pos = np.stack(
                 [frame_df[col].to_numpy().astype(np.float64, copy=False) for col in columns],

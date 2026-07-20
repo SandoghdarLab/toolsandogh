@@ -91,10 +91,10 @@ def test_link_two_particles_separated() -> None:
     locs = _simulate_and_locate(trajectories, psf, (n_frames, 1, 1, 14, 14))
     linked = tog.link(locs, search_range_micrometers=1.0, memory=0)
     # Both particles should keep their ids throughout the video.
-    sorted_linked = linked.sort(["t_idx", "y"])
+    sorted_linked = linked.sort(["frame", "y"])
     pids_per_frame = []
     for tt in range(n_frames):
-        rows = sorted_linked.filter(polars.col("t_idx") == tt)
+        rows = sorted_linked.filter(polars.col("frame") == tt)
         assert rows.shape[0] == 2
         pids_per_frame.append(rows["particle_id"].to_list())
     particle_0_ids = {p[0] for p in pids_per_frame}
@@ -216,8 +216,8 @@ def test_link_multi_channel_independent() -> None:
     locs = polars.concat(parts, how="vertical_relaxed")
     # Each channel should contribute its own trajectory.
     linked = tog.link(locs, search_range_micrometers=1.0, memory=0)
-    channel_0_ids = set(linked.filter(polars.col("c") == 0)["particle_id"].to_list())
-    channel_1_ids = set(linked.filter(polars.col("c") == 1)["particle_id"].to_list())
+    channel_0_ids = set(linked.filter(polars.col("channel") == 0)["particle_id"].to_list())
+    channel_1_ids = set(linked.filter(polars.col("channel") == 1)["particle_id"].to_list())
     assert len(channel_0_ids) == 1
     assert len(channel_1_ids) == 1
     # And the two channels should have distinct ids.
@@ -228,8 +228,8 @@ def test_link_empty_input() -> None:
     """An empty input returns an empty output with the right schema."""
     locs = polars.DataFrame(
         schema={
-            "c": polars.Int32,
-            "t_idx": polars.Int32,
+            "channel": polars.Int32,
+            "frame": polars.Int32,
             "z": polars.Float64,
             "y": polars.Float64,
             "x": polars.Float64,
@@ -284,7 +284,7 @@ def test_link_validates_input() -> None:
     )
     locs = _simulate_and_locate(trajectories, psf, (n_frames, 1, 1, 10, 10))
     # Missing required column.
-    bad = locs.drop("t_idx")
+    bad = locs.drop("frame")
     with pytest.raises(ValueError, match="missing required columns"):
         tog.link(bad, search_range_micrometers=1.0)
     # Negative memory.
@@ -416,7 +416,7 @@ def test_link_rejects_2_tuple() -> None:
 
 
 def test_link_without_channel_column() -> None:
-    """A table without a ``c`` column is linked as a single channel."""
+    """A table without a ``channel`` column is linked as a single channel."""
     psf = _gaussian_psf(1.0, 7).reshape(1, 7, 7)
     n_frames = 6
     t = np.arange(n_frames)
@@ -435,13 +435,13 @@ def test_link_without_channel_column() -> None:
     )
     locs = _simulate_and_locate(trajectories, psf, (n_frames, 1, 1, 10, 10))
     # Drop the channel column; the result should still link into one
-    # trajectory and must not add a ``c`` column.
-    locs_no_c = locs.drop("c")
-    linked = tog.link(locs_no_c, search_range_micrometers=1.0, memory=0)
-    assert "c" not in linked.columns
+    # trajectory and must not add a ``channel`` column.
+    locs_no_channel = locs.drop("channel")
+    linked = tog.link(locs_no_channel, search_range_micrometers=1.0, memory=0)
+    assert "channel" not in linked.columns
     assert linked["particle_id"].n_unique() == 1
     # All input columns are preserved.
-    for col in locs_no_c.columns:
+    for col in locs_no_channel.columns:
         assert col in linked.columns
 
 

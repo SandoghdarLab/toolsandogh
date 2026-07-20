@@ -22,7 +22,7 @@ import numpy.typing as npt
 import polars
 import polars.datatypes
 import xarray as xr
-from jaxtyping import Array, Float
+from jaxtyping import Array, Bool, Float
 
 from ._canonicalize_video import _axis_origin_and_step, canonicalize_video
 
@@ -55,7 +55,7 @@ def locate(
     channel: int | str | float | None = None,
     chunk_size: int | Literal["auto"] = "auto",
     min_distance: int = 3,
-    min_contrast: float = 0.0,
+    min_contrast: float = 1.0,
     sign: Literal["both", "positive", "negative"] = "both",
     iterations: int = 10,
     atol: float = 1e-3,
@@ -96,14 +96,15 @@ def locate(
         device memory.  If ``"auto"`` (the default), the size is derived
         from a fixed, reproducible device-memory budget so that the
         per-chunk working set (data plus matched-filter scores and the
-        boolean peak mask) stays under roughly 1 GiB.
+        boolean peak mask) stays under roughly 250 MB.
     min_distance : int
         Minimum separation (in pixels) between two detected peaks.
         Pixels closer than ``min_distance`` to a stronger peak are
         suppressed.
     min_contrast : float
         Minimum absolute value of the matched-filter score for a peak
-        to be reported.
+        to be reported.  Must be strictly positive; the default is
+        ``1.0``.
     sign : {"both", "positive", "negative"}
         Whether to detect only positive peaks, only negative peaks, or
         both.
@@ -138,7 +139,7 @@ def locate(
     polars.DataFrame
         A Polars DataFrame with the columns
         ``t, channel, z, y, x, frame, slice, row, column, contrast,
-        background, mass, snr, chi2, reduced_chi2, n_iter, converged``.
+        background, snr, chi2, reduced_chi2, n_iter, converged``.
         The ``t``, ``z``, ``y``, ``x`` columns are physical coordinates
         (float64, milliseconds and micrometres); the ``frame``/``slice``/
         ``row``/``column`` columns are index-space positions (``frame``
@@ -162,6 +163,15 @@ def locate(
     # ``(T, C, Z, Y, X)`` representation.  ``psf`` is promoted to 3D and cast
     # to the requested dtype.
     dtype = np.dtype(dtype)
+
+    # Validate scalar parameters up front so we fail before any work.
+    if min_contrast <= 0:
+        raise ValueError(f"`min_contrast` must be strictly positive, got {min_contrast!r}.")
+    if min_distance < 0:
+        raise ValueError(f"`min_distance` must be non-negative, got {min_distance!r}.")
+    if iterations < 0:
+        raise ValueError(f"`iterations` must be non-negative, got {iterations!r}.")
+
     video = canonicalize_video(video)
     psf_arr = _canonicalize_psf(psf, dtype=dtype)
 
@@ -218,8 +228,8 @@ def locate(
     # keeps the peak-detection and fitting kernels on a single JIT
     # specialization.  Padded frames are zero and cannot produce detections
     # (their matched-filter score is zero, which never exceeds
-    # ``min_contrast >= 0``), and ``n_active_frames`` tells
-    # ``_locate_in_chunk`` how many frames are real.
+    # the strictly-positive ``min_contrast``), and ``n_active_frames``
+    # tells ``_locate_in_chunk`` how many frames are real.
     #
     # ``_locate_in_chunk`` emits index-space positions only; the physical
     # ``t``/``z``/``y``/``x`` columns are computed here from the chunk's
@@ -279,7 +289,7 @@ def _locate_in_chunk(
     *,
     n_active_frames: int | None = None,
     min_distance: int = 3,
-    min_contrast: float = 0.0,
+    min_contrast: float = 1.0,
     sign: Literal["both", "positive", "negative"] = "both",
     iterations: int = 10,
     atol: float = 1e-3,
@@ -319,7 +329,8 @@ def _locate_in_chunk(
         Minimum separation (in pixels) between two detected peaks.
     min_contrast : float
         Minimum absolute value of the matched-filter score for a peak
-        to be reported.
+        to be reported.  Must be strictly positive; the default is
+        ``1.0``.
     sign : {"both", "positive", "negative"}
         Whether to detect only positive peaks, only negative peaks, or
         both.
@@ -342,7 +353,7 @@ def _locate_in_chunk(
     -------
     polars.DataFrame
         A Polars DataFrame with the columns
-        ``chunk_frame, slice, row, column, contrast, background, mass,
+        ``chunk_frame, slice, row, column, contrast, background,
         snr, chi2, reduced_chi2, n_iter, converged``.  The ``chunk_frame``
         column is Int32; ``slice``/``row``/``column`` are Float32
         (subpixel); the float statistics are Float32; ``n_iter`` is Int32;
@@ -366,6 +377,12 @@ def _locate_in_chunk(
         raise ValueError(f"`n_active_frames` must be in [0, {B}], got {n_active_frames}.")
     if noise_sigma is not None and noise_sigma < 0:
         raise ValueError(f"`noise_sigma` must be non-negative, got {noise_sigma!r}.")
+    if min_contrast <= 0:
+        raise ValueError(f"`min_contrast` must be strictly positive, got {min_contrast!r}.")
+    if min_distance < 0:
+        raise ValueError(f"`min_distance` must be non-negative, got {min_distance!r}.")
+    if iterations < 0:
+        raise ValueError(f"`iterations` must be non-negative, got {iterations!r}.")
 
     # 1+2. Fused matched-filter score and non-maximum-suppression peak
     #      mask.  A single JIT kernel produces the boolean (B, Z, Y, X) peak
@@ -411,7 +428,7 @@ def _locate_in_chunk(
     # across all emitters.  The result is a (n_emitters,) device array
     # kept resident so no extra host sync is needed before the batched fit.
     if noise_sigma is None:
-        per_frame_sigma = _estimate_noise_sigma(chunk, n_active_frames)  # (B,)
+        per_frame_sigma = _estimate_noise_sigma(chunk, n_active_frames)  # (n_active_frames,)
         noise_sigma_arr = per_frame_sigma[jnp.asarray(chunk_frame)]  # (n_emitters,)
     else:
         noise_sigma_arr = jnp.full((n_emitters,), noise_sigma, dtype=chunk.dtype)
@@ -421,8 +438,8 @@ def _locate_in_chunk(
     #    ``_MAX_EMITTERS_PER_BATCH``) so that the JIT-compiled fitting kernel
     #    specialises on a small set of shapes rather than one per distinct
     #    emitter count.  All sub-batch dispatches are queued asynchronously;
-    #    a single host sync at the end materialises every fitted scalar
-    #    (plus a second sync for the convergence flags).
+    #    sub-batch results are concatenated before reading them back to
+    #    reduce the number of host syncs.
     batch_size = 1 << (n_emitters - 1).bit_length()  # next power of two
     batch_size = min(batch_size, _MAX_EMITTERS_PER_BATCH)
     fit_keys = [
@@ -431,7 +448,6 @@ def _locate_in_chunk(
         "x_offset",
         "contrast",
         "background",
-        "mass",
         "chi2",
         "reduced_chi2",
         "snr",
@@ -457,21 +473,20 @@ def _locate_in_chunk(
             atol=atol,
             noise_sigma=sub_sigma,
         )
-        sub_stack = jnp.stack([sub_fit[k] for k in fit_keys])  # (9, batch)
+        sub_stack = jnp.stack([sub_fit[k] for k in fit_keys])  # (8, batch)
         fit_stacks.append(sub_stack[:, :n_sub])
         converged_stacks.append(sub_fit["converged"][:n_sub])
         n_iter_stacks.append(sub_fit["n_iter"][:n_sub])
 
-    # Pull every fitted scalar off the device in a single sync: concatenate
-    # all sub-batch results and read back once.
+    # Concatenate sub-batch results before reading them back to reduce
+    # the number of host syncs.
     fit_np = np.asarray(jnp.concatenate(fit_stacks, axis=1), dtype=np.float32)
     z_offsets, y_offsets, x_offsets = fit_np[0], fit_np[1], fit_np[2]
     contrast_col = np.ascontiguousarray(fit_np[3])
     background_col = np.ascontiguousarray(fit_np[4])
-    mass_col = np.ascontiguousarray(fit_np[5])
-    chi2_col = np.ascontiguousarray(fit_np[6])
-    reduced_chi2_col = np.ascontiguousarray(fit_np[7])
-    snr_col = np.ascontiguousarray(fit_np[8])
+    chi2_col = np.ascontiguousarray(fit_np[5])
+    reduced_chi2_col = np.ascontiguousarray(fit_np[6])
+    snr_col = np.ascontiguousarray(fit_np[7])
     n_iter_col = np.asarray(jnp.concatenate(n_iter_stacks), dtype=np.int32)
     converged_col = np.asarray(jnp.concatenate(converged_stacks), dtype=bool)
 
@@ -487,7 +502,6 @@ def _locate_in_chunk(
             "column": (column_peaks.astype(np.float32) + x_offsets).astype(np.float32),
             "contrast": contrast_col,
             "background": background_col,
-            "mass": mass_col,
             "snr": snr_col,
             "chi2": chi2_col,
             "reduced_chi2": reduced_chi2_col,
@@ -501,7 +515,6 @@ def _locate_in_chunk(
             "column": polars.Float32,
             "contrast": polars.Float32,
             "background": polars.Float32,
-            "mass": polars.Float32,
             "snr": polars.Float32,
             "chi2": polars.Float32,
             "reduced_chi2": polars.Float32,
@@ -524,7 +537,7 @@ def _peak_mask_batch(
     min_distance: int,
     min_contrast: float,
     sign: Literal["both", "positive", "negative"],
-) -> Float[Array, "B Z Y X"]:
+) -> Bool[Array, "B Z Y X"]:
     """
     Compute the matched-filter score and the boolean peak mask for every
     frame in ``chunk`` in a single JIT kernel.
@@ -640,7 +653,7 @@ def _fit_emitters_batch(
     Returns a dictionary of per-emitter outputs:
     ``contrast``, ``background``, ``z_offset``, ``y_offset``,
     ``x_offset``, ``converged``, ``n_iter``, ``chi2``,
-    ``reduced_chi2``, ``mass``, ``snr``.
+    ``reduced_chi2``, ``snr``.
     """
     shifted_psf, n_shift = _make_shifted_psf(psf)
     sigma = jnp.asarray(noise_sigma, dtype=stamps.dtype)
@@ -703,7 +716,7 @@ def _make_shifted_psf(
         _, _, dy, dx = params
         phase = jnp.exp(-2j * jnp.pi * (ky * dy + kx * dx))
         full = jnp.fft.ifftn(psf_fft * phase).real
-        return full[pad : pad + Py, pad : pad + Px]
+        return full[None, pad : pad + Py, pad : pad + Px]
 
     return shifted_psf, 2
 
@@ -821,8 +834,6 @@ def _fit_outputs(
         dy, dx = final_params[2], final_params[3]
         dz = jnp.array(0.0, dtype=stamp.dtype)
 
-    mass = jnp.sum(stamp)
-
     ssr = 2.0 * final_cost
     n_params = n_shift + 2
     dof = jnp.maximum(
@@ -846,7 +857,6 @@ def _fit_outputs(
         "n_iter": n_iter,
         "chi2": chi2,
         "reduced_chi2": reduced_chi2,
-        "mass": mass,
         "snr": snr,
     }
 
@@ -892,10 +902,11 @@ def _fit_one_emitter(
         r = residual(params)
         return 0.5 * jnp.sum(r * r)
 
-    # Initial guesses: contrast from the stamp centre, background from
-    # the stamp median, and zero subpixel shifts.
-    amp0 = stamp[Pz // 2, Py // 2, Px // 2]
+    # Initial guesses: contrast from the stamp centre minus the
+    # background, background from the stamp median, and zero subpixel
+    # shifts.
     bg0 = jnp.median(stamp)
+    amp0 = stamp[Pz // 2, Py // 2, Px // 2] - bg0
     shift0 = jnp.zeros(n_shift, dtype=stamp.dtype)
     params0 = jnp.concatenate([jnp.array([amp0, bg0], dtype=stamp.dtype), shift0])
 
@@ -1035,28 +1046,6 @@ def _channel_scalar_and_dtype(
     return channel, polars.Object
 
 
-# Column order of the public ``locate`` output.
-_LOCATE_COLUMNS = [
-    "t",
-    "channel",
-    "z",
-    "y",
-    "x",
-    "frame",
-    "slice",
-    "row",
-    "column",
-    "contrast",
-    "background",
-    "mass",
-    "snr",
-    "chi2",
-    "reduced_chi2",
-    "n_iter",
-    "converged",
-]
-
-
 def _empty_result(
     channel: int | str | float = 0,
 ) -> polars.DataFrame:
@@ -1065,7 +1054,7 @@ def _empty_result(
 
     The ``channel`` column is typed to match ``channel`` (via
     :func:`_channel_scalar_and_dtype`); every other column follows the
-    fixed :data:`_LOCATE_COLUMNS` schema.
+    fixed schema below.
     """
     c_scalar, c_dtype = _channel_scalar_and_dtype(channel)
     schema = {
@@ -1080,7 +1069,6 @@ def _empty_result(
         "column": polars.Float32,
         "contrast": polars.Float32,
         "background": polars.Float32,
-        "mass": polars.Float32,
         "snr": polars.Float32,
         "chi2": polars.Float32,
         "reduced_chi2": polars.Float32,
@@ -1102,7 +1090,6 @@ def _empty_chunk_result() -> polars.DataFrame:
             "column": polars.Float32,
             "contrast": polars.Float32,
             "background": polars.Float32,
-            "mass": polars.Float32,
             "snr": polars.Float32,
             "chi2": polars.Float32,
             "reduced_chi2": polars.Float32,
@@ -1164,7 +1151,6 @@ def _physical_result(
         polars.Series("column", column_arr, dtype=polars.Float32),
         polars.col("contrast"),
         polars.col("background"),
-        polars.col("mass"),
         polars.col("snr"),
         polars.col("chi2"),
         polars.col("reduced_chi2"),
@@ -1201,4 +1187,4 @@ def _resolve_chunk_size(
         return max(1, min(n_frames, _MAX_CHUNK_BYTES // per_frame_working))
     if not isinstance(chunk_size, (int, np.integer)) or chunk_size < 1:
         raise ValueError(f"`chunk_size` must be a positive int or 'auto', got {chunk_size!r}.")
-    return min(int(chunk_size), n_frames)
+    return max(1, min(int(chunk_size), n_frames))

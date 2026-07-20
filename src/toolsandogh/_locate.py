@@ -36,7 +36,7 @@ from ._canonicalize_video import _axis_origin_and_step, canonicalize_video
 # peak mask); the auto chunk size is ``budget // (3 * frame_bytes)``.  The
 # value is hard-coded (not probed from the device) so that runs are
 # reproducible across machines.
-_MAX_CHUNK_BYTES = 1 << 30  # 1 GiB
+_MAX_CHUNK_BYTES = 250_000_000
 
 # Fixed emitter-batch size for the Levenberg--Marquardt kernel.  Emitter
 # batches are padded to the next power of two (capped at this value) so

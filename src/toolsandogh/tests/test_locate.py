@@ -560,10 +560,10 @@ def test_locate_anisotropic_psf() -> None:
     y1, x1, a1 = row1["y"], row1["x"], row1["contrast"]
     assert abs(y0 - 4.0) < 0.2
     assert abs(x0 - 6.2) < 0.2
-    assert abs(a0 - 3.59) < 0.5
+    assert abs(a0 - 1.8) < 0.3
     assert abs(y1 - 12.0) < 0.2
     assert abs(x1 - 5.7) < 0.2
-    assert abs(a1 - (-2.39)) < 0.5
+    assert abs(a1 - (-1.2)) < 0.3
     # Sign of the contrasts must be preserved.
     assert a0 > 0
     assert a1 < 0
@@ -671,8 +671,8 @@ def test_locate_snr_uses_supplied_noise() -> None:
     snr = float(locs["snr"][idx])
     assert np.isfinite(snr)
     assert snr > 0
-    # Fitted contrast ~ 2.0 * L2_norm ~ 3.61, supplied sigma 0.1 -> snr ~ 36.
-    assert abs(snr - 36.0) < 5.0
+    # Fitted contrast (amplitude) ~ 2.0, supplied sigma 0.1 -> snr ~ 20.
+    assert abs(snr - 20.0) < 3.0
 
 
 def test_locate_chi2_near_dof_for_good_fit() -> None:
@@ -813,14 +813,127 @@ def test_locate_background_matches_constant_offset() -> None:
     dy = locs["row"].to_numpy() - 10.0
     dx = locs["column"].to_numpy() - 10.0
     idx = int(np.argmin(dy * dy + dx * dx))
-    # The fitter models a per-emitter additive background; with the
-    # normalized PSF the fitted background absorbs ``C * mean(psf)`` (the DC
-    # component removed by mean subtraction) on top of the true offset.
-    # contrast ~ 2.0 * L2 ~ 3.61, mean(psf) ~ 0.279 -> bg ~ 42 + 2*0.279 ~ 42.56.
+    # The fitter models a per-emitter additive background; results are
+    # reported in the units of the supplied PSF, so the fitted
+    # ``background`` recovers the true constant offset (42.0) and the
+    # ``contrast`` recovers the amplitude (2.0) directly.
     assert locs["background"].dtype == polars.Float32
-    assert abs(float(locs["background"][idx]) - 42.557) < 0.1
+    assert abs(float(locs["background"][idx]) - 42.0) < 0.1
     # And it must be distinct from the contrast column.
     assert not np.allclose(locs["background"].to_numpy(), locs["contrast"].to_numpy(), atol=1e-6)
+
+
+def test_locate_contrast_is_amplitude_round_trip() -> None:
+    """The fitted ``contrast`` recovers the simulated amplitude directly.
+
+    This is the defining property of the amplitude-unit reporting: an
+    emitter simulated with ``contrast = A`` (a peak-normalized PSF times
+    ``A``) must be reported with ``contrast ~= A`` and ``background ~= B``
+    for a true additive offset ``B``, independent of the PSF's L2 norm or
+    window size.  The output no longer depends on how the PSF was sampled.
+    """
+    psf = _gaussian_psf(1.5, 7).reshape(1, 7, 7)
+    A, B = 3.0, 17.0
+    trajectories = polars.DataFrame(
+        {
+            "t": [0],
+            "c": [0],
+            "z": [0.0],
+            "y": [10.0],
+            "x": [10.0],
+            "contrast": [A],
+            "particle_id": [0],
+        }
+    )
+    video = tog.simulate_particles(
+        trajectories,
+        psf,
+        shape=(1, 1, 1, 20, 20),
+        noise_sigma=0.0,
+        dtype=np.float32,
+    )
+    video = video + B
+    locs = tog.locate(
+        video,
+        psf,
+        chunk_size=1,
+        min_distance=3,
+        min_contrast=0.5,
+        sign="positive",
+        iterations=50,
+        atol=1e-6,
+        noise_sigma=0.1,
+    )
+    dy = locs["row"].to_numpy() - 10.0
+    dx = locs["column"].to_numpy() - 10.0
+    idx = int(np.argmin(dy * dy + dx * dx))
+    # contrast == A (amplitude), background == B (true offset), and
+    # snr == A / noise_sigma, all independent of the PSF discretization.
+    assert abs(float(locs["contrast"][idx]) - A) < 1e-3
+    assert abs(float(locs["background"][idx]) - B) < 1e-2
+    assert abs(float(locs["snr"][idx]) - A / 0.1) < 1e-2
+
+
+def test_locate_contrast_independent_of_psf_window() -> None:
+    """The reported ``contrast`` must not depend on the PSF window size.
+
+    The same amplitude-2 emitter resampled onto 7x7 and 11x11 Gaussian
+    PSFs (both peak-normalized) must report the same ``contrast`` (~2.0),
+    unlike score-unit reporting which scales with the PSF's L2 norm.
+    """
+    A = 2.0
+    trajectories = polars.DataFrame(
+        {
+            "t": [0],
+            "c": [0],
+            "z": [0.0],
+            "y": [10.0],
+            "x": [10.0],
+            "contrast": [A],
+            "particle_id": [0],
+        }
+    )
+    contrasts = []
+    for n in (7, 11):
+        psf = _gaussian_psf(1.5, n).reshape(1, n, n)
+        video = tog.simulate_particles(
+            trajectories,
+            psf,
+            shape=(1, 1, 1, 20, 20),
+            noise_sigma=0.0,
+            dtype=np.float32,
+        )
+        locs = tog.locate(
+            video,
+            psf,
+            chunk_size=1,
+            min_distance=3,
+            min_contrast=0.5,
+            sign="positive",
+            iterations=50,
+            atol=1e-6,
+        )
+        dy = locs["row"].to_numpy() - 10.0
+        dx = locs["column"].to_numpy() - 10.0
+        idx = int(np.argmin(dy * dy + dx * dx))
+        contrasts.append(float(locs["contrast"][idx]))
+    # Both windows report the same amplitude, not L2-norm-scaled scores.
+    assert abs(contrasts[0] - A) < 1e-3
+    assert abs(contrasts[1] - A) < 1e-3
+    assert abs(contrasts[0] - contrasts[1]) < 1e-3
+
+
+def test_locate_rejects_degenerate_psf() -> None:
+    """A constant (zero mean-subtracted norm) PSF must be rejected.
+
+    With no variation after mean subtraction the amplitude scale is
+    undefined (division by ~zero), so ``locate`` raises rather than emit
+    infinities or silently detect nothing.
+    """
+    psf = np.full((1, 7, 7), 0.5, dtype=np.float32)
+    chunk = jnp.zeros((1, 1, 12, 12), dtype=jnp.float32)
+    with pytest.raises(ValueError, match="degenerate"):
+        tog.locate(chunk, psf, chunk_size=1)
 
 
 def test_locate_auto_chunk_is_default() -> None:

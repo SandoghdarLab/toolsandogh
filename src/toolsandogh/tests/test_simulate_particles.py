@@ -49,11 +49,9 @@ def test_simulate_particles_roundtrip_single_emitter() -> None:
     assert video.shape == (1, 1, 1, 10, 10)
     assert video.dtype == np.float32
 
-    # Locate the emitter with the same PSF.  ``locate`` normalizes the PSF
-    # internally, so the fitted contrast is ``true_amp * s`` where ``s``
-    # is the L2 norm of the mean-subtracted PSF.
-    psf_np = np.asarray(psf)
-    psf_norm = np.linalg.norm(psf_np - psf_np.mean())
+    # Locate the emitter with the same PSF.  ``locate`` reports the fitted
+    # contrast in the units of the supplied (peak-normalized) PSF, so the
+    # fitted contrast recovers the true amplitude directly.
     locs = tog.locate(
         video,
         psf,
@@ -67,7 +65,7 @@ def test_simulate_particles_roundtrip_single_emitter() -> None:
     assert locs.shape[0] == 1
     assert abs(locs["row"][0] - true_y) < 0.05
     assert abs(locs["column"][0] - true_x) < 0.05
-    assert abs(locs["contrast"][0] - true_amp * psf_norm) < 0.1
+    assert abs(locs["contrast"][0] - true_amp) < 0.1
     assert bool(locs["converged"][0]) is True
 
 
@@ -93,10 +91,8 @@ def test_simulate_particles_negative_contrast() -> None:
         noise_sigma=0.0,
         dtype=np.float32,
     )
-    # ``locate`` normalizes the PSF, so the fitted contrast is
-    # ``true_amp * s`` where ``s`` is the L2 norm of the mean-subtracted PSF.
-    psf_np = np.asarray(psf)
-    psf_norm = np.linalg.norm(psf_np - psf_np.mean())
+    # ``locate`` reports the fitted contrast in the units of the supplied
+    # PSF, so the fitted contrast recovers the true amplitude directly.
     locs = tog.locate(
         video,
         psf,
@@ -110,7 +106,7 @@ def test_simulate_particles_negative_contrast() -> None:
     assert locs.shape[0] >= 1
     # The most prominent negative emitter should be the one we placed.
     amps = sorted(locs["contrast"].to_list())
-    assert abs(amps[0] - true_amp * psf_norm) < 0.1
+    assert abs(amps[0] - true_amp) < 0.1
 
 
 def test_simulate_particles_noise_is_added() -> None:
@@ -183,10 +179,8 @@ def test_simulate_particles_3d() -> None:
         noise_sigma=0.0,
         dtype=np.float32,
     )
-    # ``locate`` normalizes the PSF, so the fitted contrast is
-    # ``true_amp * s`` where ``s`` is the L2 norm of the mean-subtracted PSF.
-    psf_np = np.asarray(psf)
-    psf_norm = np.linalg.norm(psf_np - psf_np.mean())
+    # ``locate`` reports the fitted contrast in the units of the supplied
+    # PSF, so the fitted contrast recovers the true amplitude directly.
     locs = tog.locate(
         video,
         psf,
@@ -204,7 +198,7 @@ def test_simulate_particles_3d() -> None:
     assert abs(locs["slice"][best] - true_z) < 0.1
     assert abs(locs["row"][best] - true_y) < 0.1
     assert abs(locs["column"][best] - true_x) < 0.1
-    assert abs(locs["contrast"][best] - true_amp * psf_norm) < 0.1
+    assert abs(locs["contrast"][best] - true_amp) < 0.1
 
 
 def test_simulate_particles_missing_columns() -> None:

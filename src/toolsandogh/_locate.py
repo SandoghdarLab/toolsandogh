@@ -55,7 +55,7 @@ def locate(
     channel: int | str | float | None = None,
     chunk_size: int | Literal["auto"] = "auto",
     min_distance: int = 3,
-    min_contrast: float = 1.0,
+    min_contrast: float = 0.5,
     sign: Literal["both", "positive", "negative"] = "both",
     iterations: int = 10,
     atol: float = 1e-3,
@@ -83,12 +83,15 @@ def locate(
     psf : array-like
         The point-spread function model, shape ``(Py, Px)`` for a 2D
         (widefield) PSF or ``(Pz, Py, Px)`` for a 3D PSF.  A 2D PSF is
-        promoted to ``(1, Py, Px)`` internally.  The PSF is normalized
-        (mean-subtracted and L2-normalized) so that the matched-filter
-        score of a unit-contrast emitter is exactly 1; this makes
-        ``min_contrast`` a direct threshold on the fitted ``contrast``
-        column.  The fitted ``contrast`` is therefore reported relative
-        to the normalized PSF, not the supplied one.
+        promoted to ``(1, Py, Px)`` internally.  The PSF is
+        mean-subtracted and L2-normalized internally for the matched
+        filter (so the detection score is independent of the PSF's DC
+        level and pixel discretization), but the reported ``contrast``
+        and ``background`` are rescaled back into the units of the
+        supplied PSF: ``contrast`` is the emitter's amplitude (peak
+        value above background) and ``background`` is the true additive
+        offset.  A constant or near-constant PSF (zero mean-subtracted
+        norm) is rejected, since no amplitude scale is defined for it.
     channel : int or str or float, optional
         The channel to localize, given as a coordinate label (anything
         xarray's ``.sel`` accepts).  Required when the video has more
@@ -107,12 +110,10 @@ def locate(
         Pixels closer than ``min_distance`` to a stronger peak are
         suppressed.
     min_contrast : float
-        Minimum absolute value of the matched-filter score for a peak
-        to be reported.  Because the PSF is normalized (mean-zero,
-        unit L2 norm), the score at a true peak equals the emitter's
-        fitted contrast, so this is a direct threshold on the
-        ``contrast`` column.  Must be strictly positive; the default is
-        ``1.0``.
+        Minimum absolute amplitude for a peak to be reported, in the
+        same units as the supplied PSF (i.e. a direct threshold on the
+        ``contrast`` column, which holds the fitted amplitude).  Must
+        be strictly positive; the default is ``0.5``.
     sign : {"both", "positive", "negative"}
         Whether to detect only positive peaks, only negative peaks, or
         both.
@@ -156,22 +157,23 @@ def locate(
 
     Notes
     -----
-    The PSF is normalized (mean-subtracted, L2-normalized) internally,
-    so the fitted ``contrast`` is relative to the normalized PSF: a
-    unit-contrast emitter (one that matches the normalized PSF with
-    amplitude 1) produces a peak matched-filter score of 1 and a fitted
-    contrast of 1.  The fitted ``background`` absorbs the DC component
-    removed by mean-subtraction, so for an all-positive PSF it is biased
-    high relative to the true additive offset by ``contrast * mean(psf)``.
+    Internally the PSF is mean-subtracted and L2-normalized to form the
+    matched-filter kernel, but the results are reported in the units of
+    the supplied PSF.  The fitted model is ``A * psf + B``; the
+    ``contrast`` column holds the amplitude ``A`` (the peak value of the
+    emitter above background) and the ``background`` column holds the
+    true additive offset ``B``.  This makes ``min_contrast`` a direct
+    threshold on the reported amplitude and keeps the output
+    independent of how the PSF was discretized (window size, sampling).
 
     The ``chi2`` column is the chi-squared statistic
     ``sum(residual**2) / noise_sigma**2``, which follows a chi-squared
     distribution with ``dof = Pz*Py*Px - n_params`` degrees of freedom
     under a correct model and Gaussian noise.  The ``reduced_chi2`` column
     is ``chi2 / dof`` and has expectation 1.  The ``snr`` column is the
-    fitted contrast divided by ``noise_sigma``.  When ``noise_sigma`` is
-    not supplied, it is estimated per frame as described under the
-    ``noise_sigma`` parameter.
+    fitted contrast (amplitude) divided by ``noise_sigma``.  When
+    ``noise_sigma`` is not supplied, it is estimated per frame as
+    described under the ``noise_sigma`` parameter.
     """
     # Canonicalize the inputs.  ``video`` may be any array-like (a raw
     # NumPy array, a Dask array, a list, or an already-canonical DataArray);
@@ -190,6 +192,28 @@ def locate(
 
     video = canonicalize_video(video)
     psf_arr = _canonicalize_psf(psf, dtype=dtype)
+
+    # The detection/fitting kernels operate on the mean-subtracted,
+    # L2-normalized PSF (so the matched-filter score is independent of
+    # the PSF's DC level and discretization), but we report results in
+    # the units of the *supplied* PSF.  Recover the mean ``mu`` and L2
+    # norm ``sigma`` of the original PSF; the score-unit columns from
+    # ``_locate_in_chunk`` are rescaled to amplitude units with these
+    # at the end.  ``min_contrast`` (an amplitude threshold) becomes a
+    # score threshold by multiplying by ``sigma``.
+    p_raw = np.asarray(psf, dtype=dtype)
+    if p_raw.ndim == 2:
+        p_raw = p_raw[np.newaxis, :, :]
+    mu = float(p_raw.mean())
+    sigma = float(np.linalg.norm(p_raw - mu))
+    psf_floor = np.sqrt(np.finfo(p_raw.dtype).eps) * max(float(np.max(np.abs(p_raw - mu))), 1.0)
+    if sigma <= psf_floor:
+        raise ValueError(
+            "`psf` is degenerate (constant or near-constant): its "
+            "mean-subtracted L2 norm is ~0, so an amplitude (contrast) "
+            "scale is undefined."
+        )
+    min_contrast_score = min_contrast * sigma
 
     # Select the channel.  When the video has only one channel, default
     # to it (using the coord value if the channel has a non-default
@@ -269,7 +293,7 @@ def locate(
             psf=psf_jax,
             n_active_frames=n_active,
             min_distance=min_distance,
-            min_contrast=min_contrast,
+            min_contrast=min_contrast_score,
             sign=sign,
             iterations=iterations,
             atol=atol,
@@ -296,7 +320,20 @@ def locate(
     if not results:
         return _empty_result(channel=channel)
 
-    return polars.concat(results, how="vertical_relaxed")
+    out = polars.concat(results, how="vertical_relaxed")
+    # Rescale the score-unit columns from ``_locate_in_chunk`` into the
+    # amplitude (data) units of the supplied PSF.  Internally the fit is
+    # ``contrast_score * q + bg_fit`` with ``q = (psf - mu) / sigma``;
+    # solving for the physical model ``A * psf + B`` gives
+    # ``A = contrast_score / sigma`` and ``B = bg_fit - A * mu``.  ``snr``
+    # is divided by ``sigma`` so it stays equal to
+    # ``contrast / noise_sigma``.
+    amp = (polars.col("contrast") / sigma).cast(polars.Float32)
+    return out.with_columns(
+        amp.alias("contrast"),
+        (polars.col("background") - amp * mu).cast(polars.Float32).alias("background"),
+        (polars.col("snr") / sigma).cast(polars.Float32).alias("snr"),
+    )
 
 
 def _locate_in_chunk(

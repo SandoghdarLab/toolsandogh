@@ -1414,3 +1414,115 @@ def test_canonicalize_psf_normalizes() -> None:
     flat = np.full((3, 3), 0.5, dtype=np.float32)
     normed_flat = _canonicalize_psf(flat, dtype=np.float32)
     assert np.all(np.isfinite(normed_flat))
+
+
+def _render_2d(
+    shape: tuple[int, int],
+    emitters: list[tuple[float, float, float]],
+    profile,
+    background: float = 0.0,
+) -> np.ndarray:
+    """Render untruncated emitters ``(y, x, amplitude)`` as a (1, 1, 1, Y, X) video."""
+    yy, xx = np.meshgrid(np.arange(shape[0]), np.arange(shape[1]), indexing="ij")
+    frame = np.full(shape, background, dtype=np.float64)
+    for y, x, amplitude in emitters:
+        frame += amplitude * profile((yy - y) ** 2 + (xx - x) ** 2)
+    return frame.reshape(1, 1, 1, *shape).astype(np.float32)
+
+
+def _gaussian_profile(r2):
+    return np.exp(-r2 / (2 * 1.5**2))
+
+
+def _ringing_profile(r2):
+    """An iSCAT-like PSF whose autocorrelation has same-sign side lobes."""
+    return np.cos(1.3 * np.sqrt(r2)) * np.exp(-r2 / (2 * 3.0**2))
+
+
+def _psf_from_profile(profile, n: int) -> np.ndarray:
+    c = (n - 1) / 2
+    return _render_2d((n, n), [(c, c, 1.0)], profile)[0, 0, 0]
+
+
+@pytest.mark.parametrize("sign", ["both", "positive"])
+def test_locate_no_border_detections_with_background(sign) -> None:
+    """A constant background must not produce detections at the frame border."""
+    video = _render_2d((40, 40), [(20.0, 20.0, 5.0)], _gaussian_profile, background=100.0)
+    psf = _psf_from_profile(_gaussian_profile, 9)
+    locs = tog.locate(video, psf, noise_sigma=0.1, sign=sign)
+    assert locs.height == 1
+    assert abs(locs["row"][0] - 20.0) < 0.01
+    assert abs(locs["column"][0] - 20.0) < 0.01
+    assert abs(locs["contrast"][0] - 5.0) < 0.05
+    assert abs(locs["background"][0] - 100.0) < 0.05
+
+
+def test_locate_suppresses_side_lobes_of_bright_emitter() -> None:
+    """The opposite-sign side lobes of a bright emitter are not detections."""
+    video = _render_2d((40, 40), [(20.0, 20.0, 50.0)], _gaussian_profile)
+    psf = _psf_from_profile(_gaussian_profile, 9)
+    locs = tog.locate(video, psf, noise_sigma=0.1, sign="both")
+    assert locs.height == 1
+    assert abs(locs["contrast"][0] - 50.0) < 0.5
+
+
+def test_locate_dark_object_lobes_are_not_positive_detections() -> None:
+    """With ``sign="positive"``, a dark object's positive lobes are suppressed."""
+    video = _render_2d((40, 40), [(20.0, 20.0, -20.0)], _gaussian_profile)
+    psf = _psf_from_profile(_gaussian_profile, 9)
+    assert tog.locate(video, psf, noise_sigma=0.1, sign="positive").height == 0
+
+
+def test_locate_suppresses_same_sign_lobes_of_ringing_psf() -> None:
+    """A ringing PSF's same-sign side lobes are not detections."""
+    rng = np.random.default_rng(0)
+    video = _render_2d((60, 60), [(30.3, 29.8, 1000.0)], _ringing_profile)
+    video += rng.normal(0.0, 0.5, video.shape).astype(np.float32)
+    psf = _psf_from_profile(_ringing_profile, 21)
+    for sign in ("positive", "both"):
+        locs = tog.locate(video, psf, min_contrast=3.0, sign=sign)
+        assert locs.height == 1, sign
+        assert abs(locs["row"][0] - 30.3) < 0.05
+        assert abs(locs["column"][0] - 29.8) < 0.05
+
+
+def test_locate_keeps_opposite_sign_neighbour_of_bright_emitter() -> None:
+    """Lobe suppression must not remove a genuine opposite-sign neighbour."""
+    video = _render_2d((40, 40), [(20.0, 17.0, 50.0), (20.0, 23.0, -10.0)], _gaussian_profile)
+    psf = _psf_from_profile(_gaussian_profile, 9)
+    locs = tog.locate(video, psf, noise_sigma=0.1, sign="both").sort("column")
+    assert locs.height == 2
+    assert abs(locs["column"][0] - 17.0) < 0.1
+    assert locs["contrast"][0] > 0
+    assert abs(locs["column"][1] - 23.0) < 0.5
+    assert locs["contrast"][1] < 0
+
+
+@pytest.mark.parametrize("n", [8, 9])
+def test_locate_tied_peaks_yield_one_detection(n) -> None:
+    """An emitter centred between pixels (exactly tied scores) is reported once."""
+    video = _render_2d((40, 40), [(20.5, 20.5, 5.0)], _gaussian_profile)
+    psf = _psf_from_profile(_gaussian_profile, n)
+    locs = tog.locate(video, psf, noise_sigma=0.1)
+    assert locs.height == 1
+
+
+def test_fit_subpixel_shift_is_bounded() -> None:
+    """A fit started far from the emitter cannot drift beyond the shift bound."""
+    from toolsandogh._locate import (
+        _MAX_SUBPIXEL_SHIFT,
+        _extract_stamps_batch,
+        _fit_emitters_batch,
+    )
+
+    psf = jnp.asarray(_canonicalize_psf(_psf_from_profile(_gaussian_profile, 9)))
+    chunk = jnp.asarray(_render_2d((40, 40), [(20.0, 20.0, 5.0)], _gaussian_profile)[:, 0])
+    # Extract the stamp 3 px to the right of the emitter.
+    index = np.array([0], dtype=np.int32)
+    stamps = _extract_stamps_batch(
+        chunk, index, index, np.array([20], np.int32), np.array([23], np.int32), (1, 9, 9)
+    )
+    fit = _fit_emitters_batch(stamps, psf, iterations=30, atol=1e-3, noise_sigma=jnp.ones(1))
+    for key in ("y_offset", "x_offset"):
+        assert abs(float(fit[key][0])) <= _MAX_SUBPIXEL_SHIFT + 1e-6
+    assert not bool(fit["converged"][0])

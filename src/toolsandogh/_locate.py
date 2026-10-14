@@ -12,6 +12,8 @@ fitted contrasts and per-emitter statistics.  The private helper
 scales these into physical units using the video's coordinate axes.
 """
 
+import functools
+import itertools
 from typing import Callable, Literal
 
 import jax
@@ -21,6 +23,7 @@ import numpy as np
 import numpy.typing as npt
 import polars
 import polars.datatypes
+import scipy.signal
 import xarray as xr
 from jaxtyping import Array, Bool, Float
 
@@ -46,6 +49,21 @@ _MAX_CHUNK_BYTES = 250_000_000
 # configuration while keeping per-batch waste under 2x.  The cap also
 # bounds the Jacobian memory (``batch * m * n_params * itemsize``).
 _MAX_EMITTERS_PER_BATCH = 256
+
+# Bound (in voxels, per axis) on the subpixel shift fitted around each
+# detected peak.  The peak is the integer maximum of the matched-filter
+# score, so the true offset lies within about half a voxel; the bound
+# leaves some slack for noise while preventing the fit from wandering
+# off to (or past) the edge of the stamp, where the Fourier shift wraps
+# around.  Emitters whose fit ends at the bound are reported with
+# ``converged=False``.
+_MAX_SUBPIXEL_SHIFT = 1.0
+
+# Safety factor applied to the simulated worst-case side-lobe mismatch
+# (see :func:`_sidelobe_tolerance`).  It covers effects the simulation does
+# not model exactly, such as subpixel offsets between the simulated grid
+# points and superposition of several emitters' side lobes.
+_SIDELOBE_MARGIN = 2.0
 
 
 def locate(
@@ -92,6 +110,11 @@ def locate(
         value above background) and ``background`` is the true additive
         offset.  A constant or near-constant PSF (zero mean-subtracted
         norm) is rejected, since no amplitude scale is defined for it.
+        The PSF's centre is assumed to lie at index ``P // 2`` along
+        every axis, and its window should be large enough for the PSF to
+        have decayed to the background at the border: side lobes of very
+        bright emitters (relative to ``min_contrast``) are only reliably
+        suppressed if the PSF is not truncated.
     channel : int or str or float, optional
         The channel to localize, given as a coordinate label (anything
         xarray's ``.sel`` accepts).  Required when the video has more
@@ -106,9 +129,10 @@ def locate(
         per-chunk working set (data plus matched-filter scores and the
         boolean peak mask) stays under roughly 250 MB.
     min_distance : int
-        Minimum separation (in pixels) between two detected peaks.
-        Pixels closer than ``min_distance`` to a stronger peak are
-        suppressed.
+        Minimum separation (in pixels) between two detected peaks of the
+        same sign.  A pixel is only a peak if it is the extremum of the
+        ``(2*min_distance+1)``-wide cube around it; among exactly tied
+        extrema, only the first in raster order is kept.
     min_contrast : float
         Minimum absolute amplitude for a peak to be reported, in the
         same units as the supplied PSF (i.e. a direct threshold on the
@@ -124,7 +148,8 @@ def locate(
     atol : float
         Convergence threshold on the maximum absolute parameter
         update.  Emitters with a final parameter update smaller than
-        ``atol`` are marked ``converged=True``.
+        ``atol`` are marked ``converged=True``, unless their subpixel
+        shift ended at its bound (see Notes).
     noise_sigma : float, optional
         Standard deviation of the per-pixel Gaussian noise.  When
         ``None`` (the default) it is estimated **per frame** from the
@@ -165,6 +190,20 @@ def locate(
     true additive offset ``B``.  This makes ``min_contrast`` a direct
     threshold on the reported amplitude and keeps the output
     independent of how the PSF was discretized (window size, sampling).
+
+    Detection runs the matched filter on edge-padded frames, so a
+    constant background cancels up to the frame border.  Because the
+    mean-subtracted PSF has side lobes, every emitter also produces
+    weaker opposite-sign (and, for ringing PSFs, same-sign) responses
+    around it.  Candidate peaks are therefore only kept if their
+    response, after subtracting the side lobes predicted from all other
+    candidates, still exceeds ``min_contrast`` plus a PSF-derived
+    tolerance proportional to the neighbours' strength.  Faint emitters
+    close to much brighter ones may consequently be missed.
+
+    The subpixel shift fitted around each detected peak is limited to
+    one voxel per axis.  Emitters whose fit ends at that limit are
+    reported with ``converged=False``.
 
     The ``chi2`` column is the chi-squared statistic
     ``sum(residual**2) / noise_sigma**2``, which follows a chi-squared
@@ -456,6 +495,7 @@ def _locate_in_chunk(
         min_distance=min_distance,
         min_contrast=min_contrast,
         sign=sign,
+        lobe_tolerance=jnp.asarray(_sidelobe_tolerance(np.asarray(psf)), dtype=chunk.dtype),
     )  # (B, Z, Y, X)
 
     coords = jnp.argwhere(is_peak)  # (n, 4) -> [b, z, y, x]
@@ -598,34 +638,236 @@ def _peak_mask_batch(
     min_distance: int,
     min_contrast: float,
     sign: Literal["both", "positive", "negative"],
+    lobe_tolerance: Float[Array, "2 Qz Qy Qx"],
 ) -> Bool[Array, "B Z Y X"]:
     """
     Compute the matched-filter score and the boolean peak mask for every
     frame in ``chunk`` in a single JIT kernel.
 
-    The non-maximum-suppression window has extent ``1`` along the frame
-    axis so that detections never bleed across frames; the spatial window
-    is ``(2*min_distance+1)**3``, matching the previous per-frame logic.
-    """
-    scores = jax.vmap(lambda frame: jsignal.correlate(frame, psf, mode="same", method="fft"))(chunk)
+    The detection proceeds in four steps:
 
-    window = (1, 2 * min_distance + 1, 2 * min_distance + 1, 2 * min_distance + 1)
-    strides = (1, 1, 1, 1)
+    1. **Matched filter.**  Each frame is edge-padded by the PSF
+       half-extent and correlated with the PSF in ``"valid"`` mode, so
+       the score at ``(z, y, x)`` is exactly the inner product of the PSF
+       with the (edge-padded) stamp that :func:`_extract_stamps_batch`
+       extracts there.  Edge padding -- rather than the implicit zero
+       padding of ``mode="same"`` -- keeps a constant background
+       cancelling against the mean-zero PSF all the way to the frame
+       border; zero padding would turn any non-zero background into
+       spurious border detections.
+    2. **Non-maximum suppression.**  A pixel is a candidate if it is the
+       extremum of its ``(2*min_distance+1)**3`` spatial window (extent
+       ``1`` along the frame axis, so detections never bleed across
+       frames) and its magnitude exceeds ``min_contrast``.
+    3. **Tie breaking.**  Exactly tied extrema within one window (e.g. an
+       emitter centred between two pixels) would otherwise all pass the
+       ``score == local_extremum`` test; only the first in raster order
+       is kept.
+    4. **Side-lobe explain-away.**  The score of an emitter is
+       (approximately) its peak score times the normalized PSF
+       autocorrelation, which has side lobes: always of opposite sign
+       (the PSF is mean-zero), and also of the same sign for ringing
+       PSFs (e.g. iSCAT).  Each candidate's *remainder* is its score
+       minus the lobes predicted from all *other* candidates (their
+       amplitudes convolved with the autocorrelation).  The amplitudes
+       start as the candidates' scores and are then replaced by their
+       sign-clipped remainders, so a side lobe explained by a stronger
+       peak contributes (almost) nothing in the second round.  A
+       candidate is kept if its final remainder exceeds, with the
+       candidate's sign, ``min_contrast`` plus a tolerance: the
+       opposite-sign and same-sign amplitudes convolved with the
+       per-offset profiles ``lobe_tolerance[0]`` and
+       ``lobe_tolerance[1]``, which bound the mismatch between the
+       on-grid prediction and real emitters (see
+       :func:`_sidelobe_tolerance`).  The step is applied regardless of
+       ``sign``, because a dark object's positive side lobes must not be
+       reported as positive emitters either.
+    """
+    Pz, Py, Px = psf.shape
+    hz, hy, hx = Pz // 2, Py // 2, Px // 2
+
+    # 1. Matched filter on the edge-padded frames.
+    padded = jnp.pad(
+        chunk,
+        ((0, 0), (hz, Pz - hz - 1), (hy, Py - hy - 1), (hx, Px - hx - 1)),
+        mode="edge",
+    )
+    scores = jax.vmap(lambda frame: jsignal.correlate(frame, psf, mode="valid", method="fft"))(
+        padded
+    )  # (B, Z, Y, X)
+
+    # 2. Non-maximum suppression (separable box filters).
+    nms_window = (1, 2 * min_distance + 1, 2 * min_distance + 1, 2 * min_distance + 1)
+    neg_inf = jnp.asarray(-jnp.inf, dtype=scores.dtype)
+    pos_inf = jnp.asarray(jnp.inf, dtype=scores.dtype)
+    local_max = _box_reduce(scores, neg_inf, jax.lax.max, nms_window)
+    local_min = _box_reduce(scores, pos_inf, jax.lax.min, nms_window)
+    cand_pos = (scores == local_max) & (scores > min_contrast)
+    cand_neg = (scores == local_min) & (scores < -min_contrast)
+
+    # 3. Deterministic tie breaking.
+    cand_pos = _break_ties(cand_pos, nms_window)
+    cand_neg = _break_ties(cand_neg, nms_window)
+
+    # 4. Explain away the side lobes of neighbouring candidates (two
+    #    Jacobi rounds).
+    acf = jsignal.correlate(psf, psf, mode="full", method="fft")
+    acf = acf / jnp.max(acf)  # (2Pz-1, 2Py-1, 2Px-1), centre value 1
+    tol_opposite, tol_same = lobe_tolerance[0], lobe_tolerance[1]
+    zero = jnp.asarray(0, dtype=scores.dtype)
+
+    def spread(amplitude: jax.Array, kernel: jax.Array) -> jax.Array:
+        return jax.vmap(lambda f: jsignal.convolve(f, kernel, mode="same", method="fft"))(amplitude)
+
+    def explain_away(amp_pos: jax.Array, amp_neg: jax.Array) -> jax.Array:
+        # ``spread`` includes each candidate's own peak (acf centre = 1);
+        # add it back so that only the *other* candidates' lobes are removed.
+        amplitude = amp_pos + amp_neg
+        return scores - spread(amplitude, acf) + amplitude
+
+    amp_pos = jnp.where(cand_pos, scores, zero)
+    amp_neg = jnp.where(cand_neg, scores, zero)
+    remainder = explain_away(amp_pos, amp_neg)
+    amp_pos = jnp.where(cand_pos, jnp.maximum(remainder, zero), zero)
+    amp_neg = jnp.where(cand_neg, jnp.minimum(remainder, zero), zero)
+    remainder = explain_away(amp_pos, amp_neg)
+
+    mag_pos, mag_neg = amp_pos, -amp_neg
+    tol_pos = spread(mag_neg, tol_opposite) + spread(mag_pos, tol_same)
+    tol_neg = spread(mag_pos, tol_opposite) + spread(mag_neg, tol_same)
+    is_pos = cand_pos & (remainder > min_contrast + tol_pos)
+    is_neg = cand_neg & (-remainder > min_contrast + tol_neg)
 
     if sign == "positive":
-        local_ext = jax.lax.reduce_window(scores, -jnp.inf, jax.lax.max, window, strides, "same")
-        is_peak = (scores == local_ext) & (scores > min_contrast)
-    elif sign == "negative":
-        local_ext = jax.lax.reduce_window(scores, jnp.inf, jax.lax.min, window, strides, "same")
-        is_peak = (scores == local_ext) & (scores < -min_contrast)
-    else:  # "both"
-        local_max = jax.lax.reduce_window(scores, -jnp.inf, jax.lax.max, window, strides, "same")
-        local_min = jax.lax.reduce_window(scores, jnp.inf, jax.lax.min, window, strides, "same")
-        is_pos = (scores == local_max) & (scores > min_contrast)
-        is_neg = (scores == local_min) & (scores < -min_contrast)
-        is_peak = is_pos | is_neg
+        return is_pos
+    if sign == "negative":
+        return is_neg
+    return is_pos | is_neg
 
-    return is_peak
+
+def _box_reduce(
+    x: jax.Array,
+    init: jax.Array,
+    op: Callable[[jax.Array, jax.Array], jax.Array],
+    window: tuple[int, ...],
+) -> jax.Array:
+    """
+    Apply a ``"same"``-padded box reduction (max or min) over ``window``.
+
+    Max and min over a box are separable, so the reduction is applied one
+    axis at a time: the cost is ``O(sum(window))`` per element instead of
+    ``O(prod(window))``.  Every window extent must be odd.
+    """
+    ones = (1,) * x.ndim
+    for axis, size in enumerate(window):
+        if size > 1:
+            dims = tuple(size if a == axis else 1 for a in range(x.ndim))
+            x = jax.lax.reduce_window(x, init, op, dims, ones, "same")
+    return x
+
+
+def _break_ties(
+    mask: Bool[Array, "B Z Y X"],
+    window: tuple[int, int, int, int],
+) -> Bool[Array, "B Z Y X"]:
+    """
+    Keep only the first (raster-order) peak among peaks sharing a window.
+
+    Two pixels that both equal the extremum of their (symmetric) NMS
+    window and lie within each other's window necessarily have exactly
+    equal scores, so this only affects ties.  Each peak is dropped if any
+    other peak within ``window`` has a smaller per-frame linear index.
+    """
+    _, Z, Y, X = mask.shape
+    index = jnp.arange(Z * Y * X, dtype=jnp.int32).reshape(1, Z, Y, X)
+    sentinel = jnp.asarray(jnp.iinfo(jnp.int32).max, dtype=jnp.int32)
+    keyed = jnp.where(mask, index, sentinel)
+    first = _box_reduce(keyed, sentinel, jax.lax.min, window)
+    return mask & (first == index)
+
+
+@functools.lru_cache(maxsize=16)
+def _sidelobe_tolerance_cached(
+    psf_bytes: bytes, shape: tuple[int, int, int], dtype: str
+) -> npt.NDArray[np.floating]:
+    psf = np.frombuffer(psf_bytes, dtype=dtype).reshape(shape)
+    P = np.array(shape)
+    profiles = np.zeros((2, *(2 * P - 1)), dtype=np.float64)  # (opposite, same)
+    q = psf.astype(np.float64) - psf.mean(dtype=np.float64)
+    norm = float(np.linalg.norm(q))
+    if norm == 0.0:
+        return profiles.astype(psf.dtype)
+    q /= norm
+    acf = scipy.signal.correlate(q, q, mode="full", method="fft")
+    acf /= acf.max()
+
+    # Synthetic emitter: the PSF, padded with its mean border value (a PSF
+    # that has decayed to a flat background outside its window).
+    border = np.ones(shape, dtype=bool)
+    interior = tuple(
+        slice(None) if size == 1 else slice(1, -1) if size > 2 else slice(0, 0) for size in shape
+    )
+    border[interior] = False
+    background = float(q[border].mean())
+    padded = np.pad(q, [(p, p) for p in shape], mode="constant", constant_values=background)
+    # Shifting the emitter and correlating it with ``q`` is a single
+    # product in Fourier space.  On the ``3P`` canvas, the circular
+    # correlation at lags ``0..2P`` equals the ``"valid"`` correlation.
+    spectrum = np.fft.fftn(padded) * np.conj(np.fft.fftn(q, s=padded.shape, axes=(0, 1, 2)))
+    k = np.meshgrid(*[np.fft.fftfreq(s) for s in padded.shape], indexing="ij")
+    steps = [(-0.5, -0.25, 0.0, 0.25, 0.5) if size > 1 else (0.0,) for size in shape]
+    phases = [
+        np.exp(-2j * np.pi * sum(ki * si for ki, si in zip(k, shift, strict=True)))
+        for shift in itertools.product(*steps)
+    ]
+
+    for phase in phases:
+        score = np.fft.ifftn(spectrum * phase).real[tuple(slice(0, 2 * p + 1) for p in shape)]
+        peak = np.array(np.unravel_index(np.argmax(score), score.shape))
+        peak_score = float(score[tuple(peak)])
+        if peak_score <= 0.0:
+            continue
+        # Compare the score with ``peak_score * acf`` centred on the
+        # peak (acf centre: P - 1) over their overlap.
+        lo = np.maximum(peak - (P - 1), 0)
+        hi = np.minimum(peak + P, score.shape)
+        score_part = score[tuple(slice(a, b) for a, b in zip(lo, hi, strict=True))]
+        acf_part = tuple(
+            slice(a - c + p - 1, b - c + p - 1) for a, b, c, p in zip(lo, hi, peak, P, strict=True)
+        )
+        mismatch = (score_part - peak_score * acf[acf_part]) / peak_score
+        excess = np.stack([np.maximum(-mismatch, 0.0), np.maximum(mismatch, 0.0)])
+        profiles[(slice(None), *acf_part)] = np.maximum(profiles[(slice(None), *acf_part)], excess)
+    # The candidate itself (offset 0) never needs a same-sign tolerance.
+    profiles[(1, *(P - 1))] = 0.0
+    return (_SIDELOBE_MARGIN * profiles).astype(psf.dtype)
+
+
+def _sidelobe_tolerance(psf: npt.ArrayLike) -> npt.NDArray[np.floating]:
+    """
+    Per-offset tolerance profiles of the side-lobe explain-away step.
+
+    :func:`_peak_mask_batch` predicts the side lobes of an emitter as its
+    peak score times the on-grid PSF autocorrelation.  Real emitters
+    deviate from that prediction, because they sit between pixels and
+    because the PSF continues beyond its window.  This function
+    simulates emitters at subpixel offsets of ``0``, ``+-1/4`` and
+    ``+-1/2`` voxel along every axis the PSF extends over.  For every
+    offset ``d`` from the detected peak it records the largest amount,
+    relative to the peak score, by which the true score exceeds the
+    prediction
+
+    - in the direction *opposite* to the emitter's sign (profile ``0``,
+      relevant for opposite-sign candidates), and
+    - in the direction of the emitter's sign (profile ``1``, relevant for
+      same-sign candidates; zero at ``d = 0``).
+
+    The result has shape ``(2, 2*Pz-1, 2*Py-1, 2*Px-1)``, is multiplied
+    by the safety factor :data:`_SIDELOBE_MARGIN`, depends only on the
+    PSF, and is cached.
+    """
+    arr = np.ascontiguousarray(np.asarray(psf))
+    return _sidelobe_tolerance_cached(arr.tobytes(), tuple(arr.shape), arr.dtype.str)
 
 
 # ---------------------------------------------------------------------------
@@ -787,6 +1029,8 @@ def _lm_refine(
     residual: Callable[[jax.Array], jax.Array],
     cost: Callable[[jax.Array], jax.Array],
     *,
+    lower: jax.Array,
+    upper: jax.Array,
     iterations: int,
     atol: float,
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
@@ -795,8 +1039,10 @@ def _lm_refine(
 
     Each step solves the Gauss--Newton normal equations
     ``(J^T J + lambda * diag(J^T J)) delta = -J^T r`` with
-    ``J = jacfwd(residual)``; the damping ``lambda`` is halved on
-    accept and doubled on reject.  Once an emitter's
+    ``J = jacfwd(residual)``; the candidate ``params + delta`` is
+    projected onto the box ``[lower, upper]`` before its cost is
+    evaluated, and the damping ``lambda`` is halved on accept and
+    doubled on reject.  Once an emitter's
     ``max(abs(delta))`` falls below ``atol`` it is marked converged and
     **frozen** -- its parameters, damping, and cost are held fixed for
     the remainder of the scan so later iterations cannot perturb a
@@ -820,7 +1066,7 @@ def _lm_refine(
         diag_h = jnp.diag(jtj)
         damped = jtj + lambda_ * jnp.diag(diag_h)
         delta = jnp.linalg.solve(damped, -grad)
-        candidate_params = params + delta
+        candidate_params = jnp.clip(params + delta, lower, upper)
         candidate_cost = cost(candidate_params)
 
         accept = candidate_cost < prev_cost
@@ -971,13 +1217,26 @@ def _fit_one_emitter(
     shift0 = jnp.zeros(n_shift, dtype=stamp.dtype)
     params0 = jnp.concatenate([jnp.array([amp0, bg0], dtype=stamp.dtype), shift0])
 
+    # Contrast and background are unbounded; the subpixel shifts are
+    # confined to ``[-_MAX_SUBPIXEL_SHIFT, _MAX_SUBPIXEL_SHIFT]`` so the
+    # fit cannot drift away from the detected peak.
+    inf = jnp.full(2, jnp.inf, dtype=stamp.dtype)
+    bound = jnp.full(n_shift, _MAX_SUBPIXEL_SHIFT, dtype=stamp.dtype)
+    upper = jnp.concatenate([inf, bound])
+    lower = -upper
+
     final_params, final_cost, converged, n_iter = _lm_refine(
         params0,
         residual,
         cost,
+        lower=lower,
+        upper=upper,
         iterations=iterations,
         atol=atol,
     )
+    # A fit that ends on the shift bound wanted to move further away from
+    # the detected peak; its result is not trustworthy.
+    converged = converged & jnp.all(jnp.abs(final_params[2:]) < _MAX_SUBPIXEL_SHIFT)
     return _fit_outputs(
         stamp,
         final_params,

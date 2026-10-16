@@ -101,7 +101,9 @@ def locate(
     psf : array-like
         The point-spread function model, shape ``(Py, Px)`` for a 2D
         (widefield) PSF or ``(Pz, Py, Px)`` for a 3D PSF.  A 2D PSF is
-        promoted to ``(1, Py, Px)`` internally.  The PSF is
+        promoted to ``(1, Py, Px)`` internally.  ``Pz`` must not exceed
+        the video's ``Z`` size; in particular, 2D (``Z == 1``) videos
+        require a 2D PSF.  The PSF is
         mean-subtracted and L2-normalized internally for the matched
         filter (so the detection score is independent of the PSF's DC
         level and pixel discretization), but the reported ``contrast``
@@ -414,8 +416,8 @@ def _locate_in_chunk(
     chunk : jax.Array
         A dense ``(B, Z, Y, X)`` array of image data.
     psf : jax.Array
-        The 3D point-spread function model, shape ``(Pz, Py, Px)``.
-        Must be mean-zero and L2-normalized (see :func:`_canonicalize_psf`)
+        The 3D point-spread function model, shape ``(Pz, Py, Px)``,
+        with ``Pz <= Z``, ``Py <= Y`` and ``Px <= X``.  Must be mean-zero and L2-normalized (see :func:`_canonicalize_psf`)
         so that the matched-filter score and the fitted contrast share
         a scale.
     n_active_frames : int, optional
@@ -469,8 +471,11 @@ def _locate_in_chunk(
     Pz, Py, Px = psf.shape
     if Py > Y or Px > X:
         raise ValueError(f"PSF Y/X shape ({Py}, {Px}) must not exceed data Y/X shape ({Y}, {X}).")
-    if Pz > Z and Z > 1:
-        raise ValueError(f"PSF Z size {Pz} must not exceed data Z size {Z}.")
+    if Pz > Z:
+        raise ValueError(
+            f"PSF Z size {Pz} must not exceed data Z size {Z}"
+            + ("; use a 2D PSF (or its in-focus plane) for 2D data." if Z == 1 else ".")
+        )
     if n_active_frames is None:
         n_active_frames = B
     elif not (0 <= n_active_frames <= B):

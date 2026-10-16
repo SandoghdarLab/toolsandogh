@@ -936,6 +936,21 @@ def test_locate_rejects_degenerate_psf() -> None:
         tog.locate(chunk, psf, chunk_size=1)
 
 
+@pytest.mark.parametrize("z", [1, 2])
+def test_locate_rejects_psf_deeper_than_video(z) -> None:
+    """A PSF with more planes than the video is rejected, also for 2D videos.
+
+    Previously a 3D PSF on a single-plane video was silently accepted and
+    fitted against a stamp of edge-replicated copies of that plane,
+    giving biased contrasts.
+    """
+    psf2 = _psf_from_profile(_gaussian_profile, 9)
+    psf = np.stack([0.6 * psf2, psf2, 0.6 * psf2])
+    video = np.zeros((1, 1, z, 40, 40), dtype=np.float32)
+    with pytest.raises(ValueError, match="PSF Z size 3"):
+        tog.locate(video, psf, noise_sigma=0.1)
+
+
 def test_locate_auto_chunk_is_default() -> None:
     """The default ``chunk_size`` must be ``"auto"``."""
     import inspect

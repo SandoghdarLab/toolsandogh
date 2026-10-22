@@ -25,7 +25,7 @@ import polars
 import polars.datatypes
 import scipy.signal
 import xarray as xr
-from jaxtyping import Array, Bool, Float
+from jaxtyping import Array, Bool, Float, Int
 
 from ._canonicalize_video import _axis_origin_and_step, canonicalize_video
 
@@ -197,11 +197,12 @@ def locate(
     constant background cancels up to the frame border.  Because the
     mean-subtracted PSF has side lobes, every emitter also produces
     weaker opposite-sign (and, for ringing PSFs, same-sign) responses
-    around it.  Candidate peaks are therefore only kept if their
-    response, after subtracting the side lobes predicted from all other
-    candidates, still exceeds ``min_contrast`` plus a PSF-derived
-    tolerance proportional to the neighbours' strength.  Faint emitters
-    close to much brighter ones may consequently be missed.
+    around it.  Candidate peaks are therefore resolved greedily,
+    strongest first, and only kept if their response, after subtracting
+    the side lobes predicted from all stronger accepted emitters, still
+    exceeds ``min_contrast`` plus a PSF-derived tolerance proportional
+    to those emitters' strength.  Faint emitters close to much brighter
+    ones may consequently be missed.
 
     The subpixel shift fitted around each detected peak is limited to
     one voxel per axis.  Emitters whose fit ends at that limit are
@@ -489,11 +490,12 @@ def _locate_in_chunk(
     if iterations < 0:
         raise ValueError(f"`iterations` must be non-negative, got {iterations!r}.")
 
-    # 1+2. Fused matched-filter score and non-maximum-suppression peak
-    #      mask.  A single JIT kernel produces the boolean (B, Z, Y, X) peak
-    #      mask for the whole chunk; one eager ``argwhere`` then yields the
-    #      integer coordinates of every detection -- a single host sync per
-    #      chunk instead of one per frame.
+    # 1+2. Matched-filter score, non-maximum suppression and side-lobe
+    #      explain-away produce the boolean (B, Z, Y, X) peak mask for the
+    #      whole chunk; one eager ``argwhere`` then yields the integer
+    #      coordinates of every detection.  Host syncs are per chunk, not
+    #      per frame: one scalar per batch of explain-away rounds (usually
+    #      one batch) plus the ``argwhere``.
     is_peak = _peak_mask_batch(
         chunk,
         psf,
@@ -631,11 +633,10 @@ def _locate_in_chunk(
 
 
 # ---------------------------------------------------------------------------
-# Matched filter + non-maximum suppression (fused, batched over frames)
+# Matched filter, non-maximum suppression and side-lobe explain-away
 # ---------------------------------------------------------------------------
 
 
-@jax.jit(static_argnames=["min_distance", "sign"])
 def _peak_mask_batch(
     chunk: Float[Array, "B Z Y X"],
     psf: Float[Array, "Pz Py Px"],
@@ -647,7 +648,7 @@ def _peak_mask_batch(
 ) -> Bool[Array, "B Z Y X"]:
     """
     Compute the matched-filter score and the boolean peak mask for every
-    frame in ``chunk`` in a single JIT kernel.
+    frame in ``chunk``.
 
     The detection proceeds in four steps:
 
@@ -672,21 +673,59 @@ def _peak_mask_batch(
        (approximately) its peak score times the normalized PSF
        autocorrelation, which has side lobes: always of opposite sign
        (the PSF is mean-zero), and also of the same sign for ringing
-       PSFs (e.g. iSCAT).  Each candidate's *remainder* is its score
-       minus the lobes predicted from all *other* candidates (their
-       amplitudes convolved with the autocorrelation).  The amplitudes
-       start as the candidates' scores and are then replaced by their
-       sign-clipped remainders, so a side lobe explained by a stronger
-       peak contributes (almost) nothing in the second round.  A
-       candidate is kept if its final remainder exceeds, with the
-       candidate's sign, ``min_contrast`` plus a tolerance: the
-       opposite-sign and same-sign amplitudes convolved with the
-       per-offset profiles ``lobe_tolerance[0]`` and
-       ``lobe_tolerance[1]``, which bound the mismatch between the
-       on-grid prediction and real emitters (see
-       :func:`_sidelobe_tolerance`).  The step is applied regardless of
-       ``sign``, because a dark object's positive side lobes must not be
-       reported as positive emitters either.
+       PSFs (e.g. iSCAT).  Candidates are resolved greedily, so that
+       only *accepted* emitters explain away the lobes of other
+       candidates -- a candidate never explains away a stronger one.
+       See :func:`_explain_away_rounds`.  The step is applied regardless
+       of ``sign``, because a dark object's positive side lobes must not
+       be reported as positive emitters either.
+
+    Steps 1--3 run in one JIT kernel.  Step 4 runs in fixed-size batches
+    of greedy rounds; the host only launches another batch while
+    candidates remain unresolved (rarely more than one batch is needed).
+    """
+    scores, cand_pos, cand_neg = _peak_candidates_batch(
+        chunk, psf, min_distance=min_distance, min_contrast=min_contrast
+    )
+    unresolved = cand_pos | cand_neg
+    amplitude = jnp.zeros_like(scores)
+    n_unresolved = None
+    while True:
+        unresolved, amplitude, count = _explain_away_rounds(
+            scores,
+            cand_pos,
+            cand_neg,
+            unresolved,
+            amplitude,
+            psf,
+            lobe_tolerance,
+            min_contrast=min_contrast,
+        )
+        # Every round resolves at least the leading candidate of each
+        # frame, so the count only stalls for non-finite scores; the
+        # remaining candidates are then rejected.
+        previous, n_unresolved = n_unresolved, int(count)
+        if n_unresolved == 0 or n_unresolved == previous:
+            break
+
+    if sign == "positive":
+        return cand_pos & (amplitude > 0)
+    if sign == "negative":
+        return cand_neg & (amplitude < 0)
+    return (cand_pos & (amplitude > 0)) | (cand_neg & (amplitude < 0))
+
+
+@jax.jit(static_argnames=["min_distance"])
+def _peak_candidates_batch(
+    chunk: Float[Array, "B Z Y X"],
+    psf: Float[Array, "Pz Py Px"],
+    *,
+    min_distance: int,
+    min_contrast: float,
+) -> tuple[Float[Array, "B Z Y X"], Bool[Array, "B Z Y X"], Bool[Array, "B Z Y X"]]:
+    """
+    Matched-filter scores and positive/negative candidate masks (steps
+    1--3 of :func:`_peak_mask_batch`).
     """
     Pz, Py, Px = psf.shape
     hz, hy, hx = Pz // 2, Py // 2, Px // 2
@@ -713,41 +752,115 @@ def _peak_mask_batch(
     # 3. Deterministic tie breaking.
     cand_pos = _break_ties(cand_pos, nms_window)
     cand_neg = _break_ties(cand_neg, nms_window)
+    return scores, cand_pos, cand_neg
 
-    # 4. Explain away the side lobes of neighbouring candidates (two
-    #    Jacobi rounds).
+
+@jax.jit(static_argnames=["n_rounds"])
+def _explain_away_rounds(
+    scores: Float[Array, "B Z Y X"],
+    cand_pos: Bool[Array, "B Z Y X"],
+    cand_neg: Bool[Array, "B Z Y X"],
+    unresolved: Bool[Array, "B Z Y X"],
+    amplitude: Float[Array, "B Z Y X"],
+    psf: Float[Array, "Pz Py Px"],
+    lobe_tolerance: Float[Array, "2 Qz Qy Qx"],
+    *,
+    min_contrast: float,
+    n_rounds: int = 2,
+) -> tuple[Bool[Array, "B Z Y X"], Float[Array, "B Z Y X"], Int[Array, ""]]:
+    """
+    Run ``n_rounds`` rounds of the greedy side-lobe explain-away.
+
+    ``amplitude`` holds the signed amplitude of every accepted emitter
+    (zero elsewhere); ``unresolved`` marks the candidates not yet
+    accepted or rejected.  A candidate's *remainder* is its score minus
+    the lobes predicted from all accepted emitters (their amplitudes
+    convolved with the normalized PSF autocorrelation).  Its *excess* is
+    by how much the remainder, with the candidate's sign, exceeds
+    ``min_contrast`` plus a tolerance: the accepted opposite-sign and
+    same-sign amplitudes convolved with the per-offset profiles
+    ``lobe_tolerance[0]`` and ``lobe_tolerance[1]``, which bound the
+    mismatch between the on-grid prediction and real emitters (see
+    :func:`_sidelobe_tolerance`).
+
+    The greedy resolves candidates in order of decreasing excess and is
+    parallelized: in every round, each unresolved candidate whose excess
+    is the largest among the unresolved candidates within the
+    autocorrelation's footprint is resolved -- all such candidates are
+    too far apart to affect each other.  It is accepted, with its
+    remainder as amplitude, if its excess is positive, and rejected
+    otherwise; rejected candidates explain nothing away.  In addition,
+    candidates are rejected right away if no unresolved candidate within
+    their footprint has a positive excess (see below).
+
+    A simultaneous (Jacobi) update, in which every candidate's lobes are
+    subtracted from every other candidate, does not work for PSFs with
+    strong side lobes: the lobe candidates around a bright emitter then
+    jointly explain away most of the emitter itself, which in turn
+    leaves its lobes unexplained.
+
+    Returns the updated ``unresolved`` mask and ``amplitude``, and the
+    largest number of unresolved candidates in any frame.
+    """
     acf = jsignal.correlate(psf, psf, mode="full", method="fft")
     acf = acf / jnp.max(acf)  # (2Pz-1, 2Py-1, 2Px-1), centre value 1
     tol_opposite, tol_same = lobe_tolerance[0], lobe_tolerance[1]
     zero = jnp.asarray(0, dtype=scores.dtype)
+    neg_inf = jnp.asarray(-jnp.inf, dtype=scores.dtype)
+    # Two candidates interact iff their offset lies within the acf (and
+    # tolerance) support, so this window is the greedy's footprint.
+    Qz, Qy, Qx = acf.shape
+    footprint = (1, Qz, Qy, Qx)
 
-    def spread(amplitude: jax.Array, kernel: jax.Array) -> jax.Array:
-        return jax.vmap(lambda f: jsignal.convolve(f, kernel, mode="same", method="fft"))(amplitude)
+    # A positive candidate's tolerance is ``mag_neg * tol_opposite +
+    # mag_pos * tol_same`` (convolved).  With ``|a| = mag_pos + mag_neg``
+    # and ``a = mag_pos - mag_neg``, this is ``|a| * tol_even + a *
+    # tol_odd``, and a negative candidate's is ``|a| * tol_even - a *
+    # tol_odd``.  The lobes, ``a * acf``, share the spectrum of ``a``, so
+    # a round costs two forward and three inverse FFTs.
+    axes = (1, 2, 3)
+    fft_shape = tuple(n + k - 1 for n, k in zip(scores.shape[1:], acf.shape, strict=True))
+    same = (slice(None),) + tuple(
+        slice((k - 1) // 2, (k - 1) // 2 + n)
+        for n, k in zip(scores.shape[1:], acf.shape, strict=True)
+    )
+    acf_hat, tol_odd_hat, tol_even_hat = jnp.fft.rfftn(
+        jnp.stack([acf, (tol_same - tol_opposite) / 2, (tol_same + tol_opposite) / 2]),
+        s=fft_shape,
+        axes=axes,
+    )
 
-    def explain_away(amp_pos: jax.Array, amp_neg: jax.Array) -> jax.Array:
-        # ``spread`` includes each candidate's own peak (acf centre = 1);
-        # add it back so that only the *other* candidates' lobes are removed.
-        amplitude = amp_pos + amp_neg
-        return scores - spread(amplitude, acf) + amplitude
+    def spread(spectrum: jax.Array) -> jax.Array:
+        return jnp.fft.irfftn(spectrum, s=fft_shape, axes=axes)[same].astype(scores.dtype)
 
-    amp_pos = jnp.where(cand_pos, scores, zero)
-    amp_neg = jnp.where(cand_neg, scores, zero)
-    remainder = explain_away(amp_pos, amp_neg)
-    amp_pos = jnp.where(cand_pos, jnp.maximum(remainder, zero), zero)
-    amp_neg = jnp.where(cand_neg, jnp.minimum(remainder, zero), zero)
-    remainder = explain_away(amp_pos, amp_neg)
+    for _ in range(n_rounds):
+        amp_hat = jnp.fft.rfftn(amplitude, s=fft_shape, axes=axes)
+        abs_hat = jnp.fft.rfftn(jnp.abs(amplitude), s=fft_shape, axes=axes)
+        # Only accepted emitters carry an amplitude, and an unresolved
+        # candidate has none, so this never subtracts its own peak.
+        remainder = scores - spread(amp_hat * acf_hat)
+        tol_even = spread(abs_hat * tol_even_hat)
+        tol_odd = spread(amp_hat * tol_odd_hat)
+        excess = (
+            jnp.where(cand_pos, remainder - tol_odd, -remainder + tol_odd) - tol_even - min_contrast
+        )
+        key = jnp.where(unresolved, excess, neg_inf)
+        local_max = _box_reduce(key, neg_inf, jax.lax.max, footprint)
+        dominant = _break_ties(unresolved & (key == local_max), footprint)
+        accept = dominant & (key > zero)
+        # A key only changes when a candidate within the footprint is
+        # accepted.  If no unresolved candidate in the footprint can
+        # currently be accepted (all keys <= 0), this one is rejected
+        # right away instead of waiting for its turn, which would take
+        # one round per candidate.  This deviates from the strict greedy
+        # order only if accepting a candidate *outside* the footprint
+        # first lifts one inside it above the threshold, and then only by
+        # rejecting more.
+        hopeless = unresolved & (local_max <= zero)
+        amplitude = jnp.where(accept, remainder, amplitude)
+        unresolved = unresolved & ~dominant & ~hopeless
 
-    mag_pos, mag_neg = amp_pos, -amp_neg
-    tol_pos = spread(mag_neg, tol_opposite) + spread(mag_pos, tol_same)
-    tol_neg = spread(mag_pos, tol_opposite) + spread(mag_neg, tol_same)
-    is_pos = cand_pos & (remainder > min_contrast + tol_pos)
-    is_neg = cand_neg & (-remainder > min_contrast + tol_neg)
-
-    if sign == "positive":
-        return is_pos
-    if sign == "negative":
-        return is_neg
-    return is_pos | is_neg
+    return unresolved, amplitude, jnp.max(jnp.sum(unresolved, axis=(1, 2, 3)))
 
 
 def _box_reduce(

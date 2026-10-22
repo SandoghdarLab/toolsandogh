@@ -1501,6 +1501,43 @@ def test_locate_suppresses_same_sign_lobes_of_ringing_psf() -> None:
         assert abs(locs["column"][0] - 29.8) < 0.05
 
 
+def _strong_ringing_profile(r2):
+    """A PSF with a deep negative ring and strong ringing (side lobes ~1/3 of the peak)."""
+    r = np.sqrt(r2)
+    return (
+        np.exp(-r2 / (2 * 1.6**2))
+        - 0.6 * np.exp(-r2 / (2 * 3.2**2))
+        + 0.3 * np.cos(1.2 * r) * np.exp(-r2 / (2 * 6.0**2))
+    )
+
+
+@pytest.mark.parametrize("amplitude", [10.0, 200.0, -200.0])
+def test_locate_suppresses_strong_side_lobes(amplitude) -> None:
+    """Strong side lobes must not jointly explain away the emitter itself."""
+    rng = np.random.default_rng(0)
+    video = _render_2d((100, 100), [(50.3, 49.8, amplitude)], _strong_ringing_profile)
+    video += rng.normal(0.0, 0.05, video.shape).astype(np.float32)
+    psf = _psf_from_profile(_strong_ringing_profile, 41)
+    locs = tog.locate(video, psf, min_contrast=0.5, sign="both")
+    assert locs.height == 1
+    assert abs(locs["row"][0] - 50.3) < 0.05
+    assert abs(locs["column"][0] - 49.8) < 0.05
+    assert abs(locs["contrast"][0] - amplitude) < 0.01 * abs(amplitude)
+
+
+def test_locate_keeps_faint_neighbour_with_strong_side_lobes() -> None:
+    """Greedy explain-away keeps a faint emitter outside a bright one's lobes."""
+    video = _render_2d(
+        (100, 100), [(50.0, 40.0, 200.0), (50.0, 55.0, 40.0)], _strong_ringing_profile
+    )
+    psf = _psf_from_profile(_strong_ringing_profile, 41)
+    locs = tog.locate(video, psf, min_contrast=0.5, noise_sigma=0.05).sort("column")
+    assert locs.height == 2
+    assert abs(locs["column"][0] - 40.0) < 0.1
+    assert abs(locs["column"][1] - 55.0) < 0.1
+    assert abs(locs["contrast"][1] - 40.0) < 2.0
+
+
 def test_locate_keeps_opposite_sign_neighbour_of_bright_emitter() -> None:
     """Lobe suppression must not remove a genuine opposite-sign neighbour."""
     video = _render_2d((40, 40), [(20.0, 17.0, 50.0), (20.0, 23.0, -10.0)], _gaussian_profile)
